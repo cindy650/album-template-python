@@ -1,6 +1,10 @@
 # Etsy QQ Mail Order Backend
 
-This project turns the original qq_idleCopy.py script into a backend service while keeping the existing parsing, DeepSeek personalization matching, QQ IMAP polling, and Google Sheets write logic.
+This project turns the original qq_idleCopy.py script into a backend service
+with direct Etsy field extraction, QQ IMAP polling, SQLite persistence, JPEG
+template previews, and Google Sheets delivery.
+After a mailbox order image is generated, the backend also sends the image and
+an order-number/product text message to the configured WeCom group robot.
 
 ## Run
 
@@ -31,10 +35,12 @@ If BACKEND_API_TOKEN is empty, local API endpoints are open.
 
 - GET /health - backend health, config validity, listener status.
 - GET /api/v1/config - redacted runtime config and configured products.
-- GET /api/v1/personalization-rules - current JSON rules.
+- GET /api/v1/personalization-rules - compatibility endpoint reporting that rules are disabled.
 - POST /api/v1/orders/parse - parse an email subject/body into order JSON.
 - POST /api/v1/orders/publish - write an already parsed order to Google Sheets.
 - POST /api/v1/orders/parse-and-publish - parse then write synchronously.
+- POST /api/v1/orders/print-image - generate a printable A4 order JPEG and
+  return it as Base64. The JSON body requires `order_id` and `order_number`.
 - GET /api/v1/tasks/mail-listener - listener status.
 - POST /api/v1/tasks/mail-listener/start - start continuous QQ IMAP listener.
 - POST /api/v1/tasks/mail-listener/stop - stop continuous listener.
@@ -54,11 +60,45 @@ Important files:
 - qq_idleCopy.py - core mail parsing and integrations.
 - backend/main.py - FastAPI app and HTTP endpoints.
 - backend/task_manager.py - listener and async task management.
-- personalization_rules.json - shop/product-specific personalization rules.
 - Code.gs - Google Apps Script webhook used by APPS_SCRIPT_URL.
+
+Template preview images generated for mailbox orders are saved as JPEG files
+in `generated_template_jpgs/` by default. Use `TEMPLATE_JPG_DIR` to select a
+different directory and `TEMPLATE_IMAGE_DPI` to change the output resolution.
+Set `WECOM_ROBOT_WEBHOOK_URL` to override or disable the WeCom group robot
+webhook. Images larger than WeCom's 2 MB limit are compressed in memory for the
+notification; the generated JPEG on disk is not changed.
+
+Printable order sheets use `ORDER_PRINT_IMAGE_DPI` (300 by default). Product
+information is translated to Chinese with the configured DeepSeek API before
+the sheet is rendered.
 
 ## Notes
 
 - The continuous listener and one-time poll share qq_imap_state.json.
-- Unknown shop/product personalization rules are skipped and advance UID, matching the current script behavior.
-- Real DeepSeek, QQ IMAP, and Google Sheets calls happen in worker threads so HTTP requests do not block the event loop.
+- Before product parsing, mailbox orders must match
+  an existing row in the SQLite `shops` table. Missing shops are skipped with a
+  `系统没有此店铺` console message and advance UID.
+- Etsy option fields are extracted directly by their email labels. Wrapped
+  lines under `Names/date/location for the cover` are joined into one value.
+  Product titles are read from the text immediately before the first option
+  field; the obsolete `规格/尺寸` field is not emitted or stored.
+- Product option labels are not limited to a fixed list. The text between the
+  product title and `Shop:` is parsed into the single `商品信息` object. SQLite
+  stores it directly in `orders.product_information`; the order API restores
+  the object for dynamic frontend columns. No `product_information_json`
+  column or child information table is used.
+- Before an order is inserted or updated, its shop and product name must match
+  `size_template_products`. The resolved `size_template_id` is stored on the
+  order and reused for template image generation. Unmatched products are not
+  written to the orders table.
+- SQLite stores order values under English field names. Each business field has
+  a matching `<field_name>_text` column containing its Chinese display name.
+  Legacy `personalization_json` and `personalization_text` columns are removed
+  automatically when the order repository initializes.
+- The former `personalization_rules.json` shop/product rules file has been
+  removed. Mail product fields are parsed from the product block directly.
+- Real QQ IMAP and Google Sheets calls happen in worker threads so HTTP requests do not block the event loop.
+- Failed Google Sheets writes are retried from an in-memory background queue.
+  The orders table contains no Google Sheets fields; restarting the process
+  clears any pending retries.

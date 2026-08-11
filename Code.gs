@@ -5,14 +5,13 @@ const WEBHOOK_TOKEN = "69eb3cdafc454e98b8e10b42b47f07cb";
 const HEADERS = [
   "订单号",
   "店铺",
+  "店铺名",
   "产品",
-  "规格/尺寸",
-  "定制信息",
+  "商品信息",
   "付款方式",
   "邮寄地址",
   "交易编号",
   "数量",
-  "价格",
 ];
 
 function doGet() {
@@ -55,14 +54,13 @@ function doPost(event) {
     const row = [
       safeCellText_(orderNumber),
       safeCellText_(order["店铺"]),
+      safeCellText_(order["店铺名"]),
       safeCellText_(order["产品"]),
-      safeCellText_(order["规格/尺寸"]),
-      safeCellText_(formatPersonalization_(order["定制信息"])),
+      safeCellText_(formatProductInformation_(order["商品信息"])),
       safeCellText_(order["付款方式"]),
       safeCellText_(order["邮寄地址"]),
       safeCellText_(transactionId),
       safeCellText_(order["数量"]),
-      safeCellText_(order["价格"]),
     ];
 
     const lock = LockService.getScriptLock();
@@ -87,7 +85,7 @@ function doPost(event) {
       const range = sheet.getRange(rowNumber, 1, 1, HEADERS.length);
       range.setValues([row]);
       range.setVerticalAlignment("top");
-      sheet.getRange(rowNumber, 4, 1, 4).setWrap(true);
+      range.setWrap(true);
       SpreadsheetApp.flush();
     } finally {
       lock.releaseLock();
@@ -138,12 +136,16 @@ function findDuplicateRow_(sheet, orderNumber, transactionId) {
     return 0;
   }
 
-  const rows = sheet.getRange(2, 1, lastRow - 1, 8).getDisplayValues();
+  const orderNumberIndex = HEADERS.indexOf("订单号");
+  const transactionIdIndex = HEADERS.indexOf("交易编号");
+  const rows = sheet
+    .getRange(2, 1, lastRow - 1, HEADERS.length)
+    .getDisplayValues();
   const index = rows.findIndex((row) => {
-    if (orderNumber && row[0].trim() !== orderNumber) {
+    if (orderNumber && row[orderNumberIndex].trim() !== orderNumber) {
       return false;
     }
-    if (transactionId && row[7].trim() !== transactionId) {
+    if (transactionId && row[transactionIdIndex].trim() !== transactionId) {
       return false;
     }
     return true;
@@ -151,18 +153,21 @@ function findDuplicateRow_(sheet, orderNumber, transactionId) {
   return index < 0 ? 0 : index + 2;
 }
 
-function formatPersonalization_(personalization) {
-  if (!personalization || typeof personalization !== "object") {
-    return textValue_(personalization);
-  }
-  return Object.entries(personalization)
-    .map(([field, value]) => field + ": " + textValue_(value))
-    .join("\n");
-}
-
 function safeCellText_(value) {
   const text = textValue_(value);
   return /^[=+\-@]/.test(text) ? "'" + text : text;
+}
+
+function formatProductInformation_(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "object") {
+    return Object.entries(value)
+      .map(([field, fieldValue]) => field + ": " + textValue_(fieldValue))
+      .join("\n");
+  }
+  return String(value).replace(/\r\n?/g, "\n").trim();
 }
 
 function textValue_(value) {

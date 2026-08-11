@@ -1,14 +1,20 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, status as http_status
 from starlette.concurrency import run_in_threadpool
 
 from backend.context import (
     order_repository,
+    order_print_image_generator,
     order_service,
     parse_and_publish,
     parse_order_payload,
 )
 from backend.responses import api_success
-from backend.schemas import OrderData, ParseOrderRequest
+from backend.schemas import (
+    OrderData,
+    OrderPrintImageRequest,
+    OrderStatusUpdate,
+    ParseOrderRequest,
+)
 
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -21,16 +27,68 @@ async def list_orders(
     order_number: str | None = None,
     transaction_id: str | None = None,
     shop: str | None = None,
+    shop_id: int | None = None,
+    status: str | None = None,
 ):
-    result = await run_in_threadpool(
-        order_repository.list,
-        limit,
-        offset,
-        order_number,
-        transaction_id,
-        shop,
-    )
+    try:
+        result = await run_in_threadpool(
+            order_repository.list,
+            limit,
+            offset,
+            order_number,
+            transaction_id,
+            shop,
+            shop_id,
+            status,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     return api_success(result, message="订单查询成功")
+
+
+@router.patch("/{order_id}/status")
+async def update_order_status(order_id: int, payload: OrderStatusUpdate):
+    try:
+        result = await run_in_threadpool(
+            order_repository.update_status,
+            order_id,
+            payload.status,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return api_success(result, message="订单状态更新成功")
+
+
+@router.post("/print-image")
+async def generate_order_print_image(payload: OrderPrintImageRequest):
+    try:
+        result = await run_in_threadpool(
+            order_print_image_generator.generate,
+            payload.order_id,
+            payload.order_number,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return api_success(result, message="A4 订单打印图片生成成功")
 
 
 @router.post("/parse")

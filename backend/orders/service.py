@@ -6,6 +6,7 @@ from typing import Any
 
 import qq_idleCopy as core
 from backend.events import event_bus
+from backend.orders.google_sheets_retry import GoogleSheetsRetryWorker
 from backend.orders.repository import OrderRepository
 
 
@@ -16,9 +17,15 @@ class OrderService:
         template_image_generator=None,
         template_image_retry_attempts: int = 3,
         template_image_retry_delay_seconds: float = 5,
+        google_sheets_publisher=None,
+        google_sheets_retry_initial_seconds: float = 30,
+        google_sheets_retry_max_seconds: float = 900,
+        wecom_notifier=None,
     ):
         self.repository = repository
         self.template_image_generator = template_image_generator
+        self.google_sheets_publisher = google_sheets_publisher or core.post_order
+        self.wecom_notifier = wecom_notifier
         self.template_image_retry_attempts = max(
             0,
             int(template_image_retry_attempts),
@@ -27,6 +34,21 @@ class OrderService:
             0.0,
             float(template_image_retry_delay_seconds),
         )
+        self.google_sheets_retry_worker = GoogleSheetsRetryWorker(
+            repository,
+            self.google_sheets_publisher,
+            initial_delay_seconds=google_sheets_retry_initial_seconds,
+            max_delay_seconds=google_sheets_retry_max_seconds,
+        )
+
+    def start(self):
+        self.google_sheets_retry_worker.start()
+
+    def shutdown(self):
+        self.google_sheets_retry_worker.shutdown()
+
+    def google_sheets_retry_status(self):
+        return self.google_sheets_retry_worker.status()
 
     def publish_order(
         self,
@@ -35,14 +57,46 @@ class OrderService:
         uid: int | None = None,
         metadata: dict[str, Any] | None = None,
     ):
-        google_result = core.post_order(order)
         saved = self.repository.upsert(
             order,
-            google_sheets=google_result,
             source=source,
             uid=uid,
             metadata=metadata,
         )
+        order = {
+            **order,
+            "店铺": saved.get("shop", order.get("店铺", "")),
+            "店铺名": saved.get("shop_name", order.get("店铺名", "")),
+            "商品信息": saved.get(
+                "product_information",
+                order.get("商品信息", {}),
+            ),
+        }
+        try:
+            google_result = self.google_sheets_publisher(order)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.google_sheets_retry_worker.schedule(saved["id"])
+            google_result = {
+                "ok": False,
+                "status": "pending_retry",
+                "attempts": 1,
+                "error": error,
+            }
+            print(
+                "[Google Sheets] 首次写入失败，已加入内存补写队列："
+                f"订单ID={saved['id']}，订单号={saved['order_number']}，"
+                f"{error}",
+                flush=True,
+            )
+            event_bus.publish(
+                "order.google_sheets.failed",
+                {
+                    "order": saved,
+                    "error": error,
+                    "retry_scheduled": True,
+                },
+            )
         event_bus.publish(
             "order.saved",
             {
@@ -114,6 +168,13 @@ class OrderService:
             saved_order=result.get("local_order"),
             metadata=metadata,
         )
+        if self.wecom_notifier is not None:
+            image_result["wecom"] = self._notify_wecom(
+                order,
+                result.get("local_order"),
+                image_result,
+                uid,
+            )
         event_bus.publish(
             "order.template_image.generated",
             {
@@ -125,6 +186,49 @@ class OrderService:
             },
         )
         return image_result
+
+    def _notify_wecom(self, order, saved_order, image_result, uid):
+        try:
+            notification = self.wecom_notifier.notify_order_image(
+                order,
+                image_result,
+                saved_order=saved_order,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            notification = {
+                "ok": False,
+                "status": "failed",
+                "error": error,
+            }
+            print(
+                "[企业微信] 订单图片通知失败："
+                f"订单号={(saved_order or {}).get('order_number') or '未知'}，"
+                f"{error}",
+                flush=True,
+            )
+            event_bus.publish(
+                "order.wecom.failed",
+                {
+                    "order": saved_order,
+                    "template_image": image_result,
+                    "source": "mail-listener",
+                    "uid": uid,
+                    "error": error,
+                },
+            )
+        else:
+            event_bus.publish(
+                "order.wecom.sent",
+                {
+                    "order": saved_order,
+                    "template_image": image_result,
+                    "source": "mail-listener",
+                    "uid": uid,
+                    "notification": notification,
+                },
+            )
+        return notification
 
     def _publish_template_image_failure(
         self,

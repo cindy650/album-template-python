@@ -1,6 +1,5 @@
 from fastapi import APIRouter
 
-import qq_idleCopy as core
 from backend.responses import api_success
 
 
@@ -10,6 +9,9 @@ router = APIRouter(tags=["configuration"])
 @router.get("/personalization-rules")
 async def get_personalization_rules():
     return api_success(
-        core.validate_personalization_config(core.read_personalization_config()),
-        message="定制规则查询成功",
+        {
+            "enabled": False,
+            "message": "订单已改为按邮件独立字段直接提取",
+        },
+        message="定制规则已停用",
     )

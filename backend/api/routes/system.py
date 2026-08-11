@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 import qq_idleCopy as core
 from backend.config import settings
-from backend.context import listener
+from backend.context import listener, order_service
 from backend.responses import api_success
 
 
@@ -11,13 +11,6 @@ router = APIRouter(tags=["system"])
 
 @router.get("/config")
 async def get_config():
-    rules = core.validate_personalization_config(
-        core.read_personalization_config()
-    )
-    shops = {
-        shop_name: list(shop_rules["products"])
-        for shop_name, shop_rules in rules["shops"].items()
-    }
     return api_success(
         {
             "imap": {
@@ -30,17 +23,24 @@ async def get_config():
                 "url": core.DEEPSEEK_API_URL,
                 "model": core.DEEPSEEK_MODEL,
                 "configured": bool(core.DEEPSEEK_API_KEY),
+                "enabled": False,
             },
             "google_sheets": {
                 "url": core.APPS_SCRIPT_URL,
                 "configured": bool(core.APPS_SCRIPT_URL),
             },
-            "rules": shops,
+            "wecom_robot": {
+                "configured": bool(settings.wecom_robot_webhook_url),
+            },
+            "personalization_rules": {"enabled": False},
             "state": {"last_uid": core.load_last_uid()},
             "auto_start_mail_listener": settings.auto_start_mail_listener,
             "orders_db_path": str(settings.orders_db_path),
+            "catalog_db_path": str(settings.orders_db_path),
             "templates_db_path": str(settings.templates_db_path),
+            "templates_db_in_use": False,
             "listener": listener.status(),
+            "google_sheets_retry": order_service.google_sheets_retry_status(),
         },
         message="配置查询成功",
     )

@@ -10,7 +10,7 @@ import qq_idleCopy as core
 from backend import __version__
 from backend.api import api_router
 from backend.config import settings
-from backend.context import listener, tasks
+from backend.context import listener, order_service, tasks
 from backend.responses import api_code_for_status, api_error, api_success
 
 
@@ -18,10 +18,12 @@ from backend.responses import api_code_for_status, api_error, api_success
 async def lifespan(app):
     core.configure_utf8_console()
     socket.setdefaulttimeout(30)
+    order_service.start()
     if settings.auto_start_mail_listener:
         listener.start()
     yield
     listener.shutdown()
+    order_service.shutdown()
     tasks.shutdown()
 
 
@@ -29,7 +31,7 @@ app = FastAPI(
     title="Etsy QQ Mail Order Backend",
     version=__version__,
     description=(
-        "监听 QQ 邮箱中的 Etsy 订单，解析订单与定制信息，"
+        "监听 QQ 邮箱中的 Etsy 订单，解析订单与独立商品字段，"
         "写入 Google Sheets、本地 SQLite，并通过 SSE 推送实时事件。"
     ),
     docs_url="/docs",
@@ -124,6 +126,7 @@ async def health():
             "configuration": configuration,
             "configuration_error": configuration_error,
             "listener": listener.status(),
+            "google_sheets_retry": order_service.google_sheets_retry_status(),
         },
         message="服务健康检查成功",
     )

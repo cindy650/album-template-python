@@ -54,6 +54,56 @@ ORDER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+INDEPENDENT_ORDER_FIELDS = {
+    "Pages Quantity | Album Size": (
+        "Pages Quantity | Album Size",
+        "Pages Quantity / Album Size",
+    ),
+    "Instant photo size": (
+        "Instant photo size",
+        "Instant photo size type",
+    ),
+    "Cover Colour": ("Cover Colour", "Cover Color"),
+    "Inner Page Layout": ("Inner Page Layout",),
+    "Font Style & Lettering color": (
+        "Font Style & Lettering color",
+        "Font Style & Lettering colour",
+    ),
+    "Names/date/location for the cover": (
+        "Names/date/location for the cover",
+        "Names / date / location for the cover",
+    ),
+    "Phone Number for Delivery": (
+        "Phone Number for Delivery",
+        "Delivery Phone Number",
+    ),
+}
+
+PRODUCT_BLOCK_BOUNDARY_PATTERN = re.compile(
+    r"^(?:Purchase Shipping Label|Shipping internationally|"
+    r"Sell with confidence|Learn about|Ship with DDP|"
+    r"With Delivered Duties Paid|Order details|Payment method|"
+    r"Shipping address|Paid via Etsy Payments|Payments made via)",
+    re.IGNORECASE,
+)
+
+PRODUCT_OPTION_LINE_PATTERN = re.compile(
+    r"^(?P<label>[^:：]{1,100}?)\s*[:：]\s*(?P<value>.*)$"
+)
+
+RESERVED_PRODUCT_OPTION_LABELS = {
+    "shop",
+    "store",
+    "transaction id",
+    "transaction",
+    "quantity",
+    "qty",
+    "price",
+    "item price",
+    "payment method",
+    "shipping address",
+}
+
 SHOP_CONFIG = [
     {"sheetName": "小彩灯", "shopName": "Memiya", "currency": "USD"},
     {"sheetName": "3号店", "shopName": "LuxeJoy", "currency": "CAD"},
@@ -76,6 +126,10 @@ class ConfigurationError(ValueError):
 
 class PersonalizationRuleNotFound(ConfigurationError):
     """No shop/product rule exists for one specific order."""
+
+
+class ShopNotFoundError(ConfigurationError):
+    """The Etsy shop from one email is absent from the system shop table."""
 
 
 def configure_utf8_console():
@@ -263,6 +317,66 @@ def prepare_body_lines(body):
         if line:
             lines.append(line)
     return lines
+
+
+def canonical_product_option_label(label):
+    normalized = str(label or "").strip().casefold()
+    for field, aliases in INDEPENDENT_ORDER_FIELDS.items():
+        if normalized in {alias.casefold() for alias in aliases}:
+            return field
+    return str(label or "").strip()
+
+
+def split_product_option_line(line):
+    match = PRODUCT_OPTION_LINE_PATTERN.match(line)
+    if not match:
+        return None
+    label = match.group("label").strip()
+    if label.casefold() in RESERVED_PRODUCT_OPTION_LABELS:
+        return None
+    if len(label.split()) > 16 or label.endswith((".", "!", "?")):
+        return None
+    return canonical_product_option_label(label), match.group("value").strip()
+
+
+def find_product_option_span(lines):
+    shop_index = find_line_index(lines, r"^(?:Shop|Store)\s*:")
+    if shop_index < 0:
+        return -1, -1
+    search_start = 0
+    for index in range(shop_index):
+        if PRODUCT_BLOCK_BOUNDARY_PATTERN.search(lines[index]):
+            search_start = index + 1
+    for index in range(search_start, shop_index):
+        if split_product_option_line(lines[index]) is not None:
+            return index, shop_index
+    return -1, shop_index
+
+
+def extract_product_options_from_lines(lines):
+    start_index, end_index = find_product_option_span(lines)
+    if start_index < 0 or end_index < 0:
+        return {}
+    values = {}
+    current_field = None
+    for line in lines[start_index:end_index]:
+        labeled = split_product_option_line(line)
+        if labeled is not None:
+            current_field, value = labeled
+            values.setdefault(current_field, [])
+            if value:
+                values[current_field].append(value)
+            continue
+        if current_field:
+            values[current_field].append(line)
+    return {
+        field: " ".join(parts).strip()
+        for field, parts in values.items()
+    }
+
+
+def extract_product_options(body):
+    return extract_product_options_from_lines(prepare_body_lines(body))
 
 
 def read_personalization_config():
@@ -887,14 +1001,13 @@ def extract_original_shop(body):
 
 
 def extract_shop(body):
-    shop_name = extract_original_shop(body)
-    if not shop_name:
-        return ""
+    return extract_original_shop(body)
 
-    config = SHOP_MAP.get(shop_name.casefold())
-    if not config:
-        return shop_name
-    return f'{config["sheetName"]}/{shop_name}'
+
+def extract_shop_name(body):
+    shop = extract_original_shop(body)
+    config = SHOP_MAP.get(shop.casefold()) if shop else None
+    return config["sheetName"] if config else ""
 
 
 def extract_order_number(subject, body):
@@ -1154,6 +1267,18 @@ def looks_like_product_title_continuation(line):
 
 
 def extract_product_section(lines):
+    option_start, _ = find_product_option_span(lines)
+    if option_start > 0:
+        title_start = option_start - 1
+        while title_start > 0:
+            previous_line = lines[title_start - 1]
+            if PRODUCT_BLOCK_BOUNDARY_PATTERN.search(previous_line):
+                break
+            if not looks_like_product_title_continuation(previous_line):
+                break
+            title_start -= 1
+        return " ".join(lines[title_start:option_start]).strip()
+
     personalization_index = find_line_index(
         lines,
         r"^Personalization(?:\s*:|\s*$)",
@@ -1203,14 +1328,6 @@ def extract_product_section(lines):
         product_lines = lines[max(0, end_index - 1):end_index]
 
     return "\n".join(collapse_repeated_suffix(product_lines)).strip()
-
-
-def split_product_and_specifications(product_section):
-    """Split the product title from all lines that describe its variants."""
-    lines = [line.strip() for line in product_section.splitlines() if line.strip()]
-    if not lines:
-        return "", ""
-    return lines[0], "\n".join(lines[1:])
 
 
 def extract_order_details(body):
@@ -1288,24 +1405,44 @@ def extract_grouped_order_fields(body):
         "订单详情": "\n\n".join(
             section for section in (payment_method, shipping_address) if section
         ),
-        "商品信息": product_section,
+        "商品信息": extract_product_options_from_lines(lines),
         "个人定制信息": extract_personalization_section(product_section),
         "订单价格": extract_price_section(lines),
     }
 
 
-def parse_order_fields(subject, body, email_date, metadata=None, uid=None):
+def parse_order_fields(
+    subject,
+    body,
+    email_date,
+    metadata=None,
+    uid=None,
+    shop_lookup=None,
+):
+    original_shop = extract_original_shop(body)
+    shop = extract_shop(body)
+    shop_name = extract_shop_name(body)
+    if shop_lookup is not None and not shop_lookup(
+        original_shop,
+        shop_name,
+    ):
+        raise ShopNotFoundError(
+            f"系统没有此店铺：{original_shop or shop_name or '空店铺名'}"
+        )
+
     lines = prepare_body_lines(body)
     product_section = extract_product_section(lines)
-    product_name, specifications = split_product_and_specifications(product_section)
+    product_name = next(
+        (
+            line.strip()
+            for line in product_section.splitlines()
+            if line.strip()
+        ),
+        "",
+    )
     if not product_name:
         product_name = extract_product_name(body)
-    personalization_text = extract_personalization_text(body)
-    original_shop = extract_original_shop(body)
-    personalization_rules = load_personalization_rules(
-        original_shop,
-        product_name,
-    )
+    product_information = extract_product_options_from_lines(lines)
     payment_method = remove_section_heading(
         extract_payment_method_section(lines),
         "Payment method",
@@ -1317,13 +1454,10 @@ def parse_order_fields(subject, body, email_date, metadata=None, uid=None):
     shipping_address = " ".join(shipping_address.splitlines())
     return {
         "订单号": extract_order_number(subject, body),
-        "店铺": extract_shop(body),
+        "店铺": shop,
+        "店铺名": shop_name,
         "产品": product_name,
-        "规格/尺寸": specifications,
-        "定制信息": classify_personalization(
-            personalization_text,
-            personalization_rules,
-        ),
+        "商品信息": product_information,
         "付款方式": payment_method,
         "邮寄地址": shipping_address,
         "交易编号": extract_transaction_id(body),
@@ -1383,7 +1517,12 @@ def dispatch_order(order_handler, order_data, uid=None, metadata=None):
     return order_handler(order_data, uid=uid, metadata=metadata or {})
 
 
-def process_new_messages(client, last_uid, order_handler=None):
+def process_new_messages(
+    client,
+    last_uid,
+    order_handler=None,
+    shop_lookup=None,
+):
     all_uids = client.search(["ALL"])
     new_uids = sorted(uid for uid in all_uids if uid > last_uid)
 
@@ -1427,6 +1566,7 @@ def process_new_messages(client, last_uid, order_handler=None):
                 email_date=message.get("Date", ""),
                 metadata=metadata,
                 uid=uid,
+                shop_lookup=shop_lookup,
             )
 
             print("\n解析后的订单字段：", flush=True)
@@ -1446,6 +1586,14 @@ def process_new_messages(client, last_uid, order_handler=None):
                 flush=True,
             )
 
+        except ShopNotFoundError as exc:
+            print(
+                f"跳过 UID={uid}：{exc}",
+                flush=True,
+            )
+            last_uid = uid
+            save_last_uid(last_uid)
+            continue
         except PersonalizationRuleNotFound as exc:
             print(
                 f"跳过 UID={uid}：{exc}",
@@ -1497,7 +1645,7 @@ def wait_for_stop(stop_event, timeout):
     return stop_event.wait(timeout)
 
 
-def poll_mailbox_once(order_handler=None):
+def poll_mailbox_once(order_handler=None, shop_lookup=None):
     """Connect once, process all pending UIDs, then disconnect."""
     last_uid = load_last_uid()
     previous_uid = last_uid
@@ -1515,7 +1663,12 @@ def poll_mailbox_once(order_handler=None):
                 "advanced": max(0, last_uid - previous_uid),
             }
 
-        last_uid = process_new_messages(client, last_uid, order_handler)
+        last_uid = process_new_messages(
+            client,
+            last_uid,
+            order_handler,
+            shop_lookup,
+        )
         return {
             "initialized": False,
             "previous_uid": previous_uid,
@@ -1530,7 +1683,11 @@ def poll_mailbox_once(order_handler=None):
                 pass
 
 
-def listen_forever(stop_event=None, order_handler=None):
+def listen_forever(
+    stop_event=None,
+    order_handler=None,
+    shop_lookup=None,
+):
     last_uid = load_last_uid()
     reconnect_delay = 5
 
@@ -1566,12 +1723,14 @@ def listen_forever(stop_event=None, order_handler=None):
                         client,
                         last_uid,
                         order_handler,
+                        shop_lookup,
                     )
                 elif idle_round >= 4:
                     last_uid = process_new_messages(
                         client,
                         last_uid,
                         order_handler,
+                        shop_lookup,
                     )
                     idle_round = 0
 
@@ -1636,7 +1795,6 @@ def validate_config():
             "不要使用示例占位文字。"
         )
 
-    validate_personalization_config(read_personalization_config())
 
 
 def main():
