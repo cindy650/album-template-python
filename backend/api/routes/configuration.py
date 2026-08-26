@@ -3,10 +3,14 @@ from fastapi import APIRouter
 from backend.responses import api_success
 
 
-router = APIRouter(tags=["configuration"])
+router = APIRouter(tags=["配置"])
 
 
-@router.get("/personalization-rules")
+@router.get(
+    "/personalization-rules",
+    summary="查询订单定制规则状态",
+    description="查询旧版订单定制规则是否启用；当前订单改为直接提取邮件中的独立字段。",
+)
 async def get_personalization_rules():
     return api_success(
         {

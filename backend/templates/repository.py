@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from threading import Lock
 from typing import Any
-import sqlite3
+from backend.database import connection_scope
 
 
 def utc_now():
@@ -13,27 +12,17 @@ def utc_now():
 
 
 class TemplateRepository:
-    """SQLite storage for printable template fields and their UI labels."""
+    """MySQL storage for printable template fields and their UI labels."""
 
-    def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, database_url):
+        self.database_url = database_url
         self._lock = Lock()
         self.initialize()
 
     @contextmanager
     def connect(self):
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        try:
+        with connection_scope(self.database_url) as connection:
             yield connection
-        except Exception:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
-        finally:
-            connection.close()
 
     def initialize(self):
         with self._lock, self.connect() as connection:

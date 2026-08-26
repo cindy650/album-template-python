@@ -13,9 +13,11 @@ class MailListenerManager:
         self,
         order_handler: Callable | None = None,
         shop_lookup: Callable | None = None,
+        product_lookup: Callable | None = None,
     ):
         self._order_handler = order_handler
         self._shop_lookup = shop_lookup
+        self._product_lookup = product_lookup
         self._lock = Lock()
         self._thread: Thread | None = None
         self._stop_event: Event | None = None
@@ -47,6 +49,7 @@ class MailListenerManager:
                 self._stop_event,
                 order_handler=self._order_handler,
                 shop_lookup=self._shop_lookup,
+                product_lookup=self._product_lookup,
             )
         except Exception as exc:
             with self._lock:

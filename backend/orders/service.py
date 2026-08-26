@@ -4,10 +4,9 @@ from threading import Thread
 import time
 from typing import Any
 
-import qq_idleCopy as core
 from backend.events import event_bus
-from backend.orders.google_sheets_retry import GoogleSheetsRetryWorker
 from backend.orders.repository import OrderRepository
+from backend.orders.statuses import PREVIEW_SENT_ORDER_STATUS
 
 
 class OrderService:
@@ -17,15 +16,15 @@ class OrderService:
         template_image_generator=None,
         template_image_retry_attempts: int = 3,
         template_image_retry_delay_seconds: float = 5,
-        google_sheets_publisher=None,
-        google_sheets_retry_initial_seconds: float = 30,
-        google_sheets_retry_max_seconds: float = 900,
         wecom_notifier=None,
+        order_print_image_generator=None,
+        production_artifact_service=None,
     ):
         self.repository = repository
         self.template_image_generator = template_image_generator
-        self.google_sheets_publisher = google_sheets_publisher or core.post_order
         self.wecom_notifier = wecom_notifier
+        self.order_print_image_generator = order_print_image_generator
+        self.production_artifact_service = production_artifact_service
         self.template_image_retry_attempts = max(
             0,
             int(template_image_retry_attempts),
@@ -34,21 +33,6 @@ class OrderService:
             0.0,
             float(template_image_retry_delay_seconds),
         )
-        self.google_sheets_retry_worker = GoogleSheetsRetryWorker(
-            repository,
-            self.google_sheets_publisher,
-            initial_delay_seconds=google_sheets_retry_initial_seconds,
-            max_delay_seconds=google_sheets_retry_max_seconds,
-        )
-
-    def start(self):
-        self.google_sheets_retry_worker.start()
-
-    def shutdown(self):
-        self.google_sheets_retry_worker.shutdown()
-
-    def google_sheets_retry_status(self):
-        return self.google_sheets_retry_worker.status()
 
     def publish_order(
         self,
@@ -72,42 +56,28 @@ class OrderService:
                 order.get("商品信息", {}),
             ),
         }
-        try:
-            google_result = self.google_sheets_publisher(order)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            self.google_sheets_retry_worker.schedule(saved["id"])
-            google_result = {
-                "ok": False,
-                "status": "pending_retry",
-                "attempts": 1,
-                "error": error,
-            }
-            print(
-                "[Google Sheets] 首次写入失败，已加入内存补写队列："
-                f"订单ID={saved['id']}，订单号={saved['order_number']}，"
-                f"{error}",
-                flush=True,
+        saved_event_order = {
+            key: saved.get(key)
+            for key in (
+                "id",
+                "order_number",
+                "shop",
+                "shop_name",
+                "product",
+                "shop_id",
+                "size_template_id",
+                "status",
+                "status_text",
+                "status_button_text",
             )
-            event_bus.publish(
-                "order.google_sheets.failed",
-                {
-                    "order": saved,
-                    "error": error,
-                    "retry_scheduled": True,
-                },
-            )
+        }
         event_bus.publish(
             "order.saved",
-            {
-                "order": saved,
-                "google_sheets": google_result,
-                "source": source,
-            },
+            {"order": saved_event_order},
+            msg="新订单已入库",
         )
         return {
             "order": order,
-            "google_sheets": google_result,
             "local_order": saved,
         }
 
@@ -118,6 +88,21 @@ class OrderService:
             uid=uid,
             metadata=metadata or {},
         )
+        saved_order = result.get("local_order") or {}
+        if not saved_order.get("size_template_id"):
+            result["template_image"] = {
+                "ok": False,
+                "status": "skipped",
+                "reason": "size_template_not_associated",
+                "message": "商品未关联模板，已跳过后续图片生成和通知",
+            }
+            print(
+                "[订单] 商品未关联模板，跳过后续图片生成和通知："
+                f"订单ID={saved_order.get('id') or '空'}，"
+                f"订单号={saved_order.get('order_number') or '空'}",
+                flush=True,
+            )
+            return result
         if self.template_image_generator is not None:
             try:
                 image_result = self._generate_template_image_once(
@@ -155,6 +140,68 @@ class OrderService:
                 result["template_image"] = image_result
         return result
 
+    def send_preview_images(self, order_id: int, order_number: str):
+        current_order = self.repository.get_by_id_and_order_number(
+            order_id,
+            order_number,
+        )
+        if current_order.get("status") != 0:
+            raise ValueError("只有新订单状态可以发送示意图")
+        saved_order = self.repository.associate_current_template(
+            order_id,
+            order_number,
+        )
+        if self.template_image_generator is None:
+            raise RuntimeError("未配置订单预览图生成器")
+        if self.wecom_notifier is None:
+            raise RuntimeError("未配置企业微信机器人，无法发送示意图")
+
+        order = self.repository.order_payload(saved_order["id"])
+        preview_result = self.template_image_generator.generate_for_order(
+            order,
+            saved_order=saved_order,
+            reuse_snapshot=False,
+            upload_to_oss=False,
+        )
+        order_info_result = self._generate_order_info_image(
+            saved_order,
+            preview_result,
+        )
+        if self.production_artifact_service is not None:
+            preview_result["production_files"] = self.production_artifact_service.generate_order_artifacts(
+                saved_order["id"], saved_order["order_number"],
+                preview_result=preview_result,
+            )
+        notification = self.wecom_notifier.notify_order_image(
+            order,
+            preview_result,
+            saved_order=saved_order,
+            order_info_image_result=order_info_result,
+        )
+        if not notification.get("ok") or notification.get("status") != "sent":
+            raise RuntimeError("企业微信示意图发送失败，订单状态未变更")
+
+        updated_order = self.repository.update_status(
+            saved_order["id"],
+            PREVIEW_SENT_ORDER_STATUS,
+        )
+        event_bus.publish(
+            "order.preview_images.sent",
+            {
+                "order": updated_order,
+                "preview_image": preview_result,
+                "order_info_image": order_info_result,
+                "notification": notification,
+                "source": "api",
+            },
+        )
+        return {
+            "order": updated_order,
+            "preview_image": preview_result,
+            "order_info_image": order_info_result,
+            "wecom": notification,
+        }
+
     def _generate_template_image_once(
         self,
         order,
@@ -167,6 +214,8 @@ class OrderService:
             order,
             saved_order=result.get("local_order"),
             metadata=metadata,
+            reuse_snapshot=False,
+            upload_to_oss=False,
         )
         if self.wecom_notifier is not None:
             image_result["wecom"] = self._notify_wecom(
@@ -174,6 +223,12 @@ class OrderService:
                 result.get("local_order"),
                 image_result,
                 uid,
+            )
+        if self.production_artifact_service is not None:
+            local_order = result.get("local_order") or {}
+            image_result["production_files"] = self.production_artifact_service.generate_order_artifacts(
+                local_order["id"], local_order["order_number"],
+                preview_result=image_result,
             )
         event_bus.publish(
             "order.template_image.generated",
@@ -189,10 +244,15 @@ class OrderService:
 
     def _notify_wecom(self, order, saved_order, image_result, uid):
         try:
+            order_info_image_result = self._generate_order_info_image(
+                saved_order,
+                image_result,
+            )
             notification = self.wecom_notifier.notify_order_image(
                 order,
                 image_result,
                 saved_order=saved_order,
+                order_info_image_result=order_info_image_result,
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -228,7 +288,30 @@ class OrderService:
                     "notification": notification,
                 },
             )
+            if (
+                saved_order.get("status") == 0
+                and notification.get("ok")
+                and notification.get("status") == "sent"
+            ):
+                updated_order = self.repository.update_status(
+                    saved_order["id"],
+                    PREVIEW_SENT_ORDER_STATUS,
+                )
+                if isinstance(saved_order, dict):
+                    saved_order.update(updated_order)
         return notification
+
+    def _generate_order_info_image(self, saved_order, preview_result):
+        if self.order_print_image_generator is None:
+            raise RuntimeError("未配置订单信息图生成器")
+        if not saved_order:
+            raise RuntimeError("缺少本地订单，无法生成订单信息图")
+        return self.order_print_image_generator.generate(
+            saved_order["id"],
+            saved_order["order_number"],
+            preview_result=preview_result,
+            upload_to_oss=False,
+        )
 
     def _publish_template_image_failure(
         self,

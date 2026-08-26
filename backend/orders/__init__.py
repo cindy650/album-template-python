@@ -3,6 +3,7 @@ __all__ = [
     "OrderPrintImageGenerator",
     "OrderRepository",
     "OrderService",
+    "WeComOrderInfoImageGenerator",
 ]
 
 
@@ -18,10 +19,12 @@ def __getattr__(name):
     if name in {
         "DeepSeekProductInformationTranslator",
         "OrderPrintImageGenerator",
+        "WeComOrderInfoImageGenerator",
     }:
         from backend.orders.print_image import (
             DeepSeekProductInformationTranslator,
             OrderPrintImageGenerator,
+            WeComOrderInfoImageGenerator,
         )
 
         return {
@@ -29,5 +32,6 @@ def __getattr__(name):
                 DeepSeekProductInformationTranslator
             ),
             "OrderPrintImageGenerator": OrderPrintImageGenerator,
+            "WeComOrderInfoImageGenerator": WeComOrderInfoImageGenerator,
         }[name]
     raise AttributeError(name)

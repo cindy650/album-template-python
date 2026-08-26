@@ -23,18 +23,20 @@ def api_success(
     message: str = "success",
     code: str = "OK",
     status_code: int = 200,
+    pagination: dict[str, Any] | None = None,
 ):
+    content = {
+        "success": True,
+        "code": code,
+        "message": message,
+        "data": data,
+        "error": None,
+    }
+    if pagination:
+        content.update(pagination)
     return JSONResponse(
         status_code=status_code,
-        content=jsonable_encoder(
-            {
-                "success": True,
-                "code": code,
-                "message": message,
-                "data": data,
-                "error": None,
-            }
-        ),
+        content=jsonable_encoder(content),
     )
 
 

@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+image-map-headless-renderer/test-output/
+*.pyc
+generated_template_imports/
+generated_font_layout_previews/
+generated_order_print_images/
+generated_orders/
+generated_template_exports/
+generated_template_images/
+generated_template_jpgs/
+simulated_render/

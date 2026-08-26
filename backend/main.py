@@ -10,7 +10,8 @@ import qq_idleCopy as core
 from backend import __version__
 from backend.api import api_router
 from backend.config import settings
-from backend.context import listener, order_service, tasks
+from backend.context import image_map_renderer, listener, order_service, tasks
+from backend.database import dispose_pools
 from backend.responses import api_code_for_status, api_error, api_success
 
 
@@ -18,21 +19,21 @@ from backend.responses import api_code_for_status, api_error, api_success
 async def lifespan(app):
     core.configure_utf8_console()
     socket.setdefaulttimeout(30)
-    order_service.start()
     if settings.auto_start_mail_listener:
         listener.start()
     yield
     listener.shutdown()
-    order_service.shutdown()
     tasks.shutdown()
+    image_map_renderer.close()
+    dispose_pools()
 
 
 app = FastAPI(
-    title="Etsy QQ Mail Order Backend",
+    title="Etsy QQ 邮箱订单管理服务",
     version=__version__,
     description=(
         "监听 QQ 邮箱中的 Etsy 订单，解析订单与独立商品字段，"
-        "写入 Google Sheets、本地 SQLite，并通过 SSE 推送实时事件。"
+        "写入 MySQL，并通过 SSE 推送实时事件。"
     ),
     docs_url="/docs",
     redoc_url="/redoc",
@@ -110,7 +111,12 @@ async def root():
     }
 
 
-@app.get("/health", tags=["system"])
+@app.get(
+    "/health",
+    tags=["系统"],
+    summary="服务健康检查",
+    description="检查服务运行状态、基础配置和邮箱监听状态。",
+)
 async def health():
     try:
         core.validate_config()
@@ -126,7 +132,6 @@ async def health():
             "configuration": configuration,
             "configuration_error": configuration_error,
             "listener": listener.status(),
-            "google_sheets_retry": order_service.google_sheets_retry_status(),
         },
         message="服务健康检查成功",
     )

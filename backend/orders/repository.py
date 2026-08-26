@@ -2,14 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any
 import json
 import re
-import sqlite3
 from threading import Lock
 
-from backend.orders.statuses import DEFAULT_ORDER_STATUS, ORDER_STATUSES
+from backend.database import (
+    connection_scope,
+    connect,
+    foreign_keys,
+    json_array_contains_sql,
+    table_columns,
+    table_exists,
+    table_names,
+)
+
+from backend.orders.statuses import (
+    DEFAULT_ORDER_STATUS,
+    ORDER_STATUS_SEED,
+)
 
 
 FIELD_LABELS = {
@@ -30,8 +41,6 @@ FIELD_LABELS = {
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
-
-ORDER_STATUS_SQL = ", ".join(f"'{status}'" for status in ORDER_STATUSES)
 
 LEGACY_PRODUCT_VALUE_COLUMNS = {
     "pages_album_size": "Pages Quantity | Album Size",
@@ -63,40 +72,21 @@ LEGACY_PRODUCT_INFORMATION_COLUMNS = (
     "product_options_text",
 )
 
-LEGACY_GOOGLE_SHEETS_COLUMNS = (
-    "google_sheets_json",
-    "google_sheets_status",
-    "google_sheets_attempts",
-    "google_sheets_last_error",
-    "google_sheets_updated_at",
-)
-
-
 class OrderRepository:
-    def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, database_url):
+        self.database_url = database_url
         self._lock = Lock()
         self.initialize()
 
     @contextmanager
     def connect(self):
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        try:
+        with connection_scope(self.database_url) as connection:
             yield connection
-        except Exception:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
-        finally:
-            connection.close()
 
     def initialize(self):
         with self._lock, self.connect() as connection:
             self._ensure_shop_table(connection)
+            self._ensure_order_status_table(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS orders (
@@ -110,6 +100,8 @@ class OrderRepository:
                     shop_name TEXT,
                     product TEXT,
                     product_information TEXT NOT NULL DEFAULT '{}',
+                    matched_template_json TEXT NOT NULL DEFAULT '{}',
+                    resolved_layers_json TEXT NOT NULL DEFAULT '{}',
                     payment_method TEXT,
                     shipping_address TEXT,
                     quantity TEXT,
@@ -126,8 +118,8 @@ class OrderRepository:
                     size_template_id_text TEXT NOT NULL
                         DEFAULT '关联商品模板ID',
                     product_information_text TEXT NOT NULL DEFAULT '商品信息',
-                    status TEXT NOT NULL DEFAULT '新订单'
-                        CHECK (status IN ('新订单', '确认中', '已确认', '生产中', '已发货')),
+                    status INTEGER NOT NULL DEFAULT 0
+                        REFERENCES order_statuses(status),
                     source TEXT,
                     uid INTEGER,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -136,9 +128,28 @@ class OrderRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_artifacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    artifact_type VARCHAR(64) NOT NULL,
+                    file_format VARCHAR(16) NOT NULL,
+                    filename VARCHAR(255) NOT NULL,
+                    local_path TEXT NOT NULL,
+                    oss_url TEXT,
+                    oss_object_key TEXT,
+                    oss_status TEXT NOT NULL DEFAULT 'pending',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(order_id, artifact_type, file_format)
+                )
+                """
+            )
             existing_columns = {
                 row["name"]
-                for row in connection.execute("PRAGMA table_info(orders)")
+                for row in table_columns(connection, "orders")
             }
             for column, label in FIELD_LABELS.items():
                 if column not in existing_columns:
@@ -154,16 +165,24 @@ class OrderRepository:
                 ),
                 "shop_name": "TEXT",
                 "product_information": "TEXT NOT NULL DEFAULT '{}'",
-                "status": (
-                    f"TEXT NOT NULL DEFAULT '{DEFAULT_ORDER_STATUS}' "
-                    f"CHECK (status IN ({ORDER_STATUS_SQL}))"
-                ),
+                "matched_template_json": "TEXT NOT NULL DEFAULT '{}'",
+                "resolved_layers_json": "TEXT NOT NULL DEFAULT '{}'",
+                "status": f"INTEGER NOT NULL DEFAULT {DEFAULT_ORDER_STATUS}",
             }
             for column, definition in migrations.items():
                 if column not in existing_columns:
                     connection.execute(
                         f"ALTER TABLE orders ADD COLUMN {column} {definition}"
                     )
+            connection.execute(
+                """
+                UPDATE orders
+                SET resolved_layers_json = '{}'
+                WHERE resolved_layers_json IS NULL
+                   OR resolved_layers_json = ''
+                   OR resolved_layers_json = '[]'
+                """
+            )
             for column in LEGACY_PERSONALIZATION_COLUMNS:
                 if column in existing_columns:
                     connection.execute(f"ALTER TABLE orders DROP COLUMN {column}")
@@ -177,18 +196,19 @@ class OrderRepository:
             for column in LEGACY_PRODUCT_INFORMATION_COLUMNS:
                 if column in existing_columns:
                     connection.execute(f"ALTER TABLE orders DROP COLUMN {column}")
-            for column in LEGACY_GOOGLE_SHEETS_COLUMNS:
-                if column in existing_columns:
-                    connection.execute(f"ALTER TABLE orders DROP COLUMN {column}")
             connection.execute("DROP TABLE IF EXISTS order_product_information")
+            self._migrate_order_status_schema(connection)
             connection.execute(
-                f"""
-                UPDATE orders
-                SET status = '{DEFAULT_ORDER_STATUS}'
-                WHERE status IS NULL
-                   OR status = ''
-                   OR status NOT IN ({ORDER_STATUS_SQL})
                 """
+                UPDATE orders
+                SET status = ?
+                WHERE status IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1 FROM order_statuses
+                       WHERE order_statuses.status = orders.status
+                   )
+                """,
+                (DEFAULT_ORDER_STATUS,),
             )
             self._link_existing_orders_to_shops(connection)
             self._link_existing_orders_to_products(connection)
@@ -264,7 +284,7 @@ class OrderRepository:
             )
             if product_link is None:
                 message = (
-                    "商品表中没有匹配商品："
+                    "店铺商品列表中没有匹配商品："
                     f"店铺={row_data['shop'] or '空'}，"
                     f"商品={row_data['product'] or '空'}"
                 )
@@ -277,13 +297,13 @@ class OrderRepository:
             print(
                 "[订单] 商品关联成功："
                 f"店铺ID={row_data['shop_id']}，"
-                f"模板ID={row_data['size_template_id']}",
+                f"模板ID={row_data['size_template_id'] or '未关联'}",
                 flush=True,
             )
             existing = self._find_existing(connection, row_data)
             previous_shop_id = existing["shop_id"] if existing is not None else None
             print(
-                "[订单] 正在写入本地数据库："
+                "[订单] 正在写入 MySQL 订单库："
                 f"订单号={row_data['order_number'] or '空'}",
                 flush=True,
             )
@@ -373,7 +393,7 @@ class OrderRepository:
             saved = self.get(order_id)
         saved["created"] = created
         print(
-            "[订单] 本地数据库写入成功："
+            "[订单] MySQL 订单库写入成功："
             f"订单ID={saved['id']}，订单号={saved['order_number'] or '空'}，"
             f"模板ID={saved['size_template_id']}",
             flush=True,
@@ -395,13 +415,365 @@ class OrderRepository:
             "交易编号": saved["transaction_id"],
             "数量": saved["quantity"],
             "价格": saved["price"],
+            "matched_template": saved.get("matched_template"),
+            "resolved_layers": saved.get("resolved_layers"),
         }
 
+    def save_template_resolution(
+        self,
+        order_id: int,
+        matched_template: dict[str, Any],
+        resolved_layers: dict[str, Any],
+    ):
+        """Persist the exact template and layer snapshot used for rendering."""
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE orders
+                SET matched_template_json = ?,
+                    resolved_layers_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(matched_template or {}, ensure_ascii=False),
+                    json.dumps(resolved_layers or {}, ensure_ascii=False),
+                    utc_now(),
+                    order_id,
+                ),
+            )
+            connection.commit()
+        print(
+            f"[订单] 模板解析快照已保存：订单ID={order_id}，"
+            f"尺寸模板={bool(matched_template)}，图层={len((resolved_layers or {}).get('objects') or (resolved_layers or {}).get('elements') or [])}",
+            flush=True,
+        )
+        return self.get(order_id)
+
+    def save_template_json(
+        self,
+        order_id: int,
+        order_number: str,
+        template_json: dict[str, Any],
+    ):
+        """Save the frontend-editable Fabric document on an order."""
+        normalized_order_number = str(order_number or "").strip()
+        if not normalized_order_number:
+            raise ValueError("订单号不能为空")
+        if not isinstance(template_json, dict):
+            raise ValueError("template_json 必须是对象")
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id FROM orders
+                WHERE id = ? AND order_number = ?
+                LIMIT 1
+                """,
+                (order_id, normalized_order_number),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
+            connection.execute(
+                """
+                UPDATE orders
+                SET resolved_layers_json = ?, updated_at = ?
+                WHERE id = ? AND order_number = ?
+                """,
+                (
+                    json.dumps(template_json, ensure_ascii=False),
+                    utc_now(),
+                    order_id,
+                    normalized_order_number,
+                ),
+            )
+            connection.commit()
+        return self.get(order_id)
+
+    def save_artifact(self, order_id: int, artifact: dict[str, Any]):
+        """Upsert one generated order file and its OSS result."""
+        now = utc_now()
+        oss = artifact.get("oss") if isinstance(artifact.get("oss"), dict) else {}
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO order_artifacts
+                    (order_id, artifact_type, file_format, filename, local_path,
+                     oss_url, oss_object_key, oss_status, file_size, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_id, artifact_type, file_format) DO UPDATE SET
+                    filename = excluded.filename,
+                    local_path = excluded.local_path,
+                    oss_url = excluded.oss_url,
+                    oss_object_key = excluded.oss_object_key,
+                    oss_status = excluded.oss_status,
+                    file_size = excluded.file_size,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    order_id,
+                    str(artifact.get("artifact_type") or "artifact"),
+                    str(artifact.get("file_format") or ""),
+                    str(artifact.get("filename") or ""),
+                    str(artifact.get("local_path") or ""),
+                    str(oss.get("url") or "") or None,
+                    str(oss.get("object_key") or "") or None,
+                    str(oss.get("status") or "pending"),
+                    int(artifact.get("file_size") or 0),
+                    now,
+                    now,
+                ),
+            )
+        return artifact
+
+    def delete_artifacts_by_type(self, order_id: int, artifact_type: str) -> int:
+        """Delete obsolete artifact records for one order and artifact type."""
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                "SELECT COUNT(*) AS count FROM order_artifacts "
+                "WHERE order_id = ? AND artifact_type = ?",
+                (order_id, str(artifact_type)),
+            ).fetchone()["count"]
+            connection.execute(
+                "DELETE FROM order_artifacts WHERE order_id = ? AND artifact_type = ?",
+                (order_id, str(artifact_type)),
+            )
+            connection.commit()
+        deleted = max(0, int(existing or 0))
+        if deleted:
+            print(
+                f"[订单] 已删除旧产物记录：订单ID={order_id}，"
+                f"类型={artifact_type}，数量={deleted}",
+                flush=True,
+            )
+        return deleted
+
+    def list_artifacts(self, order_id: int, order_number: str | None = None):
+        suffix = "WHERE oa.order_id = ?"
+        params: list[Any] = [order_id]
+        if order_number is not None:
+            suffix += " AND o.order_number = ?"
+            params.append(str(order_number))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT oa.*
+                FROM order_artifacts oa
+                JOIN orders o ON o.id = oa.order_id
+                {suffix}
+                ORDER BY oa.id
+                """,
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _validate_status(self, status: int):
+        try:
+            normalized = int(status)
+        except (TypeError, ValueError):
+            normalized = None
+        with self.connect() as connection:
+            definition = self._status_definition(connection, normalized)
+            if definition is not None:
+                return definition["status"]
+            allowed = "、".join(
+                str(row["status"])
+                for row in connection.execute(
+                    "SELECT status FROM order_statuses ORDER BY status"
+                )
+            )
+        raise ValueError(f"订单状态值必须是：{allowed}")
+
     @staticmethod
-    def _validate_status(status: str):
-        if status not in ORDER_STATUSES:
-            allowed = "、".join(ORDER_STATUSES)
-            raise ValueError(f"订单状态必须是：{allowed}")
+    def _status_definition(connection, status):
+        if status is None:
+            return None
+        return connection.execute(
+            """
+            SELECT status, status_text, status_button_text
+            FROM order_statuses
+            WHERE status = ?
+            """,
+            (status,),
+        ).fetchone()
+
+    @staticmethod
+    def _ensure_order_status_table(connection):
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_statuses (
+                status INTEGER PRIMARY KEY,
+                status_text TEXT NOT NULL,
+                status_button_text TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        columns = {
+            row["name"] for row in table_columns(connection, "shops")
+        }
+        if "product_names_json" not in columns:
+            connection.execute(
+                "ALTER TABLE shops ADD COLUMN product_names_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        connection.executemany(
+            """
+            INSERT INTO order_statuses (
+                status, status_text, status_button_text
+            ) VALUES (?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                status_text = VALUES(status_text),
+                status_button_text = VALUES(status_button_text)
+            """,
+            ORDER_STATUS_SEED,
+        )
+
+    @staticmethod
+    def _migrate_order_status_schema(connection):
+        columns = {
+            row["name"]: row
+            for row in table_columns(connection, "orders")
+        }
+        status_column = columns.get("status")
+        status_has_foreign_key = any(
+            row["from"] == "status" and row["table"] == "order_statuses"
+                for row in foreign_keys(connection, "orders")
+        )
+        if (
+            status_column is not None
+            and "status_text" not in columns
+            # A numeric status column with no legacy status_text column is
+            # already normalized.
+            and (status_has_foreign_key or getattr(connection, "mysql", False))
+        ):
+            return
+
+        legacy_table = "orders_status_legacy"
+        connection.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+        connection.execute(f"ALTER TABLE orders RENAME TO {legacy_table}")
+        size_template_reference = (
+            "REFERENCES size_templates(id) ON DELETE SET NULL"
+            if table_exists(connection, "size_templates")
+            else ""
+        )
+        connection.execute(
+            f"""
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_number TEXT,
+                transaction_id TEXT,
+                shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL,
+                size_template_id INTEGER
+                    {size_template_reference},
+                shop TEXT,
+                shop_name TEXT,
+                product TEXT,
+                product_information TEXT NOT NULL DEFAULT '{{}}',
+                matched_template_json TEXT NOT NULL DEFAULT '{{}}',
+                resolved_layers_json TEXT NOT NULL DEFAULT '{{}}',
+                payment_method TEXT,
+                shipping_address TEXT,
+                quantity TEXT,
+                price TEXT,
+                order_number_text TEXT NOT NULL DEFAULT '订单号',
+                shop_text TEXT NOT NULL DEFAULT '店铺',
+                shop_name_text TEXT NOT NULL DEFAULT '店铺名',
+                product_text TEXT NOT NULL DEFAULT '产品',
+                payment_method_text TEXT NOT NULL DEFAULT '付款方式',
+                shipping_address_text TEXT NOT NULL DEFAULT '邮寄地址',
+                transaction_id_text TEXT NOT NULL DEFAULT '交易编号',
+                quantity_text TEXT NOT NULL DEFAULT '数量',
+                price_text TEXT NOT NULL DEFAULT '价格',
+                size_template_id_text TEXT NOT NULL DEFAULT '关联商品模板ID',
+                product_information_text TEXT NOT NULL DEFAULT '商品信息',
+                status INTEGER NOT NULL DEFAULT 0
+                    REFERENCES order_statuses(status),
+                source TEXT,
+                uid INTEGER,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy_columns = {
+            row["name"]
+            for row in connection.execute(
+                f"SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{legacy_table}'"
+            )
+        }
+        target_defaults = {
+            "id": "NULL",
+            "order_number": "NULL",
+            "transaction_id": "NULL",
+            "shop_id": "NULL",
+            "size_template_id": "NULL",
+            "shop": "NULL",
+            "shop_name": "NULL",
+            "product": "NULL",
+            "product_information": "'{}'",
+            "matched_template_json": "'{}'",
+            "resolved_layers_json": "'{}'",
+            "payment_method": "NULL",
+            "shipping_address": "NULL",
+            "quantity": "NULL",
+            "price": "NULL",
+            "order_number_text": "'订单号'",
+            "shop_text": "'店铺'",
+            "shop_name_text": "'店铺名'",
+            "product_text": "'产品'",
+            "payment_method_text": "'付款方式'",
+            "shipping_address_text": "'邮寄地址'",
+            "transaction_id_text": "'交易编号'",
+            "quantity_text": "'数量'",
+            "price_text": "'价格'",
+            "size_template_id_text": "'关联商品模板ID'",
+            "product_information_text": "'商品信息'",
+            "source": "NULL",
+            "uid": "NULL",
+            "metadata_json": "'{}'",
+            "created_at": "''",
+            "updated_at": "''",
+        }
+        target_columns = list(target_defaults)
+        select_values = [
+            column if column in legacy_columns else default
+            for column, default in target_defaults.items()
+        ]
+        if "status" in legacy_columns:
+            status_expression = """
+                CASE CAST(status AS TEXT)
+                    WHEN '0' THEN 0
+                    WHEN '1' THEN 1
+                    WHEN '2' THEN 2
+                    WHEN '3' THEN 3
+                    WHEN '4' THEN 4
+                    WHEN '5' THEN 5
+                    WHEN '新订单' THEN 0
+                    WHEN '确认中' THEN 1
+                    WHEN '客户确认中' THEN 1
+                    WHEN '已确认' THEN 2
+                    WHEN '待生产' THEN 2
+                    WHEN '生产中' THEN 3
+                    WHEN '已完成' THEN 5
+                    WHEN '未发货' THEN 4
+                    WHEN '待发货' THEN 4
+                    WHEN '已发货' THEN 5
+                    WHEN '订单已完成' THEN 5
+                    ELSE 0
+                END
+            """
+        else:
+            status_expression = "0"
+        target_columns.append("status")
+        select_values.append(status_expression)
+        connection.execute(
+            f"""
+            INSERT INTO orders ({', '.join(target_columns)})
+            SELECT {', '.join(select_values)} FROM {legacy_table}
+            """
+        )
+        connection.execute(f"DROP TABLE {legacy_table}")
 
     @staticmethod
     def _ensure_shop_table(connection):
@@ -411,6 +783,7 @@ class OrderRepository:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 shop TEXT NOT NULL UNIQUE,
                 shop_name TEXT NOT NULL,
+                product_names_json TEXT NOT NULL DEFAULT '[]',
                 product_count INTEGER NOT NULL DEFAULT 0,
                 order_count INTEGER NOT NULL DEFAULT 0,
                 size_template_count INTEGER NOT NULL DEFAULT 0,
@@ -433,12 +806,7 @@ class OrderRepository:
             for column in ("product_information_json", "product_options_json")
             if column in existing_columns
         ]
-        child_table_exists = connection.execute(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'order_product_information'
-            """
-        ).fetchone() is not None
+        child_table_exists = table_exists(connection, "order_product_information")
         selected_columns = ["id", "product_information"]
         selected_columns.extend(legacy_value_columns)
         selected_columns.extend(json_columns)
@@ -527,14 +895,23 @@ class OrderRepository:
             for part in reversed(shop.split("/"))
             if part.strip() and part.strip() not in candidates
         )
+        size_columns = {
+            row["name"]
+            for row in table_columns(connection, "size_templates")
+        }
+        product_column = (
+            "product_names_json"
+            if "product_names_json" in size_columns
+            else "product_names"
+        )
         for candidate in candidates:
             row = connection.execute(
-                """
+                f"""
                 SELECT id
                 FROM shops
-                WHERE shop = ? COLLATE NOCASE
-                   OR shop_name = ? COLLATE NOCASE
-                ORDER BY CASE WHEN shop = ? COLLATE NOCASE THEN 0 ELSE 1 END, id
+                WHERE shop = ?
+                   OR shop_name = ?
+                ORDER BY CASE WHEN shop = ? THEN 0 ELSE 1 END, id
                 LIMIT 1
                 """,
                 (candidate, candidate, candidate),
@@ -581,13 +958,8 @@ class OrderRepository:
             )
 
     def _link_existing_orders_to_products(self, connection):
-        required_tables = {"size_templates", "size_template_products"}
-        available_tables = {
-            row["name"]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
+        required_tables = {"size_templates"}
+        available_tables = set(table_names(connection))
         if not required_tables.issubset(available_tables):
             return
         rows = connection.execute(
@@ -635,36 +1007,41 @@ class OrderRepository:
         product = str(product or "").strip()
         if not shop or not product:
             return None
-        available = connection.execute(
-            """
-            SELECT 1
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'size_template_products'
-            """
-        ).fetchone()
-        if available is None:
-            return None
         candidates = [value for value in (shop, shop_name) if value]
         candidates.extend(
             part.strip()
             for part in reversed(shop.split("/"))
             if part.strip() and part.strip() not in candidates
         )
+        size_columns = {
+            row["name"]
+            for row in table_columns(connection, "size_templates")
+        }
+        product_column = (
+            "product_names_json"
+            if "product_names_json" in size_columns
+            else "product_names"
+        )
         for candidate in candidates:
             row = connection.execute(
-                """
-                SELECT st.shop_id, st.id AS size_template_id,
-                       s.shop, s.shop_name
-                FROM size_template_products p
-                JOIN size_templates st ON st.id = p.size_template_id
-                JOIN shops s ON s.id = st.shop_id
-                WHERE (s.shop = ? COLLATE NOCASE
-                    OR s.shop_name = ? COLLATE NOCASE)
-                  AND p.product_name = ? COLLATE NOCASE
-                ORDER BY st.id
+                f"""
+                SELECT s.id AS shop_id, s.shop, s.shop_name,
+                       (
+                           SELECT st.id
+                           FROM size_templates st
+                           WHERE st.shop_id = s.id
+                             AND {json_array_contains_sql(connection, f'st.{product_column}')}
+                           ORDER BY st.id
+                           LIMIT 1
+                       ) AS size_template_id
+                FROM shops s
+                WHERE (s.shop = ?
+                    OR s.shop_name = ?)
+                  AND {json_array_contains_sql(connection, 's.product_names_json')}
+                ORDER BY s.id
                 LIMIT 1
                 """,
-                (candidate, candidate, product),
+                (product, candidate, candidate, product),
             ).fetchone()
             if row is not None:
                 return row
@@ -682,44 +1059,27 @@ class OrderRepository:
             "SELECT COUNT(*) AS count FROM orders WHERE shop_id = ?",
             (shop_id,),
         ).fetchone()["count"]
-        size_template_exists = connection.execute(
-            """
-            SELECT 1
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'size_templates'
-            """
-        ).fetchone()
+        size_template_exists = table_exists(connection, "size_templates")
         size_template_count = 0
         font_template_count = 0
-        product_names = set()
-        order_products = connection.execute(
-            """
-            SELECT product
-            FROM orders
-            WHERE shop_id = ? AND COALESCE(product, '') != ''
-            """,
+        shop_row = connection.execute(
+            "SELECT product_names_json FROM shops WHERE id = ?",
             (shop_id,),
-        ).fetchall()
-        product_names.update(row["product"] for row in order_products)
-        if size_template_exists is not None:
+        ).fetchone()
+        try:
+            product_count = len(json.loads(shop_row["product_names_json"] or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            product_count = 0
+        if size_template_exists:
             size_template_count = connection.execute(
                 "SELECT COUNT(*) AS count FROM size_templates WHERE shop_id = ?",
                 (shop_id,),
             ).fetchone()["count"]
-            font_template_count = connection.execute(
-                "SELECT COUNT(*) AS count FROM font_templates WHERE shop_id = ?",
-                (shop_id,),
-            ).fetchone()["count"]
-            template_products = connection.execute(
-                """
-                SELECT p.product_name
-                FROM size_template_products p
-                JOIN size_templates st ON st.id = p.size_template_id
-                WHERE st.shop_id = ?
-                """,
-                (shop_id,),
-            ).fetchall()
-            product_names.update(row["product_name"] for row in template_products)
+            if table_exists(connection, "font_layout_library"):
+                font_template_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM font_layout_library WHERE shop_id = ?",
+                    (shop_id,),
+                ).fetchone()["count"]
         connection.execute(
             """
             UPDATE shops SET
@@ -730,7 +1090,7 @@ class OrderRepository:
             WHERE id = ?
             """,
             (
-                len(product_names),
+                product_count,
                 order_count,
                 size_template_count,
                 font_template_count,
@@ -756,13 +1116,18 @@ class OrderRepository:
     def list(
         self,
         limit: int = 50,
-        offset: int = 0,
+        pages: int = 1,
         order_number: str | None = None,
         transaction_id: str | None = None,
         shop: str | None = None,
         shop_id: int | None = None,
-        status: str | None = None,
+        status: int | None = None,
     ):
+        if pages < 1:
+            raise ValueError("页码必须从 1 开始")
+        if limit < 1:
+            raise ValueError("每页订单数量必须大于 0")
+        offset = (pages - 1) * limit
         where = []
         params: list[Any] = []
         if order_number:
@@ -777,8 +1142,8 @@ class OrderRepository:
         if shop_id is not None:
             where.append("shop_id = ?")
             params.append(shop_id)
-        if status:
-            self._validate_status(status)
+        if status is not None:
+            status = self._validate_status(status)
             where.append("status = ?")
             params.append(status)
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
@@ -788,23 +1153,33 @@ class OrderRepository:
                 params,
             ).fetchone()["count"]
             rows = connection.execute(
-                f"""
-                SELECT * FROM orders
-                {where_sql}
-                ORDER BY datetime(updated_at) DESC, id DESC
-                LIMIT ? OFFSET ?
-                """,
+                self._order_select(
+                    f"{where_sql} ORDER BY CAST(orders.updated_at AS DATETIME) DESC, "
+                    "orders.id DESC LIMIT ? OFFSET ?"
+                ),
                 [*params, limit, offset],
             ).fetchall()
         return {
             "items": [self.row_to_dict(row) for row in rows],
             "total": total,
             "limit": limit,
-            "offset": offset,
+            "pages": pages,
+            "total_pages": (total + limit - 1) // limit,
         }
 
-    def update_status(self, order_id: int, status: str):
-        self._validate_status(status)
+    def list_statuses(self):
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, status_text, status_button_text
+                FROM order_statuses
+                ORDER BY status
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_status(self, order_id: int, status: int):
+        status = self._validate_status(status)
         now = utc_now()
         with self._lock, self.connect() as connection:
             existing = connection.execute(
@@ -815,7 +1190,8 @@ class OrderRepository:
                 raise LookupError("订单不存在")
             connection.execute(
                 """
-                UPDATE orders SET status = ?, updated_at = ?
+                UPDATE orders
+                SET status = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (status, now, order_id),
@@ -823,10 +1199,105 @@ class OrderRepository:
             connection.commit()
         return self.get(order_id)
 
+    def associate_current_template(self, order_id: int, order_number: str):
+        normalized_order_number = str(order_number or "").strip()
+        if not normalized_order_number:
+            raise ValueError("订单号不能为空")
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id, shop, shop_name, product
+                FROM orders
+                WHERE id = ? AND order_number = ?
+                LIMIT 1
+                """,
+                (order_id, normalized_order_number),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
+            product_link = self._resolve_product_link(
+                connection,
+                existing["shop"],
+                existing["product"],
+                existing["shop_name"],
+            )
+            if product_link is None or not product_link["size_template_id"]:
+                raise ValueError(
+                    "订单商品尚未关联模板，无法生成并发送示意图："
+                    f"店铺={existing['shop'] or existing['shop_name'] or '空'}，"
+                    f"商品={existing['product'] or '空'}"
+                )
+            connection.execute(
+                """
+                UPDATE orders
+                SET shop_id = ?, size_template_id = ?,
+                    shop = ?, shop_name = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    product_link["shop_id"],
+                    product_link["size_template_id"],
+                    product_link["shop"],
+                    product_link["shop_name"],
+                    utc_now(),
+                    order_id,
+                ),
+            )
+        return self.get(order_id)
+
+    def advance_status(self, order_id: int, order_number: str):
+        normalized_order_number = str(order_number or "").strip()
+        if not normalized_order_number:
+            raise ValueError("订单号不能为空")
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id, status FROM orders
+                WHERE id = ? AND order_number = ?
+                LIMIT 1
+                """,
+                (order_id, normalized_order_number),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
+            current_status = self._validate_status(existing["status"])
+            if current_status == DEFAULT_ORDER_STATUS:
+                raise ValueError(
+                    "新订单必须先调用发送示意图接口，不能直接推进状态"
+                )
+            next_definition = connection.execute(
+                """
+                SELECT status FROM order_statuses
+                WHERE status > ?
+                ORDER BY status
+                LIMIT 1
+                """,
+                (current_status,),
+            ).fetchone()
+            if next_definition is None:
+                raise ValueError("订单已经是订单已完成状态，不能继续推进")
+            next_status = next_definition["status"]
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND order_number = ?
+                """,
+                (
+                    next_status,
+                    now,
+                    order_id,
+                    normalized_order_number,
+                ),
+            )
+            connection.commit()
+        return self.get(order_id)
+
     def get(self, order_id: int):
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM orders WHERE id = ?",
+                self._order_select("WHERE orders.id = ?"),
                 (order_id,),
             ).fetchone()
         if row is None:
@@ -839,11 +1310,9 @@ class OrderRepository:
             raise ValueError("订单号不能为空")
         with self.connect() as connection:
             row = connection.execute(
-                """
-                SELECT * FROM orders
-                WHERE id = ? AND order_number = ?
-                LIMIT 1
-                """,
+                self._order_select(
+                    "WHERE orders.id = ? AND orders.order_number = ? LIMIT 1"
+                ),
                 (order_id, normalized_order_number),
             ).fetchone()
         if row is None:
@@ -851,10 +1320,36 @@ class OrderRepository:
         return self.row_to_dict(row)
 
     @staticmethod
+    def _order_select(suffix=""):
+        return f"""
+            SELECT orders.*,
+                   order_statuses.status_text,
+                   order_statuses.status_button_text
+            FROM orders
+            JOIN order_statuses USING (status)
+            {suffix}
+        """
+
+    @staticmethod
     def row_to_dict(row):
         data = dict(row)
         data["product_information"] = OrderRepository._decode_product_information(
             data["product_information"]
         )
+        data["matched_template"] = OrderRepository._decode_json_object(
+            data.pop("matched_template_json", "{}")
+        )
+        data["resolved_layers"] = OrderRepository._decode_json_object(
+            data.pop("resolved_layers_json", "{}")
+        )
+        data["template_json"] = data["resolved_layers"]
         data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
         return data
+
+    @staticmethod
+    def _decode_json_object(value):
+        try:
+            decoded = json.loads(value or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}

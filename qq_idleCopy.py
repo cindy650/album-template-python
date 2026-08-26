@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import time
 import traceback
 from email.header import decode_header, make_header
@@ -16,6 +17,29 @@ import requests
 from imapclient import IMAPClient
 
 
+def _load_project_env():
+    """Load local .env values before module-level service configuration."""
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.is_file():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_project_env()
+
+
 # QQ IMAP configuration
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.qq.com").strip()
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
@@ -24,25 +48,15 @@ IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 QQ_USER = os.getenv("QQ_USER", "2051588081@qq.com").strip()
 QQ_AUTH_CODE = os.getenv("QQ_AUTH_CODE", "qyxmdoobbbukfagb").strip()
 
-# Optional Google Apps Script webhook. When empty, parsed orders are only printed.
-APPS_SCRIPT_URL = os.getenv(
-    "APPS_SCRIPT_URL",
-    "https://script.google.com/macros/s/AKfycbx_rvEyn4hsnuT_olKZuuFs9CkDqhJcNVgL_wYPCK59QhIWUfexGI6XLSNn91xbQ-IXXw/exec",
-).strip()
-WEBHOOK_TOKEN = os.getenv(
-    "WEBHOOK_TOKEN",
-    "69eb3cdafc454e98b8e10b42b47f07cb",
-).strip()
-
-# DeepSeek is used to map free-form Etsy personalization text back to the
-# listing's requested fields. The key is temporarily kept here as requested.
+# DeepSeek configuration. Secrets must be supplied through the environment or
+# the project-local .env file; never commit an API key to source code.
 DEEPSEEK_API_URL = os.getenv(
     "DEEPSEEK_API_URL",
     "https://api.deepseek.com/chat/completions",
 ).strip()
 DEEPSEEK_API_KEY = os.getenv(
     "DEEPSEEK_API_KEY",
-    "sk-399f3715f25547ac99110539d78e1c83",
+    "",
 ).strip()
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
 DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "60"))
@@ -53,31 +67,6 @@ ORDER_PATTERN = re.compile(
     r"You made a sale|sale on Etsy|Congratulations on your Etsy order",
     re.IGNORECASE,
 )
-
-INDEPENDENT_ORDER_FIELDS = {
-    "Pages Quantity | Album Size": (
-        "Pages Quantity | Album Size",
-        "Pages Quantity / Album Size",
-    ),
-    "Instant photo size": (
-        "Instant photo size",
-        "Instant photo size type",
-    ),
-    "Cover Colour": ("Cover Colour", "Cover Color"),
-    "Inner Page Layout": ("Inner Page Layout",),
-    "Font Style & Lettering color": (
-        "Font Style & Lettering color",
-        "Font Style & Lettering colour",
-    ),
-    "Names/date/location for the cover": (
-        "Names/date/location for the cover",
-        "Names / date / location for the cover",
-    ),
-    "Phone Number for Delivery": (
-        "Phone Number for Delivery",
-        "Delivery Phone Number",
-    ),
-}
 
 PRODUCT_BLOCK_BOUNDARY_PATTERN = re.compile(
     r"^(?:Purchase Shipping Label|Shipping internationally|"
@@ -105,13 +94,13 @@ RESERVED_PRODUCT_OPTION_LABELS = {
 }
 
 SHOP_CONFIG = [
-    {"sheetName": "小彩灯", "shopName": "Memiya", "currency": "USD"},
-    {"sheetName": "3号店", "shopName": "LuxeJoy", "currency": "CAD"},
-    {"sheetName": "14号店", "shopName": "NuviaAlbum", "currency": "CAD"},
-    {"sheetName": "15号店", "shopName": "Mivow", "currency": "USD"},
-    {"sheetName": "16号店", "shopName": "Mmovia", "currency": "USD"},
-    {"sheetName": "17号店", "shopName": "ObiaMoment", "currency": "USD"},
-    {"sheetName": "18号店", "shopName": "Sogave", "currency": "USD"},
+    {"displayName": "小彩灯", "shopName": "Memiya", "currency": "USD"},
+    {"displayName": "3号店", "shopName": "LuxeJoy", "currency": "CAD"},
+    {"displayName": "14号店", "shopName": "NuviaAlbum", "currency": "CAD"},
+    {"displayName": "15号店", "shopName": "Mivow", "currency": "USD"},
+    {"displayName": "16号店", "shopName": "Mmovia", "currency": "USD"},
+    {"displayName": "17号店", "shopName": "ObiaMoment", "currency": "USD"},
+    {"displayName": "18号店", "shopName": "18号店", "currency": "USD"},
 ]
 
 SHOP_MAP = {
@@ -130,6 +119,10 @@ class PersonalizationRuleNotFound(ConfigurationError):
 
 class ShopNotFoundError(ConfigurationError):
     """The Etsy shop from one email is absent from the system shop table."""
+
+
+class ProductNotFoundError(ConfigurationError):
+    """The Etsy product from one email is absent from the product table."""
 
 
 def configure_utf8_console():
@@ -320,10 +313,7 @@ def prepare_body_lines(body):
 
 
 def canonical_product_option_label(label):
-    normalized = str(label or "").strip().casefold()
-    for field, aliases in INDEPENDENT_ORDER_FIELDS.items():
-        if normalized in {alias.casefold() for alias in aliases}:
-            return field
+    # Product option labels vary by listing; preserve the exact email label.
     return str(label or "").strip()
 
 
@@ -477,7 +467,7 @@ def load_personalization_rules(shop_name, product_name):
     shop_candidates = [shop_name]
     shop_config = SHOP_MAP.get((shop_name or "").casefold())
     if shop_config:
-        shop_candidates.append(shop_config["sheetName"])
+        shop_candidates.append(shop_config["displayName"])
         shop_candidates.append(shop_config["shopName"])
 
     selected_shop = None
@@ -1007,7 +997,7 @@ def extract_shop(body):
 def extract_shop_name(body):
     shop = extract_original_shop(body)
     config = SHOP_MAP.get(shop.casefold()) if shop else None
-    return config["sheetName"] if config else ""
+    return config["displayName"] if config else ""
 
 
 def extract_order_number(subject, body):
@@ -1330,6 +1320,28 @@ def extract_product_section(lines):
     return "\n".join(collapse_repeated_suffix(product_lines)).strip()
 
 
+def extract_mail_order_identity(body):
+    """Extract only the fields needed to decide whether an order is supported."""
+    lines = prepare_body_lines(body)
+    product_section = extract_product_section(lines)
+    product_name = next(
+        (
+            line.strip()
+            for line in product_section.splitlines()
+            if line.strip()
+        ),
+        "",
+    )
+    if not product_name:
+        product_name = extract_product_name(body)
+    return {
+        "original_shop": extract_original_shop(body),
+        "shop": extract_shop(body),
+        "shop_name": extract_shop_name(body),
+        "product": product_name,
+    }
+
+
 def extract_order_details(body):
     lines = prepare_body_lines(body)
     sections = (
@@ -1466,34 +1478,6 @@ def parse_order_fields(
     }
 
 
-def post_order(order_data):
-    if not APPS_SCRIPT_URL:
-        print("未配置 APPS_SCRIPT_URL，本次只输出解析结果。", flush=True)
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "APPS_SCRIPT_URL 未配置",
-        }
-
-    payload = dict(order_data)
-    if WEBHOOK_TOKEN:
-        payload["token"] = WEBHOOK_TOKEN
-
-    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=30)
-    response.raise_for_status()
-
-    try:
-        result = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Apps Script 返回的不是 JSON：{response.text[:500]}") from exc
-
-    if not result.get("ok"):
-        raise RuntimeError(f"Apps Script 写入失败：{result}")
-
-    print(f"Google 表格写入成功：{result}", flush=True)
-    return result
-
-
 def load_last_uid():
     if not STATE_FILE.exists():
         return 0
@@ -1505,15 +1489,45 @@ def load_last_uid():
 
 
 def save_last_uid(uid):
-    STATE_FILE.write_text(
-        json.dumps({"last_uid": uid}, ensure_ascii=False),
-        encoding="utf-8",
+    payload = json.dumps({"last_uid": int(uid)}, ensure_ascii=False)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for _ in range(3):
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=STATE_FILE.parent,
+                prefix=f".{STATE_FILE.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, STATE_FILE)
+            return True
+        except OSError as exc:
+            last_error = exc
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            time.sleep(0.05)
+    print(
+        f"保存邮箱 UID 状态失败，下一轮可能重复处理：{last_error}",
+        flush=True,
     )
+    return False
 
 
 def dispatch_order(order_handler, order_data, uid=None, metadata=None):
     if order_handler is None:
-        return post_order(order_data)
+        return order_data
     return order_handler(order_data, uid=uid, metadata=metadata or {})
 
 
@@ -1522,6 +1536,7 @@ def process_new_messages(
     last_uid,
     order_handler=None,
     shop_lookup=None,
+    product_lookup=None,
 ):
     all_uids = client.search(["ALL"])
     new_uids = sorted(uid for uid in all_uids if uid > last_uid)
@@ -1560,13 +1575,35 @@ def process_new_messages(
                 "reply_to": decode_header_value(message.get("Reply-To", "")),
                 "to": decode_header_value(message.get("To", "")),
             }
+
+            identity = extract_mail_order_identity(body)
+            if shop_lookup is not None and not shop_lookup(
+                identity["original_shop"],
+                identity["shop_name"],
+            ):
+                raise ShopNotFoundError(
+                    "系统没有此店铺："
+                    f"{identity['original_shop'] or identity['shop_name'] or '空店铺名'}"
+                )
+            if product_lookup is not None and not product_lookup(
+                identity["shop"],
+                identity["shop_name"],
+                identity["product"],
+            ):
+                raise ProductNotFoundError(
+                    "店铺商品列表中没有匹配商品："
+                    f"店铺={identity['shop'] or identity['shop_name'] or '空'}，"
+                    f"商品={identity['product'] or '空'}"
+                )
+
             order_data = parse_order_fields(
                 subject=subject,
                 body=body,
                 email_date=message.get("Date", ""),
                 metadata=metadata,
                 uid=uid,
-                shop_lookup=shop_lookup,
+                # Shop and product were checked before full order parsing.
+                shop_lookup=None,
             )
 
             print("\n解析后的订单字段：", flush=True)
@@ -1586,7 +1623,7 @@ def process_new_messages(
                 flush=True,
             )
 
-        except ShopNotFoundError as exc:
+        except (ShopNotFoundError, ProductNotFoundError) as exc:
             print(
                 f"跳过 UID={uid}：{exc}",
                 flush=True,
@@ -1645,7 +1682,11 @@ def wait_for_stop(stop_event, timeout):
     return stop_event.wait(timeout)
 
 
-def poll_mailbox_once(order_handler=None, shop_lookup=None):
+def poll_mailbox_once(
+    order_handler=None,
+    shop_lookup=None,
+    product_lookup=None,
+):
     """Connect once, process all pending UIDs, then disconnect."""
     last_uid = load_last_uid()
     previous_uid = last_uid
@@ -1668,6 +1709,7 @@ def poll_mailbox_once(order_handler=None, shop_lookup=None):
             last_uid,
             order_handler,
             shop_lookup,
+            product_lookup,
         )
         return {
             "initialized": False,
@@ -1687,6 +1729,7 @@ def listen_forever(
     stop_event=None,
     order_handler=None,
     shop_lookup=None,
+    product_lookup=None,
 ):
     last_uid = load_last_uid()
     reconnect_delay = 5
@@ -1724,6 +1767,7 @@ def listen_forever(
                         last_uid,
                         order_handler,
                         shop_lookup,
+                        product_lookup,
                     )
                 elif idle_round >= 4:
                     last_uid = process_new_messages(
@@ -1731,6 +1775,7 @@ def listen_forever(
                         last_uid,
                         order_handler,
                         shop_lookup,
+                        product_lookup,
                     )
                     idle_round = 0
 
@@ -1788,14 +1833,6 @@ def validate_config():
             "QQ_AUTH_CODE 格式不正确。授权码只能包含英文字母和数字，"
             "不能包含空格、引号或中文。"
         )
-
-    if APPS_SCRIPT_URL and not APPS_SCRIPT_URL.isascii():
-        raise ConfigurationError(
-            "APPS_SCRIPT_URL 包含中文。请使用 Apps Script 部署后真实的 /exec URL，"
-            "不要使用示例占位文字。"
-        )
-
-
 
 def main():
     configure_utf8_console()

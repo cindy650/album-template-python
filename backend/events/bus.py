@@ -18,13 +18,20 @@ class EventBus:
         self._lock = Lock()
         self._subscribers: dict[str, Queue] = {}
 
-    def publish(self, event_type: str, data: dict[str, Any] | None = None):
+    def publish(
+        self,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        msg: str | None = None,
+    ):
         event = {
             "id": uuid4().hex,
             "type": event_type,
             "created_at": utc_now(),
-            "data": data or {},
         }
+        if msg is not None:
+            event["msg"] = msg
+        event["data"] = data or {}
         with self._lock:
             queues = list(self._subscribers.values())
         for queue in queues:

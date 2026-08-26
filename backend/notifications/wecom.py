@@ -18,7 +18,7 @@ class WeComRobotError(RuntimeError):
 
 
 class WeComRobotNotifier:
-    """Send a generated order image and its identifying text to WeCom."""
+    """Send generated order images to WeCom."""
 
     def __init__(
         self,
@@ -35,47 +35,44 @@ class WeComRobotNotifier:
         order: dict[str, Any],
         image_result: dict[str, Any],
         saved_order: dict[str, Any] | None = None,
+        order_info_image_result: dict[str, Any] | None = None,
     ):
         if not self.webhook_url:
             return {"ok": False, "status": "disabled"}
 
-        image_path = Path(str(image_result.get("path") or ""))
-        image_bytes, compressed = self._image_bytes(image_path)
-        image_payload = {
-            "msgtype": "image",
-            "image": {
-                "base64": base64.b64encode(image_bytes).decode("ascii"),
-                "md5": md5(image_bytes).hexdigest(),
-            },
-        }
-        image_response = self._post(image_payload, message_type="image")
+        if not order_info_image_result:
+            raise WeComRobotError("企业微信通知缺少订单信息图")
 
-        order_number = str(
-            (saved_order or {}).get("order_number")
-            or order.get("订单号")
-            or ""
-        ).strip()
-        product = str(
-            (saved_order or {}).get("product")
-            or order.get("产品")
-            or ""
-        ).strip()
-        text_payload = {
-            "msgtype": "text",
-            "text": {
-                "content": f"订单号：{order_number or '未知'}；产品：{product or '未知'}",
-            },
-        }
-        text_response = self._post(text_payload, message_type="text")
+        sent_images = []
+        responses = {}
+        for key, label, result in (
+            ("order_info", "订单信息图", order_info_image_result),
+            ("order_preview", "订单预览图", image_result),
+        ):
+            image_bytes, compressed = self._image_bytes(result, label)
+            payload = {
+                "msgtype": "image",
+                "image": {
+                    "base64": base64.b64encode(image_bytes).decode("ascii"),
+                    "md5": md5(image_bytes).hexdigest(),
+                },
+            }
+            responses[key] = self._post(payload, message_type=label)
+            sent_images.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "bytes": len(image_bytes),
+                    "compressed": compressed,
+                }
+            )
+
         return {
             "ok": True,
             "status": "sent",
-            "image_bytes": len(image_bytes),
-            "image_compressed": compressed,
-            "responses": {
-                "image": image_response,
-                "text": text_response,
-            },
+            "message_type": "image",
+            "sent_images": sent_images,
+            "responses": responses,
         }
 
     def _post(self, payload: dict[str, Any], message_type: str):
@@ -109,21 +106,31 @@ class WeComRobotNotifier:
         return result
 
     @staticmethod
-    def _image_bytes(path: Path):
-        if not path.is_file():
-            raise WeComRobotError(f"企业微信待发送图片不存在：{path}")
+    def _image_bytes(image_result: dict[str, Any], label: str):
+        encoded = str(image_result.get("image_base64") or "").strip()
+        if encoded:
+            try:
+                original = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise WeComRobotError(f"{label} Base64 无效") from exc
+            return WeComRobotNotifier._fit_wecom_image_limit(original, label)
 
+        path = Path(str(image_result.get("path") or ""))
+        if not path.is_file():
+            raise WeComRobotError(f"企业微信待发送{label}不存在：{path}")
         original = path.read_bytes()
-        if path.suffix.casefold() in {".jpg", ".jpeg", ".png"} and len(
-            original
-        ) <= WECOM_IMAGE_MAX_BYTES:
+        return WeComRobotNotifier._fit_wecom_image_limit(original, label)
+
+    @staticmethod
+    def _fit_wecom_image_limit(original: bytes, label: str):
+        if len(original) <= WECOM_IMAGE_MAX_BYTES:
             return original, False
 
         try:
-            with Image.open(path) as source:
+            with Image.open(BytesIO(original)) as source:
                 image = ImageOps.exif_transpose(source).convert("RGB")
         except (OSError, ValueError) as exc:
-            raise WeComRobotError(f"企业微信待发送图片无法读取：{path}") from exc
+            raise WeComRobotError(f"{label} 超过 2 MB 且无法压缩") from exc
 
         image.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
         quality = 90
@@ -143,4 +150,4 @@ class WeComRobotNotifier:
                 )
                 image = image.resize(next_size, Image.Resampling.LANCZOS)
 
-        raise WeComRobotError("图片压缩后仍超过企业微信 2 MB 限制")
+        raise WeComRobotError(f"{label} 压缩后仍超过企业微信 2 MB 限制")
