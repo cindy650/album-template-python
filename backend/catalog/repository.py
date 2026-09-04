@@ -78,8 +78,86 @@ def unique_preserve_order(values: list[str]):
     return result
 
 
+def normalize_common_spec_values(value: Any) -> list[dict[str, Any]]:
+    """Keep frontend-provided common size presets as JSON objects unchanged."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("common_spec_values 必须是数组")
+    result = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"common_spec_values[{index}] 必须是对象")
+        result.append(deepcopy(item))
+    return result
+
+
 def placeholders(values: list[Any]):
     return ", ".join("?" for _ in values)
+
+
+DEFAULT_TEXT_GENERATION_RULES = (
+    (
+        "背脊",
+        "从订单商品信息取Spine Text字段，去掉多余符号,字母全部大写,字段为空不替换原本内容",
+    ),
+    (
+        "地点",
+        "从订单的商品信息取Names/date/location for the cover字段中的地点，字母全部大写，没有匹配到地点的话给这个字段文字置空",
+    ),
+    (
+        "日期转数字",
+        "从订单的商品信息取Names/date/location for the cover字段中取日期，是英语的需要翻译成数字并补零",
+    ),
+    (
+        "原文日期",
+        "从订单的商品信息取Names/date/location for the cover字段中取日期，",
+    ),
+    (
+        "年转数字",
+        "从订单的商品信息取Names/date/location for the cover字段中取日期年，是英语的需要翻译成数字",
+    ),
+    (
+        "月/日转数字",
+        "从订单的商品信息取Names/date/location for the cover字段中取日期月和日，是英语的需要翻译成数字并补零",
+    ),
+    (
+        "姓氏字母全大写",
+        "从订单的商品信息取Names/date/location for the cover字段中的姓氏，，字母全部大写，没的话置空",
+    ),
+    (
+        "姓氏用原文",
+        "从订单的商品信息取Names/date/location for the cover字段中的姓氏，没的话置空",
+    ),
+    (
+        "第一个名",
+        "从订单的商品信息取Names/date/location for the cover字段中的名字，第一个名",
+    ),
+    (
+        "第二个名",
+        "从订单的商品信息取Names/date/location for the cover字段中的名字，第二个名",
+    ),
+    (
+        "第一个名首字母",
+        "取订单信息Names/date/location for the cover 字段中的名字，取第一个姓名的首字母并大写",
+    ),
+    (
+        "第二个名首字母",
+        "取订单信息Names/date/location for the cover 字段中的名字，取第二个姓名的首字母并大写",
+    ),
+    (
+        "两名字首字母",
+        "取订单信息Names/date/location for the cover 字段中的名字，取第一个姓名和第二个名的首字母并小写",
+    ),
+    (
+        "全部名字",
+        "取订单信息Names/date/location for the cover 字段中的名字，名字之间的连接符需要保留",
+    ),
+    (
+        "全部名字大写",
+        "取订单信息Names/date/location for the cover 字段中的名字 ，名字之间的连接符需要保留，字母全部大写",
+    ),
+)
 
 
 class CatalogRepository:
@@ -105,6 +183,27 @@ class CatalogRepository:
             }
             if not required_tables.issubset(existing_tables):
                 self._create_schema(connection)
+            self._ensure_columns(
+                connection,
+                "shops",
+                {
+                    "shop_name": "TEXT NOT NULL DEFAULT ''",
+                    "product_names_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "wecom_robot_webhook_url": "TEXT NOT NULL DEFAULT ''",
+                    "product_count": "INTEGER NOT NULL DEFAULT 0",
+                    "order_count": "INTEGER NOT NULL DEFAULT 0",
+                    "new_order_count": "INTEGER NOT NULL DEFAULT 0",
+                    "confirmation_count": "INTEGER NOT NULL DEFAULT 0",
+                    "pending_production_count": "INTEGER NOT NULL DEFAULT 0",
+                    "in_production_count": "INTEGER NOT NULL DEFAULT 0",
+                    "pending_shipment_count": "INTEGER NOT NULL DEFAULT 0",
+                    "completed_order_count": "INTEGER NOT NULL DEFAULT 0",
+                    "size_template_count": "INTEGER NOT NULL DEFAULT 0",
+                    "font_template_count": "INTEGER NOT NULL DEFAULT 0",
+                    "created_at": "TEXT NOT NULL DEFAULT ''",
+                    "updated_at": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
             self._ensure_columns(
                 connection,
                 "size_templates",
@@ -133,12 +232,16 @@ class CatalogRepository:
             self._migrate_size_template_fields(connection)
             self._create_font_layout_library_schema(connection)
             self._create_product_schema(connection)
+            self._create_inner_page_template_schema(connection)
+            self._create_text_generation_rule_schema(connection)
+            self._seed_text_generation_rules(connection)
             self._create_font_layout_size_variant_schema(connection)
             self._remove_size_template_font_layout_schema(connection)
             connection.execute("DROP TABLE IF EXISTS font_templates")
             # Product categories and their product_names are user-managed.
             # Do not repopulate them from legacy shop/template JSON on startup.
             self._link_existing_products_to_size_templates(connection)
+            self._migrate_product_safe_distances(connection)
             self._refresh_all_shop_counts(connection)
             connection.commit()
 
@@ -150,8 +253,15 @@ class CatalogRepository:
                 shop TEXT NOT NULL UNIQUE,
                 shop_name TEXT NOT NULL,
                 product_names_json TEXT NOT NULL DEFAULT '[]',
+                wecom_robot_webhook_url TEXT NOT NULL DEFAULT '',
                 product_count INTEGER NOT NULL DEFAULT 0,
                 order_count INTEGER NOT NULL DEFAULT 0,
+                new_order_count INTEGER NOT NULL DEFAULT 0,
+                confirmation_count INTEGER NOT NULL DEFAULT 0,
+                pending_production_count INTEGER NOT NULL DEFAULT 0,
+                in_production_count INTEGER NOT NULL DEFAULT 0,
+                pending_shipment_count INTEGER NOT NULL DEFAULT 0,
+                completed_order_count INTEGER NOT NULL DEFAULT 0,
                 size_template_count INTEGER NOT NULL DEFAULT 0,
                 font_template_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -168,8 +278,15 @@ class CatalogRepository:
             {
                 "shop_name": "TEXT NOT NULL DEFAULT ''",
                 "product_names_json": "TEXT NOT NULL DEFAULT '[]'",
+                "wecom_robot_webhook_url": "TEXT NOT NULL DEFAULT ''",
                 "product_count": "INTEGER NOT NULL DEFAULT 0",
                 "order_count": "INTEGER NOT NULL DEFAULT 0",
+                "new_order_count": "INTEGER NOT NULL DEFAULT 0",
+                "confirmation_count": "INTEGER NOT NULL DEFAULT 0",
+                "pending_production_count": "INTEGER NOT NULL DEFAULT 0",
+                "in_production_count": "INTEGER NOT NULL DEFAULT 0",
+                "pending_shipment_count": "INTEGER NOT NULL DEFAULT 0",
+                "completed_order_count": "INTEGER NOT NULL DEFAULT 0",
                 "size_template_count": "INTEGER NOT NULL DEFAULT 0",
                 "font_template_count": "INTEGER NOT NULL DEFAULT 0",
                 "created_at": "TEXT NOT NULL DEFAULT ''",
@@ -290,6 +407,113 @@ class CatalogRepository:
         )
 
     @staticmethod
+    def _create_inner_page_template_schema(connection):
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inner_page_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+                product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                preview_image_path TEXT NOT NULL DEFAULT '',
+                layers_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        CatalogRepository._ensure_columns(
+            connection,
+            "inner_page_templates",
+            {
+                "product_id": "INTEGER NOT NULL",
+                "description": "TEXT NOT NULL DEFAULT ''",
+                "preview_image_path": "TEXT NOT NULL DEFAULT ''",
+                "layers_json": "TEXT NOT NULL DEFAULT '{}'",
+                "created_at": "TEXT NOT NULL DEFAULT ''",
+                "updated_at": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inner_page_templates_shop_id "
+            "ON inner_page_templates(shop_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inner_page_templates_product_id "
+            "ON inner_page_templates(product_id)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inner_page_template_options (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                inner_page_template_id INTEGER NOT NULL,
+                size_option_id VARCHAR(255) NOT NULL,
+                label VARCHAR(255) NOT NULL,
+                size_unit VARCHAR(10) NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                layers_json LONGTEXT NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
+                UNIQUE KEY uq_inner_page_template_option (inner_page_template_id, size_option_id),
+                CONSTRAINT fk_inner_page_template_options_template
+                    FOREIGN KEY (inner_page_template_id)
+                    REFERENCES inner_page_templates(id) ON DELETE CASCADE
+            )
+            """
+        )
+        CatalogRepository._ensure_columns(
+            connection,
+            "inner_page_template_options",
+            {"size_unit": "VARCHAR(10) NOT NULL DEFAULT ''"},
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inner_page_template_options_template_id "
+            "ON inner_page_template_options(inner_page_template_id)"
+        )
+
+    @staticmethod
+    def _create_text_generation_rule_schema(connection):
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS template_text_generation_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name VARCHAR(255) NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        CatalogRepository._ensure_columns(
+            connection,
+            "template_text_generation_rules",
+            {
+                "name": "VARCHAR(255) NOT NULL DEFAULT ''",
+                "description": "TEXT NOT NULL DEFAULT ''",
+                "created_at": "TEXT NOT NULL DEFAULT ''",
+                "updated_at": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_template_text_generation_rules_name "
+            "ON template_text_generation_rules(name)"
+        )
+
+    @staticmethod
+    def _seed_text_generation_rules(connection):
+        now = utc_now()
+        for name, description in DEFAULT_TEXT_GENERATION_RULES:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO template_text_generation_rules
+                    (name, description, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, description, now, now),
+            )
+
+    @staticmethod
     def _create_font_layout_size_variant_schema(connection):
         connection.execute(
             """
@@ -302,9 +526,6 @@ class CatalogRepository:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(font_layout_id, size_template_option_id),
-                CONSTRAINT fk_font_layout_size_variants_layout
-                    FOREIGN KEY (font_layout_id)
-                    REFERENCES font_layout_library(id) ON DELETE CASCADE,
                 CONSTRAINT fk_font_layout_size_variants_option
                     FOREIGN KEY (size_template_option_id)
                     REFERENCES size_template_options(id) ON DELETE CASCADE
@@ -347,13 +568,26 @@ class CatalogRepository:
                 row["from"]
                 for row in foreign_keys(connection, "font_layout_size_variants")
             }
-            if "font_layout_id" not in existing_foreign_key_columns:
-                connection.execute(
-                    "ALTER TABLE font_layout_size_variants "
-                    "ADD CONSTRAINT fk_font_layout_size_variants_layout "
-                    "FOREIGN KEY (font_layout_id) REFERENCES font_layout_library(id) "
-                    "ON DELETE CASCADE"
-                )
+            # The variant JSON is an independent snapshot. Do not keep a
+            # cascading FK to the library row: deleting a library template
+            # must leave already-applied size variants intact.
+            layout_fk_names = connection.execute(
+                """
+                SELECT DISTINCT kcu.CONSTRAINT_NAME AS constraint_name
+                FROM information_schema.KEY_COLUMN_USAGE kcu
+                WHERE kcu.TABLE_SCHEMA = DATABASE()
+                  AND kcu.TABLE_NAME = 'font_layout_size_variants'
+                  AND kcu.COLUMN_NAME = 'font_layout_id'
+                  AND kcu.REFERENCED_TABLE_NAME = 'font_layout_library'
+                """
+            ).fetchall()
+            for fk_row in layout_fk_names:
+                constraint_name = compact_string(fk_row.get("constraint_name"))
+                if constraint_name:
+                    connection.execute(
+                        f"ALTER TABLE font_layout_size_variants "
+                        f"DROP FOREIGN KEY `{constraint_name}`"
+                    )
             if "size_template_option_id" not in existing_foreign_key_columns:
                 connection.execute(
                     "ALTER TABLE font_layout_size_variants "
@@ -384,12 +618,64 @@ class CatalogRepository:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 description TEXT NOT NULL DEFAULT '',
+                specifications_json TEXT NOT NULL DEFAULT '[]',
+                specification_field VARCHAR(255) NOT NULL
+                    DEFAULT 'Book Size | Page Count',
+                cover_safe_distance_json LONGTEXT NULL,
+                spine_safe_distance_json LONGTEXT NULL,
+                back_cover_safe_distance_json LONGTEXT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        CatalogRepository._ensure_columns(
+            connection,
+            "products",
+            {
+                "specifications_json": "TEXT NOT NULL DEFAULT '[]'",
+                "specification_field": (
+                    "VARCHAR(255) NOT NULL DEFAULT 'Book Size | Page Count'"
+                ),
+                "common_spec_values_json": "TEXT NOT NULL DEFAULT '[]'",
+                # MySQL does not consistently allow literal defaults on
+                # TEXT/LONGTEXT columns. Nulls are normalized below instead.
+                "cover_safe_distance_json": "LONGTEXT NULL",
+                "spine_safe_distance_json": "LONGTEXT NULL",
+                "back_cover_safe_distance_json": "LONGTEXT NULL",
+            },
+        )
+        connection.execute(
+            """
+            UPDATE products
+            SET specifications_json = '[]'
+            WHERE specifications_json IS NULL OR specifications_json = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE products
+            SET specification_field = 'Book Size | Page Count'
+            WHERE specification_field IS NULL OR TRIM(specification_field) = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE products
+            SET common_spec_values_json = '[]'
+            WHERE common_spec_values_json IS NULL OR common_spec_values_json = ''
+            """
+        )
+        for column in (
+            "cover_safe_distance_json",
+            "spine_safe_distance_json",
+            "back_cover_safe_distance_json",
+        ):
+            connection.execute(
+                f"UPDATE products SET {column} = '{{}}' "
+                f"WHERE {column} IS NULL OR {column} = ''"
+            )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS product_shops (
@@ -602,6 +888,7 @@ class CatalogRepository:
                 spine_bleed REAL NOT NULL DEFAULT 0,
                 spine_width_mode TEXT NOT NULL DEFAULT 'fixed',
                 spine_width_formula_json TEXT NOT NULL DEFAULT '{}',
+                layers_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(size_template_id, size_option_id)
@@ -612,7 +899,11 @@ class CatalogRepository:
             "CREATE INDEX IF NOT EXISTS idx_size_template_options_template_id "
             "ON size_template_options(size_template_id)"
         )
-
+        CatalogRepository._ensure_columns(
+            connection,
+            "size_template_options",
+            {"layers_json": "TEXT NOT NULL DEFAULT '{}'"},
+        )
     @classmethod
     def _migrate_size_template_fields(cls, connection):
         from backend.templates.size_variants import normalize_size_spec
@@ -777,11 +1068,23 @@ class CatalogRepository:
             cursor = connection.execute(
                 """
                 INSERT INTO shops (
-                    shop, shop_name, product_names_json, product_count,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    shop, shop_name, product_names_json, wecom_robot_webhook_url,
+                    product_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (shop, shop_name, json_dump(products), len(products), now, now),
+                (
+                    shop,
+                    shop_name,
+                    json_dump(products),
+                    compact_string(
+                        payload.get("wecom_robot_webhook_url")
+                        or payload.get("wecom_robot")
+                        or payload.get("企业微信机器人")
+                    ),
+                    len(products),
+                    now,
+                    now,
+                ),
             )
             shop_id = cursor.lastrowid
             self._link_orders_to_shop(connection, shop_id, shop)
@@ -962,8 +1265,10 @@ class CatalogRepository:
                 json_load(row["product_names_json"], [])
             )
             product_key = product_name.casefold()
+            created = False
             if product_key not in {name.casefold() for name in product_names}:
                 product_names.append(product_name)
+                created = True
                 connection.execute(
                     """
                     UPDATE shops
@@ -983,6 +1288,7 @@ class CatalogRepository:
                 "shop_id": row["id"],
                 "shop": row["shop"],
                 "shop_name": row["shop_name"],
+                "created": created,
             }
 
     def update_shop(self, shop_id: int, payload: dict[str, Any]):
@@ -1002,6 +1308,17 @@ class CatalogRepository:
             if not shop_name:
                 raise ValueError("店铺名不能为空")
             updates["shop_name"] = shop_name
+        if any(
+            key in payload
+            for key in ("wecom_robot_webhook_url", "wecom_robot", "企业微信机器人")
+        ):
+            updates["wecom_robot_webhook_url"] = compact_string(
+                payload.get("wecom_robot_webhook_url")
+                if "wecom_robot_webhook_url" in payload
+                else payload.get("wecom_robot")
+                if "wecom_robot" in payload
+                else payload.get("企业微信机器人")
+            )
         if not updates and not has_products:
             return self.get_shop(shop_id)
         updates["updated_at"] = utc_now()
@@ -1051,6 +1368,95 @@ class CatalogRepository:
     # ------------------------------------------------------------------
     # Product-first catalog API
     # ------------------------------------------------------------------
+    def create_text_generation_rule(self, payload: dict[str, Any]):
+        name = compact_string(payload.get("name"))
+        if not name:
+            raise ValueError("文字生成规则名称不能为空")
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO template_text_generation_rules
+                    (name, description, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, compact_string(payload.get("description")), now, now),
+            )
+            rule_id = cursor.lastrowid
+        return self.get_text_generation_rule(rule_id)
+
+    def list_text_generation_rules(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        search: str | None = None,
+    ):
+        where = ""
+        params: list[Any] = []
+        keyword = compact_string(search)
+        if keyword:
+            where = "WHERE name LIKE ? OR description LIKE ?"
+            params.extend((f"%{keyword}%", f"%{keyword}%"))
+        with self.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) AS count FROM template_text_generation_rules {where}",
+                params,
+            ).fetchone()["count"]
+            rows = connection.execute(
+                f"""
+                SELECT id, name, description, created_at, updated_at
+                FROM template_text_generation_rules
+                {where}
+                ORDER BY name ASC, id ASC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_text_generation_rule(self, rule_id: int):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id, name, description, created_at, updated_at "
+                "FROM template_text_generation_rules WHERE id = ?",
+                (rule_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError("文字生成规则不存在")
+        return dict(row)
+
+    def update_text_generation_rule(self, rule_id: int, payload: dict[str, Any]):
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id, name, description FROM template_text_generation_rules WHERE id = ?",
+                (rule_id,),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("文字生成规则不存在")
+            name = (
+                compact_string(payload.get("name"))
+                if "name" in payload
+                else compact_string(existing["name"])
+            )
+            if not name:
+                raise ValueError("文字生成规则名称不能为空")
+            description = (
+                compact_string(payload.get("description"))
+                if "description" in payload
+                else compact_string(existing["description"])
+            )
+            connection.execute(
+                "UPDATE template_text_generation_rules "
+                "SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+                (name, description, utc_now(), rule_id),
+            )
+        return self.get_text_generation_rule(rule_id)
+
     def create_product(self, payload: dict[str, Any]):
         name = compact_string(payload.get("name") or payload.get("product") or payload.get("产品名"))
         if not name:
@@ -1064,12 +1470,44 @@ class CatalogRepository:
         )
         if not names:
             raise ValueError("product_names 不能为空")
+        specifications = unique_preserve_order(
+            normalize_string_list(payload.get("specifications"))
+        )
+        specification_field = compact_string(
+            payload.get("specification_field") or "Book Size | Page Count"
+        )
+        if not specification_field:
+            raise ValueError("specification_field 不能为空")
+        common_spec_values = normalize_common_spec_values(
+            payload.get("common_spec_values")
+        )
+        safe_distances = self._product_safe_distance_values(payload)
         shop_ids = self._payload_int_list(payload.get("shop_ids") or payload.get("shops"))
         now = utc_now()
         with self._lock, self.connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO products (name, description, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (name, compact_string(payload.get("description")), int(bool(payload.get("enabled", True))), now, now),
+                """
+                INSERT INTO products (
+                    name, description, specifications_json, specification_field,
+                    common_spec_values_json,
+                    cover_safe_distance_json, spine_safe_distance_json,
+                    back_cover_safe_distance_json,
+                    enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    compact_string(payload.get("description")),
+                    json_dump(specifications),
+                    specification_field,
+                    json_dump(common_spec_values),
+                    json_dump(safe_distances["cover_safe_distance"]),
+                    json_dump(safe_distances["spine_safe_distance"]),
+                    json_dump(safe_distances["back_cover_safe_distance"]),
+                    int(bool(payload.get("enabled", True))),
+                    now,
+                    now,
+                ),
             )
             product_id = cursor.lastrowid
             self._replace_product_relations(connection, product_id, names, shop_ids, now)
@@ -1117,13 +1555,67 @@ class CatalogRepository:
             shop_ids = None
             if "shop_ids" in payload or "shops" in payload:
                 shop_ids = self._payload_int_list(payload.get("shop_ids") if "shop_ids" in payload else payload.get("shops"))
+            specifications = None
+            if "specifications" in payload:
+                specifications = unique_preserve_order(
+                    normalize_string_list(payload.get("specifications"))
+                )
+            specification_field = (
+                compact_string(payload.get("specification_field"))
+                if "specification_field" in payload
+                else existing["specification_field"]
+            )
+            if not specification_field:
+                raise ValueError("specification_field 不能为空")
+            common_spec_values = None
+            if "common_spec_values" in payload:
+                common_spec_values = normalize_common_spec_values(
+                    payload.get("common_spec_values")
+                )
+            safe_distances = self._product_safe_distance_values(payload, existing)
             updates = {
                 "name": name,
                 "description": compact_string(payload.get("description")) if "description" in payload else existing["description"],
+                "specifications_json": (
+                    json_dump(specifications)
+                    if specifications is not None
+                    else existing["specifications_json"]
+                ),
+                "specification_field": specification_field,
+                "common_spec_values_json": (
+                    json_dump(common_spec_values)
+                    if common_spec_values is not None
+                    else existing.get("common_spec_values_json", "[]")
+                ),
+                "cover_safe_distance_json": json_dump(
+                    safe_distances["cover_safe_distance"]
+                ),
+                "spine_safe_distance_json": json_dump(
+                    safe_distances["spine_safe_distance"]
+                ),
+                "back_cover_safe_distance_json": json_dump(
+                    safe_distances["back_cover_safe_distance"]
+                ),
                 "enabled": int(bool(payload.get("enabled"))) if "enabled" in payload else existing["enabled"],
                 "updated_at": utc_now(),
             }
-            connection.execute("UPDATE products SET name = :name, description = :description, enabled = :enabled, updated_at = :updated_at WHERE id = :id", {**updates, "id": product_id})
+            connection.execute(
+                """
+                UPDATE products SET
+                    name = :name,
+                    description = :description,
+                    specifications_json = :specifications_json,
+                    specification_field = :specification_field,
+                    common_spec_values_json = :common_spec_values_json,
+                    cover_safe_distance_json = :cover_safe_distance_json,
+                    spine_safe_distance_json = :spine_safe_distance_json,
+                    back_cover_safe_distance_json = :back_cover_safe_distance_json,
+                    enabled = :enabled,
+                    updated_at = :updated_at
+                WHERE id = :id
+                """,
+                {**updates, "id": product_id},
+            )
             if names is not None or shop_ids is not None:
                 old_names = self._product_names(connection, product_id)
                 old_shops = self._product_shop_ids(connection, product_id)
@@ -1220,6 +1712,26 @@ class CatalogRepository:
     @staticmethod
     def _product_row_to_dict(connection, row):
         data = dict(row)
+        data["specifications"] = unique_preserve_order(
+            normalize_string_list(
+                json_load(data.pop("specifications_json", "[]"), [])
+            )
+        )
+        data["specification_field"] = compact_string(
+            data.get("specification_field") or "Book Size | Page Count"
+        )
+        data["common_spec_values"] = normalize_common_spec_values(
+            json_load(data.pop("common_spec_values_json", "[]"), [])
+        )
+        for key in (
+            "cover_safe_distance",
+            "spine_safe_distance",
+            "back_cover_safe_distance",
+        ):
+            column = f"{key}_json"
+            data[key] = CatalogRepository._normalize_safe_distance(
+                json_load(data.pop(column, "{}"), {}), key
+            )
         data["product_names"] = CatalogRepository._product_names(connection, row["id"])
         data["shops"] = [dict(item) for item in connection.execute(
             "SELECT s.id, s.shop, s.shop_name FROM shops s JOIN product_shops ps ON ps.shop_id = s.id WHERE ps.product_id = ? ORDER BY s.id",
@@ -1228,6 +1740,299 @@ class CatalogRepository:
         data["shop_ids"] = [item["id"] for item in data["shops"]]
         data["size_template_ids"] = [item["id"] for item in connection.execute("SELECT id FROM size_templates WHERE product_id = ? ORDER BY id", (row["id"],)).fetchall()]
         return data
+
+    @classmethod
+    def _product_safe_distance_values(
+        cls,
+        payload: dict[str, Any],
+        fallback: Any | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """Normalize product-level safe distances used by every renderer."""
+        fallback = dict(fallback or {})
+        result = {}
+        for key in (
+            "cover_safe_distance",
+            "spine_safe_distance",
+            "back_cover_safe_distance",
+        ):
+            if key in payload:
+                value = payload.get(key)
+            else:
+                value = json_load(fallback.get(f"{key}_json", "{}"), {})
+            result[key] = cls._normalize_safe_distance(value, key)
+        return result
+
+    @staticmethod
+    def _migrate_product_safe_distances(connection) -> None:
+        """Backfill new product settings from legacy size-template settings once."""
+        products = connection.execute(
+            "SELECT id, cover_safe_distance_json, spine_safe_distance_json, "
+            "back_cover_safe_distance_json FROM products"
+        ).fetchall()
+        for product in products:
+            template = connection.execute(
+                """
+                SELECT cover_safe_distance_json, spine_safe_distance_json,
+                       back_cover_safe_distance_json
+                FROM size_templates
+                WHERE product_id = ?
+                  AND (
+                    cover_safe_distance_json <> '{}'
+                    OR spine_safe_distance_json <> '{}'
+                    OR back_cover_safe_distance_json <> '{}'
+                  )
+                ORDER BY id
+                LIMIT 1
+                """,
+                (product["id"],),
+            ).fetchone()
+            if template is None:
+                continue
+            updates = {}
+            for key in (
+                "cover_safe_distance",
+                "spine_safe_distance",
+                "back_cover_safe_distance",
+            ):
+                column = f"{key}_json"
+                current = str(product[column] or "{}").strip()
+                if current in {"", "{}", "null"}:
+                    value = str(template[column] or "{}").strip()
+                    if value not in {"", "{}", "null"}:
+                        updates[column] = value
+            if updates:
+                assignments = ", ".join(f"{key} = ?" for key in updates)
+                connection.execute(
+                    f"UPDATE products SET {assignments}, updated_at = ? WHERE id = ?",
+                    [*updates.values(), utc_now(), product["id"]],
+                )
+
+    @staticmethod
+    def _mail_shop_candidates(*shop_names: str):
+        candidates = []
+        for name in shop_names:
+            normalized = compact_string(name)
+            if normalized and normalized.casefold() not in {
+                item.casefold() for item in candidates
+            }:
+                candidates.append(normalized)
+        return candidates
+
+    def find_product_name_for_shop(self, product_name: str, *shop_names: str):
+        product_name = compact_string(product_name)
+        candidates = self._mail_shop_candidates(*shop_names)
+        if not product_name or not candidates:
+            return None
+        candidate_placeholders = ", ".join("?" for _ in candidates)
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT p.*, s.id AS matched_shop_id,
+                       s.shop AS matched_shop, s.shop_name AS matched_shop_name,
+                       pn.name AS matched_product_name,
+                       (
+                           SELECT st.id FROM size_templates st
+                           WHERE st.product_id = p.id AND st.shop_id = s.id
+                           ORDER BY st.id LIMIT 1
+                       ) AS size_template_id
+                FROM products p
+                JOIN product_shops ps ON ps.product_id = p.id
+                JOIN shops s ON s.id = ps.shop_id
+                JOIN product_names pn ON pn.product_id = p.id
+                WHERE p.enabled = 1
+                  AND (s.shop IN ({candidate_placeholders})
+                       OR s.shop_name IN ({candidate_placeholders}))
+                  AND LOWER(TRIM(pn.name)) = LOWER(?)
+                ORDER BY p.id
+                LIMIT 1
+                """,
+                [*candidates, *candidates, product_name],
+            ).fetchone()
+        return self._mail_product_row(row) if row is not None else None
+
+    def list_mail_product_candidates(self, *shop_names: str):
+        candidates = self._mail_shop_candidates(*shop_names)
+        if not candidates:
+            return []
+        candidate_placeholders = ", ".join("?" for _ in candidates)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.*, s.id AS matched_shop_id,
+                       s.shop AS matched_shop, s.shop_name AS matched_shop_name,
+                       NULL AS matched_product_name,
+                       (
+                           SELECT st.id FROM size_templates st
+                           WHERE st.product_id = p.id AND st.shop_id = s.id
+                           ORDER BY st.id LIMIT 1
+                       ) AS size_template_id
+                FROM products p
+                JOIN product_shops ps ON ps.product_id = p.id
+                JOIN shops s ON s.id = ps.shop_id
+                WHERE p.enabled = 1
+                  AND (s.shop IN ({candidate_placeholders})
+                       OR s.shop_name IN ({candidate_placeholders}))
+                ORDER BY p.id
+                """,
+                [*candidates, *candidates],
+            ).fetchall()
+        return [self._mail_product_row(row) for row in rows]
+
+    def associate_mail_product_name(
+        self,
+        product_id: int,
+        shop_id: int,
+        product_name: str,
+    ):
+        product_name = compact_string(product_name)
+        if not product_name:
+            raise ValueError("商品名不能为空")
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT p.*, s.id AS matched_shop_id,
+                       s.shop AS matched_shop, s.shop_name AS matched_shop_name,
+                       pn.name AS matched_product_name,
+                       (
+                           SELECT st.id FROM size_templates st
+                           WHERE st.product_id = p.id AND st.shop_id = s.id
+                           ORDER BY st.id LIMIT 1
+                       ) AS size_template_id
+                FROM products p
+                JOIN product_shops ps ON ps.product_id = p.id
+                JOIN shops s ON s.id = ps.shop_id
+                JOIN product_names pn ON pn.product_id = p.id
+                WHERE s.id = ? AND LOWER(TRIM(pn.name)) = LOWER(?)
+                ORDER BY p.id LIMIT 1
+                """,
+                (shop_id, product_name),
+            ).fetchone()
+            if existing is not None:
+                return self._mail_product_row(existing)
+
+            product = connection.execute(
+                """
+                SELECT p.*, s.id AS matched_shop_id,
+                       s.shop AS matched_shop, s.shop_name AS matched_shop_name,
+                       NULL AS matched_product_name,
+                       (
+                           SELECT st.id FROM size_templates st
+                           WHERE st.product_id = p.id AND st.shop_id = s.id
+                           ORDER BY st.id LIMIT 1
+                       ) AS size_template_id
+                FROM products p
+                JOIN product_shops ps ON ps.product_id = p.id
+                JOIN shops s ON s.id = ps.shop_id
+                WHERE p.id = ? AND p.enabled = 1 AND s.id = ?
+                LIMIT 1
+                """,
+                (product_id, shop_id),
+            ).fetchone()
+            if product is None:
+                raise ValueError("产品不存在、已停用或未关联当前店铺")
+            sort_order = connection.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order
+                FROM product_names WHERE product_id = ?
+                """,
+                (product_id,),
+            ).fetchone()["next_order"]
+            connection.execute(
+                """
+                INSERT INTO product_names (
+                    product_id, name, sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (product_id, product_name, sort_order, now, now),
+            )
+            shop_row = connection.execute(
+                "SELECT product_names_json FROM shops WHERE id = ?",
+                (shop_id,),
+            ).fetchone()
+            legacy_names = normalize_string_list(
+                json_load(shop_row["product_names_json"], [])
+            )
+            if product_name.casefold() not in {
+                value.casefold() for value in legacy_names
+            }:
+                legacy_names.append(product_name)
+                connection.execute(
+                    """
+                    UPDATE shops
+                    SET product_names_json = ?, product_count = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (json_dump(legacy_names), len(legacy_names), now, shop_id),
+                )
+            data = self._mail_product_row(product)
+            data["matched_product_name"] = product_name
+            return data
+
+    @staticmethod
+    def _mail_product_row(row):
+        data = dict(row)
+        data["product_id"] = data.pop("id")
+        data["shop_id"] = data.pop("matched_shop_id")
+        data["shop"] = data.pop("matched_shop")
+        data["shop_name"] = data.pop("matched_shop_name")
+        data["product_name"] = data.pop("matched_product_name", None)
+        data["specifications"] = unique_preserve_order(
+            normalize_string_list(
+                json_load(data.pop("specifications_json", "[]"), [])
+            )
+        )
+        data["specification_field"] = compact_string(
+            data.get("specification_field") or "Book Size | Page Count"
+        )
+        data["common_spec_values"] = normalize_common_spec_values(
+            json_load(data.pop("common_spec_values_json", "[]"), [])
+        )
+        for key in (
+            "cover_safe_distance",
+            "spine_safe_distance",
+            "back_cover_safe_distance",
+        ):
+            data[key] = CatalogRepository._normalize_safe_distance(
+                json_load(data.pop(f"{key}_json", "{}"), {}), key
+            )
+        return data
+
+    def find_product_template_specification(
+        self,
+        product_id: int,
+        shop_id: int,
+        specification_value: str,
+    ):
+        """Find a product template option contained in an order field value."""
+        source = " ".join(str(specification_value or "").split()).casefold()
+        if not source:
+            return None
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT st.id AS size_template_id,
+                       sto.size_option_id,
+                       sto.label
+                FROM size_templates st
+                JOIN size_template_options sto
+                  ON sto.size_template_id = st.id
+                WHERE st.product_id = ? AND st.shop_id = ?
+                ORDER BY st.id, sto.sort_order, sto.id
+                """,
+                (product_id, shop_id),
+            ).fetchall()
+        for row in rows:
+            aliases = (row["size_option_id"], row["label"])
+            for alias in aliases:
+                normalized = " ".join(str(alias or "").split()).casefold()
+                if normalized and normalized in source:
+                    return {
+                        "size_template_id": row["size_template_id"],
+                        "matched_specification": alias,
+                    }
+        return None
 
     def create_size_template(self, payload: dict[str, Any]):
         product_id = self._optional_int(payload.get("product_id") or payload.get("product"))
@@ -1656,13 +2461,38 @@ class CatalogRepository:
                 if candidates and not candidates.intersection(requested):
                     return None
             if product_name:
-                names = {
-                    compact_string(value).casefold()
-                    for value in template.get("product_names") or []
-                    if compact_string(value)
-                }
-                if names and compact_string(product_name).casefold() not in names:
-                    return None
+                template_product_id = self._optional_int(template.get("product_id"))
+                normalized_product_name = compact_string(product_name)
+                if template_product_id is not None:
+                    with self.connect() as connection:
+                        if table_exists(connection, "product_names"):
+                            matched = connection.execute(
+                                """
+                                SELECT 1 FROM product_names
+                                WHERE product_id = ?
+                                  AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                                LIMIT 1
+                                """,
+                                (template_product_id, normalized_product_name),
+                            ).fetchone()
+                            if matched is None:
+                                return None
+                        else:
+                            names = {
+                                compact_string(value).casefold()
+                                for value in template.get("product_names") or []
+                                if compact_string(value)
+                            }
+                            if names and normalized_product_name.casefold() not in names:
+                                return None
+                else:
+                    names = {
+                        compact_string(value).casefold()
+                        for value in template.get("product_names") or []
+                        if compact_string(value)
+                    }
+                    if names and normalized_product_name.casefold() not in names:
+                        return None
             return self._flatten_render_template(template)
 
         product_name = compact_string(product_name)
@@ -1671,15 +2501,25 @@ class CatalogRepository:
         candidate_shop_ids = []
         with self.connect() as connection:
             if product_id is not None:
-                row = connection.execute(
-                    "SELECT id FROM size_templates WHERE product_id = ? AND "
-                    + json_array_contains_sql(
-                        connection,
-                        self._size_template_product_column(connection),
-                    )
-                    + " ORDER BY id LIMIT 1",
-                    (product_id, product_name),
-                ).fetchone()
+                if table_exists(connection, "product_names"):
+                    matched_product = connection.execute(
+                        """
+                        SELECT 1 FROM product_names
+                        WHERE product_id = ?
+                          AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                        LIMIT 1
+                        """,
+                        (product_id, product_name),
+                    ).fetchone()
+                    if matched_product is None:
+                        return None
+                sql = "SELECT id FROM size_templates WHERE product_id = ?"
+                parameters = [product_id]
+                if shop_id is not None:
+                    sql += " AND shop_id = ?"
+                    parameters.append(shop_id)
+                sql += " ORDER BY id LIMIT 1"
+                row = connection.execute(sql, parameters).fetchone()
                 if row is not None:
                     return self._flatten_render_template(self.get_size_template(row["id"]))
             if shop_id is not None:
@@ -2082,6 +2922,16 @@ class CatalogRepository:
             if shop_id is None:
                 raise ValueError("店铺id不能为空")
             self._require_shop(connection, shop_id)
+            enriched_fonts = self._enrich_layers_font_urls(
+                layers,
+                connection.execute("SELECT * FROM fonts WHERE enabled = 1").fetchall(),
+            )
+            if enriched_fonts:
+                print(
+                    f"[模板保存] 已从字体库补全基础图层字体链接："
+                    f"模板={name}，字体={','.join(sorted(enriched_fonts))}",
+                    flush=True,
+                )
             cursor = connection.execute(
                 """
                 INSERT INTO font_layout_library (
@@ -2103,6 +2953,448 @@ class CatalogRepository:
             template_id = cursor.lastrowid
             self._refresh_shop_counts(connection, shop_id)
         return self.get_font_layout_library_template(template_id)
+
+    def _inner_page_template_row_to_dict(self, row) -> dict[str, Any]:
+        data = dict(row)
+        data.pop("layers_json", None)
+        data["preview_image"] = compact_string(
+            data.pop("preview_image_path", "")
+        ) or None
+        data["shop"] = data.get("shop", "")
+        data["shop_name"] = data.get("shop_name", "")
+        data["product"] = None
+        if data.get("product_id") is not None:
+            try:
+                data["product"] = self.get_product(int(data["product_id"]))
+            except LookupError:
+                data["product"] = None
+        with self.connect() as connection:
+            data["size_options"] = self._inner_page_template_options(
+                connection, int(data["id"])
+            )
+        return data
+
+    @staticmethod
+    def _inner_page_template_option_row_to_dict(row):
+        item = dict(row)
+        item["id"] = str(item.pop("size_option_id"))
+        item["label"] = compact_string(item["label"])
+        item["size_unit"] = compact_string(item["size_unit"])
+        item["layers"] = CatalogRepository._normalize_layers(
+            json_load(item.pop("layers_json"), {})
+        )
+        return item
+
+    @classmethod
+    def _inner_page_template_options(cls, connection, template_id: int):
+        rows = connection.execute(
+            """
+            SELECT id, size_option_id, label, size_unit, sort_order, layers_json,
+                   created_at, updated_at
+            FROM inner_page_template_options
+            WHERE inner_page_template_id = ?
+            ORDER BY sort_order, id
+            """,
+            (template_id,),
+        ).fetchall()
+        return [cls._inner_page_template_option_row_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _inner_page_template_option_row(connection, template_id: int, option_id: str):
+        return connection.execute(
+            """
+            SELECT id, size_option_id, label, size_unit, sort_order, layers_json,
+                   created_at, updated_at
+            FROM inner_page_template_options
+            WHERE inner_page_template_id = ? AND size_option_id = ?
+            """,
+            (template_id, option_id),
+        ).fetchone()
+
+    @staticmethod
+    def _normalize_inner_page_options(raw_options: Any):
+        if not isinstance(raw_options, list) or not raw_options:
+            raise ValueError("size_options 至少需要一个内页规格")
+        result = []
+        seen = set()
+        for index, raw in enumerate(raw_options):
+            if not isinstance(raw, dict):
+                raise ValueError(f"size_options[{index}] 必须是对象")
+            option_id = compact_string(raw.get("id") or raw.get("size_option_id"))
+            label = compact_string(raw.get("label") or option_id)
+            size_unit = compact_string(raw.get("size_unit"))
+            if not option_id:
+                raise ValueError(f"size_options[{index}].id 不能为空")
+            if option_id in seen:
+                raise ValueError(f"内页规格不能重复: {option_id}")
+            if size_unit not in {"in", "mm", "cm"}:
+                raise ValueError(
+                    f"size_options[{index}].size_unit 必须是 in、mm 或 cm"
+                )
+            if not isinstance(raw.get("layers"), dict):
+                raise ValueError(f"size_options[{index}].layers 必须是对象")
+            seen.add(option_id)
+            result.append({
+                "id": option_id,
+                "label": label,
+                "size_unit": size_unit,
+                "layers": CatalogRepository._normalize_layers(raw["layers"]),
+            })
+        return result
+
+    def create_inner_page_template(self, payload: dict[str, Any]):
+        shop_id = self._optional_int(payload.get("shop_id"))
+        product_id = self._optional_int(payload.get("product_id"))
+        name = compact_string(payload.get("name"))
+        if shop_id is None:
+            raise ValueError("店铺id不能为空")
+        if product_id is None:
+            raise ValueError("product_id 不能为空")
+        if not name:
+            raise ValueError("内页模板名称不能为空")
+        options = self._normalize_inner_page_options(payload.get("size_options"))
+        preview = normalize_preview_url(
+            payload.get("preview_image_path") or payload.get("preview_image")
+        )
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            self._require_shop(connection, shop_id)
+            if product_id is not None:
+                if connection.execute(
+                    "SELECT id FROM products WHERE id = ?", (product_id,)
+                ).fetchone() is None:
+                    raise ValueError("产品不存在")
+                if shop_id not in self._product_shop_ids(connection, product_id):
+                    raise ValueError("产品未关联该店铺")
+            cursor = connection.execute(
+                """
+                INSERT INTO inner_page_templates (
+                    shop_id, product_id, name, description,
+                    preview_image_path, layers_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    shop_id,
+                    product_id,
+                    name,
+                    compact_string(payload.get("description")),
+                    preview,
+                    json_dump({}),
+                    now,
+                    now,
+                ),
+            )
+            template_id = cursor.lastrowid
+            for sort_order, option in enumerate(options):
+                connection.execute(
+                    """
+                    INSERT INTO inner_page_template_options (
+                        inner_page_template_id, size_option_id, label, size_unit,
+                        sort_order, layers_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        template_id,
+                        option["id"],
+                        option["label"],
+                        option["size_unit"],
+                        sort_order,
+                        json_dump(option["layers"]),
+                        now,
+                        now,
+                    ),
+                )
+        return self.get_inner_page_template(template_id)
+
+    def list_inner_page_templates(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        shop_id: int | None = None,
+        product_id: int | None = None,
+        search: str | None = None,
+    ):
+        where = []
+        params: list[Any] = []
+        if shop_id is not None:
+            where.append("ipt.shop_id = ?")
+            params.append(shop_id)
+        if product_id is not None:
+            where.append("ipt.product_id = ?")
+            params.append(product_id)
+        if compact_string(search):
+            keyword = f"%{compact_string(search)}%"
+            where.append("(ipt.name LIKE ? OR ipt.description LIKE ?)")
+            params.extend((keyword, keyword))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        with self.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) AS count FROM inner_page_templates ipt {where_sql}",
+                params,
+            ).fetchone()["count"]
+            rows = connection.execute(
+                f"""
+                SELECT ipt.*, s.shop, s.shop_name, p.name AS product_name
+                FROM inner_page_templates ipt
+                JOIN shops s ON s.id = ipt.shop_id
+                LEFT JOIN products p ON p.id = ipt.product_id
+                {where_sql}
+                ORDER BY ipt.updated_at DESC, ipt.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return {
+            "items": [self._inner_page_template_row_to_dict(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_inner_page_template(self, template_id: int):
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT ipt.*, s.shop, s.shop_name, p.name AS product_name
+                FROM inner_page_templates ipt
+                JOIN shops s ON s.id = ipt.shop_id
+                LEFT JOIN products p ON p.id = ipt.product_id
+                WHERE ipt.id = ?
+                """,
+                (template_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError("内页模板不存在")
+        return self._inner_page_template_row_to_dict(row)
+
+    def create_inner_page_template_option(
+        self,
+        template_id: int,
+        payload: dict[str, Any],
+    ):
+        option = self._normalize_inner_page_options([payload])[0]
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            if connection.execute(
+                "SELECT id FROM inner_page_templates WHERE id = ?",
+                (template_id,),
+            ).fetchone() is None:
+                raise LookupError("内页模板不存在")
+            if self._inner_page_template_option_row(
+                connection, template_id, option["id"]
+            ) is not None:
+                raise ValueError(f"内页规格已存在: {option['id']}")
+            sort_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_sort_order
+                FROM inner_page_template_options
+                WHERE inner_page_template_id = ?
+                """,
+                (template_id,),
+            ).fetchone()
+            sort_order = int(sort_row["next_sort_order"])
+            connection.execute(
+                """
+                INSERT INTO inner_page_template_options (
+                    inner_page_template_id, size_option_id, label, size_unit,
+                    sort_order, layers_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template_id,
+                    option["id"],
+                    option["label"],
+                    option["size_unit"],
+                    sort_order,
+                    json_dump(option["layers"]),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE inner_page_templates SET updated_at = ? WHERE id = ?",
+                (now, template_id),
+            )
+            row = self._inner_page_template_option_row(
+                connection, template_id, option["id"]
+            )
+        return self._inner_page_template_option_row_to_dict(row)
+
+    def update_inner_page_template_option(
+        self,
+        template_id: int,
+        option_id: str,
+        payload: dict[str, Any],
+    ):
+        option_id = compact_string(option_id)
+        updates = dict(payload or {})
+        if not updates:
+            raise ValueError("至少传入 label、size_unit 或 layers 中的一个字段")
+        for key, value in updates.items():
+            if value is None:
+                raise ValueError(f"{key} 不能为空")
+        with self._lock, self.connect() as connection:
+            if connection.execute(
+                "SELECT id FROM inner_page_templates WHERE id = ?",
+                (template_id,),
+            ).fetchone() is None:
+                raise LookupError("内页模板不存在")
+            existing_row = self._inner_page_template_option_row(
+                connection, template_id, option_id
+            )
+            if existing_row is None:
+                raise LookupError(f"内页规格不存在: {option_id}")
+            existing = self._inner_page_template_option_row_to_dict(existing_row)
+            option = self._normalize_inner_page_options(
+                [
+                    {
+                        "id": option_id,
+                        "label": updates.get("label", existing["label"]),
+                        "size_unit": updates.get(
+                            "size_unit", existing["size_unit"]
+                        ),
+                        "layers": updates.get("layers", existing["layers"]),
+                    }
+                ]
+            )[0]
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE inner_page_template_options
+                SET label = ?, size_unit = ?, layers_json = ?, updated_at = ?
+                WHERE inner_page_template_id = ? AND size_option_id = ?
+                """,
+                (
+                    option["label"],
+                    option["size_unit"],
+                    json_dump(option["layers"]),
+                    now,
+                    template_id,
+                    option_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE inner_page_templates SET updated_at = ? WHERE id = ?",
+                (now, template_id),
+            )
+            row = self._inner_page_template_option_row(
+                connection, template_id, option_id
+            )
+        return self._inner_page_template_option_row_to_dict(row)
+
+    def delete_inner_page_template_option(
+        self,
+        template_id: int,
+        option_id: str,
+    ):
+        option_id = compact_string(option_id)
+        with self._lock, self.connect() as connection:
+            if connection.execute(
+                "SELECT id FROM inner_page_templates WHERE id = ?",
+                (template_id,),
+            ).fetchone() is None:
+                raise LookupError("内页模板不存在")
+            if self._inner_page_template_option_row(
+                connection, template_id, option_id
+            ) is None:
+                raise LookupError(f"内页规格不存在: {option_id}")
+            connection.execute(
+                """
+                DELETE FROM inner_page_template_options
+                WHERE inner_page_template_id = ? AND size_option_id = ?
+                """,
+                (template_id, option_id),
+            )
+            connection.execute(
+                "UPDATE inner_page_templates SET updated_at = ? WHERE id = ?",
+                (utc_now(), template_id),
+            )
+        return {
+            "deleted": True,
+            "template_id": template_id,
+            "size_option_id": option_id,
+        }
+
+    def update_inner_page_template(self, template_id: int, payload: dict[str, Any]):
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM inner_page_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+            if existing is None:
+                raise LookupError("内页模板不存在")
+            shop_id = self._optional_int(payload.get("shop_id")) or existing["shop_id"]
+            product_id = (
+                self._optional_int(payload.get("product_id"))
+                if "product_id" in payload
+                else existing["product_id"]
+            )
+            if product_id is None:
+                raise ValueError("product_id 不能为空")
+            self._require_shop(connection, shop_id)
+            if product_id is not None:
+                if connection.execute(
+                    "SELECT id FROM products WHERE id = ?", (product_id,)
+                ).fetchone() is None:
+                    raise ValueError("产品不存在")
+                if shop_id not in self._product_shop_ids(connection, product_id):
+                    raise ValueError("产品未关联该店铺")
+            updates = {"shop_id": shop_id, "product_id": product_id}
+            for key in ("name", "description"):
+                if key in payload:
+                    value = compact_string(payload[key])
+                    if key == "name" and not value:
+                        raise ValueError("内页模板名称不能为空")
+                    updates[key] = value
+            if "preview_image" in payload or "preview_image_path" in payload:
+                updates["preview_image_path"] = normalize_preview_url(
+                    payload.get("preview_image_path") or payload.get("preview_image")
+                )
+            options = None
+            if "size_options" in payload:
+                options = self._normalize_inner_page_options(payload.get("size_options"))
+            updates["updated_at"] = utc_now()
+            set_sql = ", ".join(f"{key} = :{key}" for key in updates)
+            connection.execute(
+                f"UPDATE inner_page_templates SET {set_sql} WHERE id = :id",
+                {**updates, "id": template_id},
+            )
+            if options is not None:
+                connection.execute(
+                    "DELETE FROM inner_page_template_options WHERE inner_page_template_id = ?",
+                    (template_id,),
+                )
+                for sort_order, option in enumerate(options):
+                    connection.execute(
+                        """
+                        INSERT INTO inner_page_template_options (
+                            inner_page_template_id, size_option_id, label, size_unit,
+                            sort_order, layers_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            template_id,
+                            option["id"],
+                            option["label"],
+                            option["size_unit"],
+                            sort_order,
+                            json_dump(option["layers"]),
+                            updates["updated_at"],
+                            updates["updated_at"],
+                        ),
+                    )
+        return self.get_inner_page_template(template_id)
+
+    def delete_inner_page_template(self, template_id: int):
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM inner_page_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+            if existing is None:
+                raise LookupError("内页模板不存在")
+            connection.execute(
+                "DELETE FROM inner_page_templates WHERE id = ?", (template_id,)
+            )
+        return {"deleted": True, "id": template_id}
 
     def list_font_layout_library_templates(
         self,
@@ -2172,7 +3464,7 @@ class CatalogRepository:
         ):
             raise ValueError("字体布局模板与尺寸模板不属于同一产品")
         return connection.execute(
-            "SELECT id, size_option_id, label FROM size_template_options "
+            "SELECT id, size_option_id, label, layers_json FROM size_template_options "
             "WHERE size_template_id = ? ORDER BY sort_order, id",
             (size_template_id,),
         ).fetchall()
@@ -2211,7 +3503,9 @@ class CatalogRepository:
         missing_ids = []
         for option in options:
             option_id = compact_string(option["size_option_id"])
-            has_variant = int(option["id"]) in variant_option_ids
+            direct_layers = json_load(option.get("layers_json"), {})
+            has_direct_layers = isinstance(direct_layers, dict) and bool(direct_layers)
+            has_variant = int(option["id"]) in variant_option_ids or has_direct_layers
             if has_variant:
                 synced_ids.append(option_id)
             else:
@@ -2221,10 +3515,14 @@ class CatalogRepository:
                     "size_option_id": option_id,
                     "label": compact_string(option["label"]),
                     "has_size_variant": has_variant,
-                    "layers_source": "size_variant" if has_variant else "base",
+                    "layers_source": (
+                        "size_template_option"
+                        if has_direct_layers
+                        else "size_variant" if has_variant else "base"
+                    ),
                     "using_base_layers": not has_variant,
                     "message": (
-                        "当前规格已有独立字体布局数据"
+                        "当前规格已有独立图层数据"
                         if has_variant
                         else "当前规格暂无独立图层数据，将使用基础字体布局模板"
                     ),
@@ -2269,7 +3567,46 @@ class CatalogRepository:
                 (template_id,),
             ).fetchone()
             if row is None:
-                raise LookupError("字体布局模板不存在")
+                # A library template may be physically deleted after its
+                # per-size JSON snapshots were applied. Keep those snapshots
+                # readable from the size-template context.
+                if size_template_id is None:
+                    raise LookupError("字体布局模板不存在")
+                selected_row = connection.execute(
+                    "SELECT selected_font_layout_id FROM size_templates "
+                    "WHERE id = ?",
+                    (size_template_id,),
+                ).fetchone()
+                if (
+                    selected_row is None
+                    or self._optional_int(selected_row.get("selected_font_layout_id"))
+                    != int(template_id)
+                ):
+                    raise LookupError("字体布局模板不存在")
+                snapshot = connection.execute(
+                    """
+                    SELECT st.shop_id, st.product_id
+                    FROM size_templates st
+                    JOIN font_layout_size_variants flsv
+                      ON flsv.size_template_id = st.id
+                    WHERE st.id = ? AND flsv.font_layout_id = ?
+                    LIMIT 1
+                    """,
+                    (size_template_id, template_id),
+                ).fetchone()
+                if snapshot is None:
+                    raise LookupError("字体布局模板不存在")
+                row = {
+                    "id": int(template_id),
+                    "shop_id": snapshot["shop_id"],
+                    "product_id": snapshot.get("product_id"),
+                    "name": "已删除字体布局",
+                    "sort_key": "",
+                    "preview_image_path": "",
+                    "layers_json": "{}",
+                    "created_at": "",
+                    "updated_at": "",
+                }
             result = self._font_layout_library_row_to_dict(row)
             if size_template_id is None:
                 return result
@@ -2309,7 +3646,7 @@ class CatalogRepository:
             if not requested_option_id:
                 if selected_layout_id not in (None, template_id):
                     result["message"] = (
-                        "当前尺寸模板正在使用其他字体布局；本模板规格数据仅供切换后使用"
+                        "当前尺寸模板正在使用其他字体布局；本模板规格副本仍可独立编辑"
                     )
                 else:
                     result["message"] = status["message"]
@@ -2335,7 +3672,9 @@ class CatalogRepository:
                 None,
             )
             result["size_option_id"] = requested_option_id
-            if selected_layout_id not in (None, template_id):
+            direct_layers = self._normalize_layers(json_load(option.get("layers_json"), {}))
+            has_direct_layers = bool(direct_layers)
+            if selected_layout_id not in (None, template_id) and not has_direct_layers:
                 result["layers_source"] = "base"
                 result["using_base_layers"] = True
                 result["has_size_variant"] = False
@@ -2344,9 +3683,16 @@ class CatalogRepository:
                     "当前尺寸模板正在使用其他字体布局，已使用本模板基础图层"
                 )
                 return result
-            result["has_size_variant"] = variant is not None
-            result["using_base_layers"] = variant is None
-            if variant is not None:
+            result["has_size_variant"] = variant is not None or has_direct_layers
+            result["using_base_layers"] = not result["has_size_variant"]
+            if has_direct_layers:
+                result["layers"] = direct_layers
+                objects = direct_layers.get("objects")
+                result["layer_count"] = len(objects) if isinstance(objects, list) else 0
+                result["layers_source"] = "size_template_option"
+                result["size_variant_id"] = int(variant["id"]) if variant is not None else None
+                result["message"] = "已加载当前规格独立图层数据"
+            elif variant is not None:
                 result["layers"] = self._normalize_layers(
                     json_load(variant["layers_json"], {})
                 )
@@ -2373,11 +3719,36 @@ class CatalogRepository:
                 "SELECT * FROM font_layout_library WHERE id = ?",
                 (template_id,),
             ).fetchone()
-            if layout is None:
-                raise LookupError("字体布局模板不存在")
             selected_layout_id = self._selected_font_layout_id(
                 connection, size_template_id
             )
+            if layout is None:
+                if selected_layout_id != template_id:
+                    raise LookupError("字体布局模板不存在")
+                snapshot = connection.execute(
+                    """
+                    SELECT st.shop_id, st.product_id
+                    FROM size_templates st
+                    JOIN font_layout_size_variants flsv
+                      ON flsv.size_template_id = st.id
+                    WHERE st.id = ? AND flsv.font_layout_id = ?
+                    LIMIT 1
+                    """,
+                    (size_template_id, template_id),
+                ).fetchone()
+                if snapshot is None:
+                    raise LookupError("字体布局模板不存在")
+                layout = {
+                    "id": int(template_id),
+                    "shop_id": snapshot["shop_id"],
+                    "product_id": snapshot.get("product_id"),
+                    "name": "已删除字体布局",
+                    "sort_key": "",
+                    "preview_image_path": "",
+                    "layers_json": "{}",
+                    "created_at": "",
+                    "updated_at": "",
+                }
             options = self._font_layout_size_context(
                 connection,
                 layout,
@@ -2460,6 +3831,21 @@ class CatalogRepository:
             ]
             if missing:
                 raise LookupError(f"尺寸方案不存在: {', '.join(missing)}")
+            font_records = connection.execute(
+                "SELECT * FROM fonts WHERE enabled = 1"
+            ).fetchall()
+            for item in normalized_items:
+                enriched_fonts = self._enrich_layers_font_urls(
+                    item["layers"],
+                    font_records,
+                )
+                if enriched_fonts:
+                    print(
+                        f"[模板保存] 已从字体库补全规格图层字体链接："
+                        f"字体布局ID={template_id}，规格={item['size_option_id']}，"
+                        f"字体={','.join(sorted(enriched_fonts))}",
+                        flush=True,
+                    )
             self._set_selected_font_layout(
                 connection,
                 size_template_id,
@@ -2467,6 +3853,23 @@ class CatalogRepository:
             )
             for item in normalized_items:
                 option = option_by_id[item["size_option_id"]]
+                # Synchronization is a copy operation: keep the canonical
+                # editable layer document on the size option itself. The
+                # variant row remains populated for existing clients and
+                # historical layout-status queries.
+                connection.execute(
+                    """
+                    UPDATE size_template_options
+                    SET layers_json = ?, updated_at = ?
+                    WHERE id = ? AND size_template_id = ?
+                    """,
+                    (
+                        json_dump(item["layers"]),
+                        now,
+                        option["id"],
+                        size_template_id,
+                    ),
+                )
                 connection.execute(
                     """
                     INSERT INTO font_layout_size_variants (
@@ -2495,14 +3898,12 @@ class CatalogRepository:
             item["size_option_id"] for item in normalized_items
         ]
         result["synced_count"] = len(normalized_items)
+        synced_labels = ", ".join(
+            item["size_option_id"] for item in normalized_items
+        )
         result["message"] = (
-            f"已同步 {len(normalized_items)} 个规格"
+            f"已同步 {len(normalized_items)} 个规格（{synced_labels}）"
             + "，当前尺寸模板已切换到该字体布局"
-            + (
-                "，未同步规格将使用基础字体布局模板"
-                if result["missing_size_option_ids"]
-                else "，全部规格都已有独立字体布局数据"
-            )
         )
         return result
 
@@ -2552,7 +3953,11 @@ class CatalogRepository:
             size_option_id,
         )
         result["deleted"] = existing is not None
-        result["message"] = "规格字体布局已删除，当前规格已恢复使用基础模板"
+        result["message"] = (
+            "字体布局历史快照已删除；规格自己的独立图层仍保留"
+            if existing is not None
+            else "当前规格没有该字体布局历史快照，规格独立图层保持不变"
+        )
         return result
 
     def update_font_layout_library_template(
@@ -2616,6 +4021,16 @@ class CatalogRepository:
                 if "layers" in payload
                 else json_load(existing["layers_json"], {})
             )
+            enriched_fonts = self._enrich_layers_font_urls(
+                layers,
+                connection.execute("SELECT * FROM fonts WHERE enabled = 1").fetchall(),
+            )
+            if enriched_fonts:
+                print(
+                    f"[模板保存] 已从字体库补全基础图层字体链接："
+                    f"字体布局ID={template_id}，字体={','.join(sorted(enriched_fonts))}",
+                    flush=True,
+                )
             preview_image_path = (
                 normalize_preview_url(
                     payload.get("preview_image_path")
@@ -2666,18 +4081,14 @@ class CatalogRepository:
     def delete_font_layout_library_template(self, template_id: int):
         with self._lock, self.connect() as connection:
             existing = connection.execute(
-                "SELECT shop_id, preview_image_path FROM font_layout_library WHERE id = ?",
+                "SELECT shop_id, preview_image_path "
+                "FROM font_layout_library WHERE id = ?",
                 (template_id,),
             ).fetchone()
             if existing is None:
                 raise LookupError("字体布局模板不存在")
             connection.execute(
                 "DELETE FROM font_layout_library WHERE id = ?",
-                (template_id,),
-            )
-            connection.execute(
-                "UPDATE size_templates SET selected_font_layout_id = NULL "
-                "WHERE selected_font_layout_id = ?",
                 (template_id,),
             )
             self._refresh_shop_counts(connection, int(existing["shop_id"]))
@@ -3042,8 +4453,13 @@ class CatalogRepository:
             where.append("enabled = ?")
             params.append(1 if enabled else 0)
         if search:
-            where.append("(LOWER(font_preferred) LIKE LOWER(?) OR LOWER(font_en) LIKE LOWER(?) OR LOWER(font_all_name) LIKE LOWER(?))")
-            params.extend([f"%{search}%"] * 3)
+            where.append(
+                "(LOWER(font_name) LIKE LOWER(?) "
+                "OR LOWER(font_preferred) LIKE LOWER(?) "
+                "OR LOWER(font_en) LIKE LOWER(?) "
+                "OR LOWER(font_all_name) LIKE LOWER(?))"
+            )
+            params.extend([f"%{search}%"] * 4)
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         with self.connect() as connection:
             total = connection.execute(
@@ -3462,6 +4878,99 @@ class CatalogRepository:
         if isinstance(value, dict):
             return deepcopy(value)
         raise ValueError("layers 必须是完整图层文档对象")
+
+    @staticmethod
+    def _select_font_source(
+        records: list[Any],
+        family: str,
+        *,
+        weight: str = "normal",
+        style: str = "normal",
+    ) -> str:
+        family_key = compact_string(family).casefold()
+        if not family_key:
+            return ""
+        wants_italic = compact_string(style).casefold() in {"italic", "oblique"}
+        wants_bold = compact_string(weight).casefold() in {
+            "bold", "bolder", "600", "700", "800", "900",
+        }
+
+        def score(raw_record: Any) -> tuple[int, int]:
+            record = dict(raw_record)
+            names = [
+                compact_string(record.get(field)).casefold()
+                for field in (
+                    "font_family",
+                    "font_preferred",
+                    "font_en",
+                    "font_all_name",
+                )
+            ]
+            if family_key not in names:
+                return (-1, 0)
+            descriptor = " ".join(
+                compact_string(record.get(field)).casefold()
+                for field in ("font_name", "post_script_name", "file_path")
+            )
+            is_italic = "italic" in descriptor or "oblique" in descriptor
+            is_bold = "bold" in descriptor or "semibold" in descriptor
+            style_score = 20 if is_italic == wants_italic else -20
+            weight_score = 10 if is_bold == wants_bold else -10
+            exact_family_score = 20 if names[0] == family_key else 0
+            try:
+                record_id = int(record.get("id") or 0)
+            except (TypeError, ValueError):
+                record_id = 0
+            return (100 + exact_family_score + style_score + weight_score, -record_id)
+
+        candidates = [
+            dict(record)
+            for record in records
+            if bool(dict(record).get("enabled", True))
+            and compact_string(dict(record).get("file_path"))
+            and score(record)[0] >= 0
+        ]
+        selected = max(candidates, key=score, default=None)
+        return compact_string((selected or {}).get("file_path"))
+
+    @classmethod
+    def _enrich_layers_font_urls(
+        cls,
+        layers: dict[str, Any],
+        font_records: list[Any],
+    ) -> set[str]:
+        enriched: set[str] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, dict):
+                return
+            family = compact_string(
+                value.get("fontFamily") or value.get("font_family")
+            )
+            font_url = compact_string(
+                value.get("fontUrl") or value.get("font_url")
+            )
+            if family and not font_url:
+                source = cls._select_font_source(
+                    font_records,
+                    family,
+                    weight=compact_string(value.get("fontWeight")) or "normal",
+                    style=compact_string(value.get("fontStyle")) or "normal",
+                )
+                if source:
+                    value["fontUrl"] = source
+                    enriched.add(family)
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+        visit(layers)
+        return enriched
+
     @staticmethod
     def _size_template_option_row_to_dict(row) -> dict[str, Any]:
         data = {
@@ -3475,6 +4984,9 @@ class CatalogRepository:
             "spine_width": float(row["spine_width"] or 0),
             "spine_bleed": float(row["spine_bleed"] or 0),
         }
+        layers = json_load(row.get("layers_json"), {})
+        if isinstance(layers, dict) and layers:
+            data["layers"] = CatalogRepository._normalize_layers(layers)
         mode = compact_string(row.get("spine_width_mode")) or "fixed"
         if mode != "fixed":
             data["spine_width_mode"] = mode
@@ -3521,8 +5033,8 @@ class CatalogRepository:
                 size_template_id, size_option_id, label, sort_order,
                 size_unit, single_side_width, single_side_height,
                 bleed, spine_width, spine_bleed, spine_width_mode,
-                spine_width_formula_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                spine_width_formula_json, layers_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 template_id,
@@ -3537,6 +5049,7 @@ class CatalogRepository:
                 float(option.get("spine_bleed") or 0),
                 compact_string(option.get("spine_width_mode")) or "fixed",
                 json_dump(option.get("spine_width_formula") or {}),
+                json_dump(option.get("layers") or {}),
                 now,
                 now,
             ),
@@ -3593,16 +5106,22 @@ class CatalogRepository:
         saving a size-template editor cannot erase saved font layers.
         """
         existing_rows = connection.execute(
-            "SELECT size_option_id FROM size_template_options "
+            "SELECT size_option_id, layers_json FROM size_template_options "
             "WHERE size_template_id = ?",
             (template_id,),
         ).fetchall()
         existing_ids = {str(row["size_option_id"]) for row in existing_rows}
+        existing_layers = {
+            str(row["size_option_id"]): json_load(row.get("layers_json"), {})
+            for row in existing_rows
+        }
         incoming_ids = {str(option["id"]) for option in options}
 
         for sort_order, option in enumerate(options):
             option_id = str(option["id"])
             if option_id in existing_ids:
+                if "layers" not in option:
+                    option = {**option, "layers": existing_layers.get(option_id, {})}
                 cls._update_size_template_option_row(
                     connection,
                     template_id,
@@ -3647,7 +5166,7 @@ class CatalogRepository:
                 label = ?, size_unit = ?, single_side_width = ?,
                 single_side_height = ?, bleed = ?, spine_width = ?,
                 spine_bleed = ?, spine_width_mode = ?,
-                spine_width_formula_json = ?, updated_at = ?
+                spine_width_formula_json = ?, layers_json = ?, updated_at = ?
             WHERE size_template_id = ? AND size_option_id = ?
             """,
             (
@@ -3660,6 +5179,7 @@ class CatalogRepository:
                 float(option.get("spine_bleed") or 0),
                 compact_string(option.get("spine_width_mode")) or "fixed",
                 json_dump(option.get("spine_width_formula") or {}),
+                json_dump(option.get("layers") or {}),
                 now,
                 template_id,
                 option_id,
@@ -4184,6 +5704,20 @@ class CatalogRepository:
         ).fetchone() is None:
             return
         order_count = self._orders_count(connection, shop_id)
+        status_counts = {status: 0 for status in range(6)}
+        if table_exists(connection, "orders"):
+            order_columns = {row["name"] for row in table_columns(connection, "orders")}
+            if "shop_id" in order_columns and "status" in order_columns:
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM orders WHERE shop_id = ? GROUP BY status",
+                    (shop_id,),
+                ).fetchall():
+                    try:
+                        status = int(row["status"])
+                    except (TypeError, ValueError):
+                        continue
+                    if status in status_counts:
+                        status_counts[status] = int(row["count"] or 0)
         size_template_count = connection.execute(
             "SELECT COUNT(*) AS count FROM size_templates WHERE shop_id = ?",
             (shop_id,),
@@ -4204,6 +5738,12 @@ class CatalogRepository:
             UPDATE shops SET
                 product_count = ?,
                 order_count = ?,
+                new_order_count = ?,
+                confirmation_count = ?,
+                pending_production_count = ?,
+                in_production_count = ?,
+                pending_shipment_count = ?,
+                completed_order_count = ?,
                 size_template_count = ?,
                 font_template_count = ?,
                 updated_at = CASE WHEN updated_at = '' THEN ? ELSE updated_at END
@@ -4212,6 +5752,12 @@ class CatalogRepository:
             (
                 product_count,
                 order_count,
+                status_counts[0],
+                status_counts[1],
+                status_counts[2],
+                status_counts[3],
+                status_counts[4],
+                status_counts[5],
                 size_template_count,
                 font_template_count,
                 utc_now(),
@@ -4306,7 +5852,35 @@ class CatalogRepository:
     def _shop_row_to_dict(self, row):
         data = dict(row)
         data["products"] = json_load(data["product_names_json"], [])
+        # Keep the URL field explicit in the public shop payload.  The value
+        # is intentionally returned as-is so the frontend can edit it.
+        data["wecom_robot_webhook_url"] = compact_string(
+            data.get("wecom_robot_webhook_url")
+        )
         return data
+
+    def get_shop_wecom_robot_webhook(self, shop_id: int | None):
+        """Return the configured WeCom webhook for a shop, or an empty value."""
+        if shop_id is None:
+            return ""
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT wecom_robot_webhook_url FROM shops WHERE id = ?",
+                (shop_id,),
+            ).fetchone()
+        return compact_string(row["wecom_robot_webhook_url"]) if row else ""
+
+    def has_configured_shop_wecom_robot(self):
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM shops
+                WHERE TRIM(wecom_robot_webhook_url) <> ''
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
 
     @staticmethod
     def _size_template_display_name(
@@ -4322,7 +5896,41 @@ class CatalogRepository:
             return compact_string(product_names[0])
         return f"尺寸模板 {template_id}"
 
+    @staticmethod
+    def _merge_render_size_layouts(
+        direct_layouts: list[dict[str, Any]],
+        variant_layouts: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Use the size option's own copy before legacy variant snapshots."""
+        merged: list[dict[str, Any]] = []
+        direct_ids = set()
+        for item in direct_layouts:
+            option_id = compact_string(item.get("size_option_id"))
+            if not option_id:
+                continue
+            direct_ids.add(option_id)
+            merged.append(deepcopy(item))
+        for item in variant_layouts:
+            if compact_string(item.get("size_option_id")) not in direct_ids:
+                merged.append(deepcopy(item))
+        return merged
+
     def _flatten_render_template(self, template: dict[str, Any]):
+        direct_size_layouts = []
+        for option in template.get("size_options") or []:
+            if not isinstance(option, dict) or not isinstance(option.get("layers"), dict):
+                continue
+            layers = self._normalize_layers(option["layers"])
+            if not layers:
+                continue
+            direct_size_layouts.append(
+                {
+                    "size_option_id": str(option.get("id") or ""),
+                    "layers": layers,
+                    "canvas": deepcopy(layers.get("canvas") or {}),
+                    "layers_source": "size_template_option",
+                }
+            )
         layouts = self.list_font_layout_library_templates(
             limit=500,
             shop_id=int(template["shop_id"]),
@@ -4336,13 +5944,56 @@ class CatalogRepository:
         # library template as if they were active simultaneously.
         if selected_layout_id is None:
             layouts = []
+            if direct_size_layouts:
+                base_layers = deepcopy(direct_size_layouts[0]["layers"])
+                layouts = [{
+                    "id": None,
+                    "name": "尺寸模板规格图层",
+                    "preview_image": "",
+                    "layers": base_layers,
+                    "size_layouts": direct_size_layouts,
+                }]
         else:
             layouts = [
                 layout for layout in layouts
                 if int(layout.get("id")) == selected_layout_id
             ]
+        if selected_layout_id is not None and not layouts:
+            # The selected library row may have been physically removed after
+            # its per-size snapshots were saved. Reconstruct a minimal active
+            # layout from the preserved variant rows for rendering.
+            with self.connect() as connection:
+                has_variant = connection.execute(
+                    """
+                    SELECT 1 FROM font_layout_size_variants
+                    WHERE font_layout_id = ? AND size_template_id = ?
+                    LIMIT 1
+                    """,
+                    (selected_layout_id, int(template["id"])),
+                ).fetchone()
+            if has_variant is not None:
+                layouts = [{
+                    "id": selected_layout_id,
+                    "name": "已删除字体布局",
+                    "preview_image": "",
+                    "layers": {"objects": []},
+                }]
+            elif direct_size_layouts:
+                # A stale/deleted selected layout must not hide independent
+                # layers already copied onto the size options.
+                layouts = [{
+                    "id": None,
+                    "name": "尺寸模板规格图层",
+                    "preview_image": "",
+                    "layers": deepcopy(direct_size_layouts[0]["layers"]),
+                    "size_layouts": direct_size_layouts,
+                }]
         variants_by_layout: dict[int, list[dict[str, Any]]] = {}
-        layout_ids = [int(layout["id"]) for layout in layouts]
+        layout_ids = [
+            int(layout["id"])
+            for layout in layouts
+            if self._optional_int(layout.get("id")) is not None
+        ]
         if layout_ids:
             with self.connect() as connection:
                 id_placeholders = placeholders(layout_ids)
@@ -4368,6 +6019,7 @@ class CatalogRepository:
                 variant = {
                     "size_option_id": compact_string(row["size_option_id"]),
                     "layers": layers,
+                    "layers_source": "size_variant",
                 }
                 # New layer documents may carry their reference canvas inside
                 # the document. Preserve it instead of making renderers guess.
@@ -4399,7 +6051,12 @@ class CatalogRepository:
                     )
                 },
                 "size_layouts": deepcopy(
-                    variants_by_layout.get(int(layout["id"]), [])
+                    self._merge_render_size_layouts(
+                        direct_size_layouts,
+                        variants_by_layout.get(
+                            self._optional_int(layout.get("id")), []
+                        ),
+                    )
                 ),
             }
             for layout in layouts

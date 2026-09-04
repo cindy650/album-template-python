@@ -2,6 +2,20 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
+
+class SSEMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    msg: str = Field(min_length=1, description="需要立即推送给所有 SSE 订阅者的消息")
+
+    @field_validator("msg")
+    @classmethod
+    def validate_msg(cls, value: str):
+        value = value.strip()
+        if not value:
+            raise ValueError("msg 不能为空")
+        return value
+
 class ParseOrderRequest(BaseModel):
     subject: str = Field(description="邮件标题")
     body: str = Field(description="已解码的纯文本邮件正文")
@@ -143,6 +157,15 @@ class ImageMapRenderRequest(BaseModel):
 class ShopCreate(BaseModel):
     shop: str = Field(description="店铺唯一标识")
     shop_name: str = Field(default="", description="店铺名")
+    wecom_robot_webhook_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "wecom_robot_webhook_url",
+            "wecom_robot",
+            "企业微信机器人",
+        ),
+        description="企业微信机器人 Webhook 地址",
+    )
     products: list[str] = Field(
         default_factory=list,
         validation_alias=AliasChoices("products", "product_names"),
@@ -153,11 +176,29 @@ class ShopCreate(BaseModel):
 class ShopUpdate(BaseModel):
     shop: str | None = Field(default=None, description="店铺唯一标识")
     shop_name: str | None = Field(default=None, description="店铺名")
+    wecom_robot_webhook_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "wecom_robot_webhook_url",
+            "wecom_robot",
+            "企业微信机器人",
+        ),
+        description="企业微信机器人 Webhook 地址；传空字符串表示清除",
+    )
     products: list[str] | None = Field(
         default=None,
         validation_alias=AliasChoices("products", "product_names"),
         description="店铺关联的完整商品名数组；传入时替换原有关联",
     )
+
+
+class SafeDistanceValues(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    top: float = Field(default=0, ge=0, description="上安全距离")
+    right: float = Field(default=0, ge=0, description="右安全距离")
+    bottom: float = Field(default=0, ge=0, description="下安全距离")
+    left: float = Field(default=0, ge=0, description="左安全距离")
 
 
 class ProductCreate(BaseModel):
@@ -169,6 +210,49 @@ class ProductCreate(BaseModel):
         min_length=1,
         description="用于匹配订单的商品名数组；可同时填写多个商品名",
     )
+    specifications: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("specifications", "specifications_json"),
+        description="邮件订单规格字段中允许匹配的规格片段数组；为空时按关联模板规格匹配",
+    )
+    specification_field: str = Field(
+        default="Book Size | Page Count",
+        min_length=1,
+        description="从订单商品信息中读取规格值的字段名",
+    )
+    common_spec_values: list[dict[str, Any]] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices(
+            "common_spec_values",
+            "common_specifications",
+            "常用规格值",
+        ),
+        description="常用规格值对象数组；由前端填写并按原值保存，可为空",
+    )
+    cover_safe_distance: SafeDistanceValues = Field(
+        default_factory=SafeDistanceValues,
+        validation_alias=AliasChoices(
+            "cover_safe_distance",
+            "cover_safe_distance_json",
+        ),
+        description="封面安全距离，包含 top、right、bottom、left，单位固定为毫米",
+    )
+    spine_safe_distance: SafeDistanceValues = Field(
+        default_factory=SafeDistanceValues,
+        validation_alias=AliasChoices(
+            "spine_safe_distance",
+            "spine_safe_distance_json",
+        ),
+        description="背脊安全距离，包含 top、right、bottom、left，单位固定为毫米",
+    )
+    back_cover_safe_distance: SafeDistanceValues = Field(
+        default_factory=SafeDistanceValues,
+        validation_alias=AliasChoices(
+            "back_cover_safe_distance",
+            "back_cover_safe_distance_json",
+        ),
+        description="封底安全距离，包含 top、right、bottom、left，单位固定为毫米",
+    )
     shop_ids: list[int] = Field(default_factory=list, description="关联店铺 ID，可关联多个店铺")
     enabled: bool = Field(default=True, description="是否启用")
 
@@ -179,6 +263,12 @@ class ProductCreate(BaseModel):
             raise ValueError("product_names 必须是数组")
         return value
 
+    @field_validator("specifications", mode="before")
+    @classmethod
+    def validate_specifications(cls, value):
+        if not isinstance(value, list):
+            raise ValueError("specifications 必须是数组")
+        return value
 
 class ProductUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -188,6 +278,49 @@ class ProductUpdate(BaseModel):
     product_names: list[str] | None = Field(
         default=None,
         description="用于匹配订单的商品名数组；传入时替换全部商品名",
+    )
+    specifications: list[str] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("specifications", "specifications_json"),
+        description="邮件订单规格字段中允许匹配的规格片段数组；传空数组表示该产品无独立规格",
+    )
+    specification_field: str | None = Field(
+        default=None,
+        min_length=1,
+        description="从订单商品信息中读取规格值的字段名",
+    )
+    common_spec_values: list[dict[str, Any]] | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "common_spec_values",
+            "common_specifications",
+            "常用规格值",
+        ),
+        description="常用规格值对象数组；传入时替换全部值，可传空数组清空",
+    )
+    cover_safe_distance: SafeDistanceValues | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "cover_safe_distance",
+            "cover_safe_distance_json",
+        ),
+        description="封面安全距离，包含 top、right、bottom、left，单位固定为毫米；不传则保持原值",
+    )
+    spine_safe_distance: SafeDistanceValues | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "spine_safe_distance",
+            "spine_safe_distance_json",
+        ),
+        description="背脊安全距离，包含 top、right、bottom、left，单位固定为毫米；不传则保持原值",
+    )
+    back_cover_safe_distance: SafeDistanceValues | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "back_cover_safe_distance",
+            "back_cover_safe_distance_json",
+        ),
+        description="封底安全距离，包含 top、right、bottom、left，单位固定为毫米；不传则保持原值",
     )
     shop_ids: list[int] | None = Field(default=None, description="关联店铺 ID 数组")
     enabled: bool | None = Field(default=None, description="是否启用")
@@ -199,6 +332,12 @@ class ProductUpdate(BaseModel):
             raise ValueError("product_names 必须是数组")
         return value
 
+    @field_validator("specifications", mode="before")
+    @classmethod
+    def validate_specifications(cls, value):
+        if value is not None and not isinstance(value, list):
+            raise ValueError("specifications 必须是数组")
+        return value
 
 class SizeTemplateCreate(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -357,15 +496,6 @@ class SizeTemplateOptionUpdate(BaseModel):
     select: bool = Field(default=False, description="修改后是否切换为当前方案")
 
 
-class SafeDistanceValues(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    top: float = Field(default=0, ge=0, description="上安全距离")
-    right: float = Field(default=0, ge=0, description="右安全距离")
-    bottom: float = Field(default=0, ge=0, description="下安全距离")
-    left: float = Field(default=0, ge=0, description="左安全距离")
-
-
 class SizeTemplateOptionV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -378,6 +508,10 @@ class SizeTemplateOptionV2(BaseModel):
     bleed: float = Field(ge=0, description="出血")
     spine_width: float = Field(ge=0, description="背脊宽")
     spine_bleed: float = Field(ge=0, description="背脊出血")
+    layers: dict[str, Any] | None = Field(
+        default=None,
+        description="该规格独立图层文档；可直接编辑，也可由字体布局同步复制",
+    )
 
 
 class SizeTemplateCreateV2(BaseModel):
@@ -547,6 +681,74 @@ class FontLayoutLibrarySaveAs(BaseModel):
         default=None,
         description="新模板排序搜索键；不传时继承源模板",
     )
+
+
+class InnerPageTemplateCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shop_id: int = Field(gt=0, description="所属店铺 ID")
+    product_id: int = Field(gt=0, description="关联产品分类 ID")
+    name: str = Field(min_length=1, description="内页模板名称")
+    description: str = Field(default="", description="模板说明")
+    preview_image: str | None = Field(default=None, description="标识图 OSS 访问链接")
+    size_options: list["InnerPageTemplateOption"] = Field(
+        min_length=1,
+        description="内页规格及其独立图层数组",
+    )
+
+
+class InnerPageTemplateUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shop_id: int | None = Field(default=None, gt=0, description="所属店铺 ID")
+    product_id: int = Field(gt=0, description="关联产品分类 ID；编辑时可修改关联产品")
+    name: str | None = Field(default=None, min_length=1, description="内页模板名称")
+    description: str | None = Field(default=None, description="模板说明")
+    preview_image: str | None = Field(default=None, description="标识图 OSS 访问链接")
+    size_options: list["InnerPageTemplateOption"] | None = Field(
+        default=None,
+        min_length=1,
+        description="完整内页规格及其独立图层数组；不传则保留已有规格",
+    )
+
+
+class InnerPageTemplateOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, description="内页规格业务 ID")
+    label: str = Field(min_length=1, description="内页规格名称")
+    size_unit: Literal["in", "mm", "cm"] = Field(
+        description="规格单位；按前端提交值原样保存，不做换算",
+    )
+    layers: dict[str, Any] = Field(description="该规格完整图层文档")
+
+
+class InnerPageTemplateOptionUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = Field(default=None, min_length=1, description="内页规格名称")
+    size_unit: Literal["in", "mm", "cm"] | None = Field(
+        default=None,
+        description="规格单位；按前端提交值原样保存，不做换算",
+    )
+    layers: dict[str, Any] | None = Field(
+        default=None,
+        description="该规格完整图层文档；不传则保留已有图层",
+    )
+
+
+class TextGenerationRuleCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, description="文字生成规则名称")
+    description: str = Field(default="", description="文字生成规则描述")
+
+
+class TextGenerationRuleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, description="文字生成规则名称")
+    description: str | None = Field(default=None, description="文字生成规则描述")
 
 
 class FontLayoutSizeVariantItem(BaseModel):

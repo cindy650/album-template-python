@@ -10,7 +10,12 @@ import qq_idleCopy as core
 from backend import __version__
 from backend.api import api_router
 from backend.config import settings
-from backend.context import image_map_renderer, listener, order_service, tasks
+from backend.context import (
+    image_map_renderer,
+    listener,
+    order_service,
+    tasks,
+)
 from backend.database import dispose_pools
 from backend.responses import api_code_for_status, api_error, api_success
 

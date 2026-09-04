@@ -4,6 +4,13 @@
   const fabric = global.fabric;
   if (!fabric) throw new Error('Fabric 7.4.0 未加载');
 
+  const CANVAS_ROW_GAP = 0;
+  const PIXELS_PER_UNIT = Object.freeze({
+    in: 96,
+    cm: 96 / 2.54,
+    mm: 96 / 25.4,
+  });
+
   installTextWordSpacingSupport();
 
   global.ImageMapHeadlessRenderer = Object.freeze({
@@ -18,7 +25,10 @@
     const workarea = rawObjects.find(item => String(item?.id || '').toLowerCase() === 'workarea');
     if (!workarea) throw new Error('图层 JSON 缺少 id=workarea 的画布对象');
 
+    normalizeWorkareaPrintGeometry(workarea);
+
     const bounds = resolveWorkareaBounds(workarea);
+    syncSpineEndBlocks(rawObjects, workarea, bounds);
     const cropWidth = Math.ceil(bounds.width);
     const cropHeight = Math.ceil(bounds.height);
     const dpi = positive(options?.dpi ?? 300, 'dpi');
@@ -37,105 +47,90 @@
     canvas.setDimensions({ width: cropWidth, height: cropHeight });
 
     const warnings = [];
-    let loadedFonts = [];
-    let outputCanvas = null;
-    try {
-      loadedFonts = await loadFonts(rawObjects, warnings);
-      const objectsToRender = [];
-      if (typeof workarea.src === 'string' && workarea.src) objectsToRender.push(workarea);
-      objectsToRender.push(...rawObjects.filter(item => String(item?.id || '').toLowerCase() !== 'workarea'));
+    let textOverflowBlocked = false;
+    await loadFonts(rawObjects, warnings);
+    const objectsToRender = [];
+    if (typeof workarea.src === 'string' && workarea.src) objectsToRender.push(workarea);
+    objectsToRender.push(...rawObjects.filter(item => String(item?.id || '').toLowerCase() !== 'workarea'));
 
-      for (const serialized of objectsToRender) {
-        const local = toWorkareaScene(serialized, bounds);
-        const object = await createObject(local, warnings);
-        if (!object) continue;
-        canvas.add(object);
-        object.setCoords?.();
-      }
-
-      canvas.backgroundColor = options?.backgroundColor || workarea.backgroundColor || '#ffffff';
-      canvas.renderAll();
-      if (formats.some(format => format === 'jpg' || format === 'png')) {
-        outputCanvas = canvas.toCanvasElement(multiplier, {
-          left: 0,
-          top: 0,
-          width: cropWidth,
-          height: cropHeight,
-        });
-      }
-      const images = {};
-      if (formats.includes('jpg')) {
-        images.jpg = outputCanvas.toDataURL('image/jpeg', quality);
-      }
-      if (formats.includes('png')) {
-        images.png = outputCanvas.toDataURL('image/png');
-      }
-      const svg = formats.includes('svg')
-        ? exportSvg(canvas, loadedFonts, outputCanvas, cropWidth, cropHeight, multiplier)
-        : null;
-      const geometry = canvas.getObjects().map((object, sourceIndex) => {
-        const center = object.getCenterPoint();
-        const objectBounds = object.getBoundingRect();
-        return {
-          sourceIndex,
-          id: object.id ?? null,
-          type: object.type,
-          left: object.left,
-          top: object.top,
-          centerX: center.x,
-          centerY: center.y,
-          width: object.width,
-          height: object.height,
-          scaleX: object.scaleX,
-          scaleY: object.scaleY,
-          angle: object.angle,
-          boundingRect: {
-            left: objectBounds.left,
-            top: objectBounds.top,
-            right: objectBounds.left + objectBounds.width,
-            bottom: objectBounds.top + objectBounds.height,
-            width: objectBounds.width,
-            height: objectBounds.height,
-          },
-          textLines: Array.isArray(object.textLines) ? [...object.textLines] : null,
-          characterBounds: Array.isArray(object.__charBounds)
-            ? object.__charBounds.map(line => (
-              Array.isArray(line)
-                ? line.map(box => box ? {
-                  width: box.width,
-                  kernedWidth: box.kernedWidth,
-                  left: box.left,
-                } : null)
-                : null
-            ))
-            : null,
-        };
-      });
-      const result = {
-        images,
-        width: outputCanvas?.width ?? Math.floor(cropWidth * multiplier),
-        height: outputCanvas?.height ?? Math.floor(cropHeight * multiplier),
-        cssWidth: cropWidth,
-        cssHeight: cropHeight,
-        dpi,
-        objectCount: canvas.getObjects().length,
-        geometry,
-        workareaOrigin: { left: bounds.left, top: bounds.top },
-        crop: { left: bounds.left, top: bounds.top, width: cropWidth, height: cropHeight },
-        warnings,
-        fontStatus: loadedFonts.status,
-        fabricVersion: fabric.version,
-        svg,
-      };
-      return result;
-    } finally {
-      canvas.dispose();
-      releaseFonts(loadedFonts);
-      if (outputCanvas) {
-        outputCanvas.width = 0;
-        outputCanvas.height = 0;
-      }
+    for (const serialized of objectsToRender) {
+      // Alignment markers define the position used for the first safety check.
+      // Objects without a marker keep their authored position throughout.
+      applyAlignmentMarkers([serialized], workarea);
+      const local = toWorkareaScene(serialized, bounds);
+      const object = await createObject(local, warnings);
+      if (!object) continue;
+      const fitResult = fitTextObjectToSafeRegion(
+        object,
+        serialized,
+        workarea,
+        bounds,
+        options,
+      );
+      warnings.push(...fitResult.warnings);
+      textOverflowBlocked = textOverflowBlocked || fitResult.blocked;
+      // Reapply markers after font fitting so a reduced text box is centered
+      // using its final geometry. Unmarked axes remain untouched.
+      applyAlignmentMarkers([serialized], workarea);
+      const alignedLocal = toWorkareaScene(serialized, bounds);
+      object.set({ left: alignedLocal.left, top: alignedLocal.top });
+      canvas.add(object);
+      object.setCoords?.();
     }
+    if (textOverflowBlocked) {
+      canvas.dispose();
+      throw new Error(warnings.filter(item => item.includes('已阻止导出')).join('\n') || '存在文字图层超出安全区域，已阻止导出');
+    }
+
+    canvas.backgroundColor = options?.backgroundColor || workarea.backgroundColor || '#ffffff';
+    canvas.renderAll();
+    const outputCanvas = canvas.toCanvasElement(multiplier, {
+      left: 0,
+      top: 0,
+      width: cropWidth,
+      height: cropHeight,
+    });
+    const images = {};
+    if (formats.includes('jpg')) {
+      images.jpg = outputCanvas.toDataURL('image/jpeg', quality);
+    }
+    if (formats.includes('png')) {
+      images.png = outputCanvas.toDataURL('image/png');
+    }
+    if (formats.includes('svg')) {
+      images.svg = buildSvg(canvas, workarea, bounds, rawObjects);
+    }
+    if (formats.includes('text-to-svg')) {
+      images.textToSvg = await buildTextToSvg(canvas, workarea, bounds, rawObjects);
+    }
+    const geometry = canvas.getObjects().map(object => ({
+      id: object.id ?? null,
+      type: object.type,
+      left: object.left,
+      top: object.top,
+      width: object.width,
+      height: object.height,
+      scaleX: object.scaleX,
+      scaleY: object.scaleY,
+    }));
+    const result = {
+      images,
+      // Return the cloned document after text fitting and alignment so callers
+      // can persist the exact fontSize values used to generate the files.
+      // The object passed in options.json is never mutated.
+      json: source,
+      width: outputCanvas.width,
+      height: outputCanvas.height,
+      cssWidth: cropWidth,
+      cssHeight: cropHeight,
+      dpi,
+      objectCount: canvas.getObjects().length,
+      geometry,
+      warnings,
+      fabricVersion: fabric.version,
+    };
+    canvas.dispose();
+    return result;
   }
 
   function extractObjects(value) {
@@ -143,6 +138,483 @@
     if (Array.isArray(value?.objects)) return value.objects;
     if (Array.isArray(value?.layers?.objects)) return value.layers.objects;
     throw new Error('图层 JSON 必须是对象数组，或包含 objects/layers.objects 数组');
+  }
+
+  /**
+   * Keep the standalone renderer aligned with WorkareaHandler's two-row
+   * geometry. Older/simplified payloads may carry canvasRows=2 while their
+   * Fabric width/height or printGuides still describe a single row.
+   */
+  function normalizeWorkareaPrintGeometry(workarea) {
+    if (workarea.canvasRows !== 2) return;
+
+    const factor = PIXELS_PER_UNIT[String(workarea.unit || '').toLowerCase()];
+    const sideHeight = nonnegativeOrNull(workarea.sideHeight);
+    const bleed = nonnegativeOrNull(workarea.bleed);
+    const separateBleed = workarea.separateBleed === true;
+    const horizontalBleed = separateBleed ? nonnegativeOrNull(workarea.horizontalBleed) : bleed;
+    const verticalBleed = separateBleed ? nonnegativeOrNull(workarea.verticalBleed) : bleed;
+    if (!factor || sideHeight === null || horizontalBleed === null || verticalBleed === null) return;
+
+    const rowHeight = Math.max(1, (sideHeight + verticalBleed * 2) * factor);
+    const rowGap = nonnegativeOrNull(workarea.canvasRowGap) ?? CANVAS_ROW_GAP;
+    const height = rowHeight * 2 + rowGap;
+    const sideWidth = nonnegativeOrNull(workarea.sideWidth);
+    const width = sideWidth !== null
+      ? Math.max(1, (sideWidth * 2 + horizontalBleed * 2) * factor)
+      : positiveOrNull(workarea.workareaWidth) || positiveOrNull(workarea.width);
+
+    if (width) {
+      workarea.width = width;
+      workarea.workareaWidth = width;
+    }
+    // Two-row layouts intentionally have no spine. Normalize these fields so
+    // the returned JSON and all downstream exporters agree with the geometry.
+    workarea.spineWidth = 0;
+    workarea.spineBleed = 0;
+    workarea.height = height;
+    workarea.workareaHeight = height;
+    workarea.printGuides = buildPrintGuides(width, height, {
+      factor,
+      sideWidth,
+      horizontalBleed,
+      verticalBleed,
+      spineWidth: 0,
+      spineBleed: 0,
+      canvasRows: 2,
+      canvasRowGap: rowGap,
+    }, workarea.printGuides);
+  }
+
+  function syncSpineEndBlocks(objects, workarea, bounds) {
+    const ids = new Set(['__spine-top-block', '__spine-bottom-block']);
+    for (let index = objects.length - 1; index >= 0; index -= 1) {
+      if (ids.has(String(objects[index]?.id || ''))) objects.splice(index, 1);
+    }
+    const blocks = buildSpineEndBlocks(workarea, bounds);
+    if (!blocks.length) return blocks;
+    const workareaIndex = objects.indexOf(workarea);
+    objects.splice(workareaIndex >= 0 ? workareaIndex + 1 : 0, 0, ...blocks);
+    return blocks;
+  }
+
+  function buildSpineEndBlocks(workarea, bounds) {
+    if (workarea.canvasRows === 2) return [];
+    const unit = String(workarea.unit || '').toLowerCase();
+    const factor = PIXELS_PER_UNIT[unit];
+    const spineWidth = Math.max(0, numberOr(workarea.spineWidth, 0));
+    if (!factor || !(spineWidth > 0)) return [];
+
+    const bleed = Math.max(0, numberOr(workarea.bleed, 0));
+    const horizontalBleed = Math.max(0, numberOr(
+      workarea.separateBleed === true ? workarea.horizontalBleed : bleed,
+      bleed,
+    ));
+    const sideWidth = Math.max(0, numberOr(workarea.sideWidth, 0));
+    const spineBleed = Math.max(0, numberOr(workarea.spineBleed, 0));
+    const logicalWidth = positiveOrNull(workarea.workareaWidth)
+      || positiveOrNull(workarea.width)
+      || bounds.width;
+    const logicalHeight = positiveOrNull(workarea.workareaHeight)
+      || positiveOrNull(workarea.height)
+      || bounds.height;
+    const scaleX = bounds.width / logicalWidth;
+    const scaleY = bounds.height / logicalHeight;
+    const left = bounds.left
+      + (horizontalBleed + sideWidth + spineBleed) * factor * scaleX;
+    const width = spineWidth * factor * scaleX;
+    const height = Math.min(bounds.height, 5 * PIXELS_PER_UNIT.mm * scaleY);
+    const makeBlock = (id, name, top) => ({
+      id,
+      name,
+      type: 'Rect',
+      originX: 'left',
+      originY: 'top',
+      left,
+      top,
+      width,
+      height,
+      scaleX: 1,
+      scaleY: 1,
+      angle: 0,
+      fill: '#000000',
+      stroke: null,
+      strokeWidth: 0,
+      selectable: false,
+      evented: false,
+    });
+    return [
+      makeBlock('__spine-top-block', '背脊顶部黑块', bounds.top),
+      makeBlock('__spine-bottom-block', '背脊底部黑块', bounds.top + bounds.height - height),
+    ];
+  }
+
+  /**
+   * Reapply the editor's persistent region-centering markers before Fabric
+   * creates any objects. The input document has already been cloned, so these
+   * corrections affect every export format without mutating the caller's JSON.
+   */
+  function applyAlignmentMarkers(objects, workarea) {
+    const bounds = resolveWorkareaBounds(workarea);
+    const unit = String(workarea.unit || '').toLowerCase();
+    const factor = PIXELS_PER_UNIT[unit] || PIXELS_PER_UNIT.in;
+    const logicalWidth = positiveOrNull(workarea.workareaWidth) || positiveOrNull(workarea.width) || bounds.width;
+    const logicalHeight = positiveOrNull(workarea.workareaHeight) || positiveOrNull(workarea.height) || bounds.height;
+    const scaleX = bounds.width / logicalWidth;
+    const scaleY = bounds.height / logicalHeight;
+    const bleed = Math.max(0, numberOr(workarea.bleed, 0));
+    const horizontalBleed = Math.max(0, numberOr(
+      workarea.separateBleed === true ? workarea.horizontalBleed : bleed,
+      bleed,
+    )) * factor;
+    const verticalBleed = Math.max(0, numberOr(
+      workarea.separateBleed === true ? workarea.verticalBleed : bleed,
+      bleed,
+    )) * factor;
+    const sideWidth = Math.max(0, numberOr(workarea.sideWidth, 0)) * factor;
+    const rows = workarea.canvasRows === 2 ? 2 : 1;
+    const spineBleed = rows === 2 ? 0 : Math.max(0, numberOr(workarea.spineBleed, 0)) * factor;
+    const spineWidth = rows === 2 ? 0 : Math.max(0, numberOr(workarea.spineWidth, 0)) * factor;
+    const horizontalBounds = rows === 2
+      ? [
+        horizontalBleed * scaleX,
+        (horizontalBleed + sideWidth) * scaleX,
+        (logicalWidth - horizontalBleed - sideWidth) * scaleX,
+        (logicalWidth - horizontalBleed) * scaleX,
+      ]
+      : [
+        horizontalBleed * scaleX,
+        (horizontalBleed + sideWidth + spineBleed) * scaleX,
+        (horizontalBleed + sideWidth + spineBleed + spineWidth) * scaleX,
+        (logicalWidth - horizontalBleed) * scaleX,
+      ];
+    const rowGap = rows === 2 ? Math.max(0, numberOr(workarea.canvasRowGap, CANVAS_ROW_GAP)) : 0;
+    const rowHeight = Math.max(1, (logicalHeight - rowGap * (rows - 1)) / rows);
+    const verticalBounds = [];
+    for (let row = 0; row < rows; row += 1) {
+      const rowTop = row * (rowHeight + rowGap);
+      verticalBounds.push(
+        (rowTop + verticalBleed) * scaleY,
+        (rowTop + rowHeight - verticalBleed) * scaleY,
+      );
+    }
+
+    for (const object of objects) {
+      if (!object || String(object.id || '').toLowerCase() === 'workarea') continue;
+      if (object.horizontalCentered !== true && object.verticalCentered !== true) continue;
+
+      const center = getSerializedObjectCenter(object);
+      if (object.horizontalCentered === true) {
+        const current = center.x - bounds.left;
+        const [start, end] = findHorizontalRegion(horizontalBounds, current, bounds.width);
+        const target = bounds.left + (start + end) / 2;
+        object.left = numberOr(object.left, 0) + target - center.x;
+        center.x = target;
+      }
+      if (object.verticalCentered === true) {
+        const current = center.y - bounds.top;
+        const [start, end] = findVerticalRegion(verticalBounds, current, bounds.height);
+        const target = bounds.top + (start + end) / 2;
+        object.top = numberOr(object.top, 0) + target - center.y;
+        center.y = target;
+      }
+    }
+  }
+
+  function findHorizontalRegion(boundaries, current, size) {
+    for (let index = 0; index < boundaries.length - 1; index += 1) {
+      if (current >= boundaries[index] && current <= boundaries[index + 1]) {
+        return [boundaries[index], boundaries[index + 1]];
+      }
+    }
+    if (current < boundaries[0]) return [boundaries[0], boundaries[1] ?? size];
+    return [boundaries.at(-2) ?? 0, boundaries.at(-1) ?? size];
+  }
+
+  function findVerticalRegion(boundaries, current, size) {
+    for (let index = 0; index + 1 < boundaries.length; index += 2) {
+      if (current >= boundaries[index] && current <= boundaries[index + 1]) {
+        return [boundaries[index], boundaries[index + 1]];
+      }
+    }
+
+    let nearestIndex = 0;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    for (let index = 0; index + 1 < boundaries.length; index += 2) {
+      const distance = current < boundaries[index]
+        ? boundaries[index] - current
+        : current - boundaries[index + 1];
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = index;
+      }
+    }
+    return [boundaries[nearestIndex] ?? 0, boundaries[nearestIndex + 1] ?? size];
+  }
+
+  function getSerializedObjectCenter(object) {
+    const rawWidth = finiteOrNull(object.width ?? object.workareaWidth) ?? 0;
+    const rawHeight = finiteOrNull(object.height ?? object.workareaHeight) ?? 0;
+    const width = Math.abs(rawWidth * numberOr(object.scaleX, 1));
+    const height = Math.abs(rawHeight * numberOr(object.scaleY, 1));
+    const originX = String(object.originX || 'left').toLowerCase();
+    const originY = String(object.originY || 'top').toLowerCase();
+    const offsetX = originX === 'center' ? 0 : originX === 'right' ? -width / 2 : width / 2;
+    const offsetY = originY === 'center' ? 0 : originY === 'bottom' ? -height / 2 : height / 2;
+    const angle = numberOr(object.angle, 0) * Math.PI / 180;
+    const rotatedX = offsetX * Math.cos(angle) - offsetY * Math.sin(angle);
+    const rotatedY = offsetX * Math.sin(angle) + offsetY * Math.cos(angle);
+    return {
+      x: numberOr(object.left, 0) + rotatedX,
+      y: numberOr(object.top, 0) + rotatedY,
+    };
+  }
+
+  function fitTextObjectToSafeRegion(object, serialized, workarea, bounds, options) {
+    if (!object || String(serialized?.id || '').toLowerCase() === 'workarea') return { warnings: [], blocked: false };
+    if (typeof object.getObjects === 'function' && object.getObjects().length) {
+      const children = object.getObjects();
+      const serializedChildren = Array.isArray(serialized?.objects) ? serialized.objects : [];
+      return children.reduce((result, child, index) => {
+        const childResult = fitTextObjectToSafeRegion(
+          child,
+          serializedChildren.find(item => item?.id != null && item.id === child.id) || serializedChildren[index] || {},
+          workarea,
+          bounds,
+          options,
+        );
+        result.warnings.push(...childResult.warnings);
+        result.blocked = result.blocked || childResult.blocked;
+        return result;
+      }, { warnings: [], blocked: false });
+    }
+    const type = String(serialized?.type || object.type || '').toLowerCase();
+    if (!['text', 'i-text', 'textbox'].includes(type) && serialized?.superType !== 'text') return { warnings: [], blocked: false };
+    const originalSize = numberOr(object.fontSize, 0);
+    if (!(originalSize > 0) || typeof object.getCenterPoint !== 'function' || typeof object.getBoundingRect !== 'function') return { warnings: [], blocked: false };
+
+    const regions = buildTextSafeRegions(workarea, bounds, options);
+    if (!regions) return { warnings: [], blocked: false };
+    const center = object.getCenterPoint();
+    // `object` has already been translated to workarea-local coordinates by
+    // toWorkareaScene. Subtracting the workarea origin again misclassifies
+    // layers whenever the authored workarea has a non-zero left/top.
+    const face = nearestRegion(center.x, regions.faces);
+    const row = nearestRegion(center.y, regions.rows);
+    const margins = face.name === '背脊'
+      ? regions.spineMargin
+      : face.name === '封底'
+        ? regions.backCoverMargin
+        : regions.coverMargin;
+    const [faceSafeStart, faceSafeEnd] = insetRegion(
+      face.start,
+      face.end,
+      margins.left * regions.scaleX,
+      margins.right * regions.scaleX,
+    );
+    const [rowSafeStart, rowSafeEnd] = insetRegion(
+      row.start,
+      row.end,
+      margins.top * regions.scaleY,
+      margins.bottom * regions.scaleY,
+    );
+    // `object` is already converted by toWorkareaScene, therefore both the
+    // object bounds and the safe regions are in workarea-local coordinates.
+    const safeLeft = faceSafeStart;
+    const safeRight = faceSafeEnd;
+    const safeTop = rowSafeStart;
+    const safeBottom = rowSafeEnd;
+    let rect = object.getBoundingRect();
+    const isOverflowing = value => Boolean(value && (
+      value.left < safeLeft - 0.01 ||
+      value.left + value.width > safeRight + 0.01 ||
+      value.top < safeTop - 0.01 ||
+      value.top + value.height > safeBottom + 0.01
+    ));
+    // Keep measuring after every 0.5-pixel font-size change. A proportional
+    // adjustment can make a text object unnecessarily small when font metrics,
+    // kerning, or explicit line height differ from the initial estimate.
+    while (isOverflowing(rect)) {
+      const current = numberOr(object.fontSize, 1);
+      if (current <= 1) break;
+      const next = Math.max(1, current - 0.5);
+      if (!(next < current)) break;
+      object.set('fontSize', next);
+      object.initDimensions?.();
+      object.setCoords?.();
+      rect = object.getBoundingRect();
+    }
+    const finalSize = numberOr(object.fontSize, originalSize);
+    if (serialized && finalSize < originalSize - 0.01) serialized.fontSize = finalSize;
+    const label = String(serialized?.name || serialized?.id || '未命名图层');
+    const remainsOutside = isOverflowing(rect);
+    if (finalSize >= originalSize - 0.01 && !remainsOutside) return { warnings: [], blocked: false };
+    return {
+      warnings: [`图层“${label}”超出${row.name}${face.name}安全区域${finalSize < originalSize - 0.01 ? `，字号已从 ${originalSize.toFixed(2)} 缩小至 ${finalSize.toFixed(2)}` : ''}${remainsOutside ? '，缩小至最小可用字号后仍有超出，已阻止导出' : ''}`],
+      blocked: remainsOutside,
+    };
+  }
+
+  function buildTextSafeRegions(workarea, bounds, options = {}) {
+    const unit = String(workarea.unit || '').toLowerCase();
+    const factor = PIXELS_PER_UNIT[unit] || PIXELS_PER_UNIT.in;
+    const bleed = Math.max(0, numberOr(workarea.bleed, 0));
+    const horizontalBleed = Math.max(0, numberOr(workarea.separateBleed === true ? workarea.horizontalBleed : bleed, bleed));
+    const verticalBleed = Math.max(0, numberOr(workarea.separateBleed === true ? workarea.verticalBleed : bleed, bleed));
+    const sideWidth = Math.max(0, numberOr(workarea.sideWidth, 0));
+    const sideHeight = Math.max(0, numberOr(workarea.sideHeight, 0));
+    const logicalWidth = positiveOrNull(workarea.workareaWidth) || bounds.width;
+    const rows = workarea.canvasRows === 2 ? 2 : 1;
+    const spineWidth = rows === 2 ? 0 : Math.max(0, numberOr(workarea.spineWidth, 0));
+    const spineBleed = rows === 2 ? 0 : Math.max(0, numberOr(workarea.spineBleed, 0));
+    const rowGap = rows === 2 ? Math.max(0, numberOr(workarea.canvasRowGap, CANVAS_ROW_GAP)) : 0;
+    const physicalWidth = sideWidth * 2 + horizontalBleed * 2 + spineBleed * 2 + spineWidth;
+    const physicalRowHeight = sideHeight + verticalBleed * 2;
+    const physicalHeight = physicalRowHeight * rows + rowGap / factor;
+    const scaleX = physicalWidth > 0 ? bounds.width / (physicalWidth * factor) : 1;
+    const scaleY = physicalHeight > 0 ? bounds.height / (physicalHeight * factor) : 1;
+    // Single-row layouts keep the existing cover/spine margins. For a
+    // double-row layout, the 6mm safe distance applies to each page edge;
+    // there is no spine region in this layout.
+    const configured = options.safeDistances
+      || workarea.safeDistances
+      || workarea.safe_distance
+      || {};
+    const readMargins = (key, fallback) => {
+      const value = configured[key] || {};
+      const configuredFactor = PIXELS_PER_UNIT.mm;
+      const resolveMargin = (side) => (
+        value[side] == null
+          ? fallback * factor
+          : numberOr(value[side], 0) * configuredFactor
+      );
+      return {
+        top: Math.max(0, resolveMargin('top')),
+        right: Math.max(0, resolveMargin('right')),
+        bottom: Math.max(0, resolveMargin('bottom')),
+        left: Math.max(0, resolveMargin('left')),
+      };
+    };
+    const doubleRowSafeMargin = 6 / 25.4;
+    const coverMargin = readMargins(
+      'cover_safe_distance',
+      rows === 2 ? doubleRowSafeMargin : 0.4,
+    );
+    const backCoverMargin = readMargins(
+      'back_cover_safe_distance',
+      rows === 2 ? doubleRowSafeMargin : 0.4,
+    );
+    const spineMargin = readMargins(
+      'spine_safe_distance',
+      rows === 2 ? 0 : 0.05,
+    );
+    const makeRegion = (name, start, end) => {
+      const actualStart = start * (name.startsWith('第') ? scaleY : scaleX);
+      const actualEnd = end * (name.startsWith('第') ? scaleY : scaleX);
+      return { name, start: actualStart, end: actualEnd };
+    };
+    const faces = rows === 2
+      ? [
+        makeRegion('封面', horizontalBleed * factor, (horizontalBleed + sideWidth) * factor),
+        makeRegion('封底', (logicalWidth / factor - horizontalBleed - sideWidth) * factor, (logicalWidth / factor - horizontalBleed) * factor),
+      ]
+      : [
+        makeRegion('封面', horizontalBleed * factor, (horizontalBleed + sideWidth) * factor),
+        makeRegion('背脊', (horizontalBleed + sideWidth + spineBleed) * factor, (horizontalBleed + sideWidth + spineBleed + spineWidth) * factor),
+        makeRegion('封底', (horizontalBleed + sideWidth + spineBleed + spineWidth + spineBleed) * factor, (logicalWidth / factor - horizontalBleed) * factor),
+      ];
+    const rowHeight = Math.max(1, (bounds.height - rowGap * (rows - 1)) / rows);
+    const rowRegions = Array.from({ length: rows }, (_, row) => {
+      const start = row * (rowHeight + rowGap) + verticalBleed * factor * scaleY;
+      const end = row * (rowHeight + rowGap) + rowHeight - verticalBleed * factor * scaleY;
+      const actualStart = start;
+      const actualEnd = end;
+      return { name: rows === 2 ? `第${row + 1}排` : '画布', start: actualStart, end: actualEnd };
+    });
+    return {
+      faces,
+      rows: rowRegions,
+      coverMargin,
+      backCoverMargin,
+      spineMargin,
+      scaleX,
+      scaleY,
+    };
+  }
+
+  function insetRegion(start, end, startMargin, endMargin) {
+    const available = Math.max(0, end - start - 1);
+    const total = startMargin + endMargin;
+    if (total > available && total > 0) {
+      const ratio = available / total;
+      startMargin *= ratio;
+      endMargin *= ratio;
+    }
+    return [start + startMargin, Math.max(start + 1, end - endMargin)];
+  }
+
+  function nearestRegion(value, regions) {
+    const inside = regions.find(region => value >= region.start && value <= region.end);
+    if (inside) return inside;
+    return regions.reduce((nearest, region) => {
+      const distance = value < region.start ? region.start - value : value - region.end;
+      const nearestDistance = value < nearest.start ? nearest.start - value : value - nearest.end;
+      return distance < nearestDistance ? region : nearest;
+    });
+  }
+
+  function buildPrintGuides(width, height, values, fallbackGuides) {
+    if (!width || values.sideWidth === null || values.spineWidth === null || values.spineBleed === null) {
+      return Array.isArray(fallbackGuides) ? fallbackGuides : [];
+    }
+
+    const sideWidth = values.sideWidth * values.factor;
+    const horizontalBleed = values.horizontalBleed * values.factor;
+    const verticalBleed = values.verticalBleed * values.factor;
+    const rows = values.canvasRows === 2 ? 2 : 1;
+    const spineWidth = rows === 2 ? 0 : values.spineWidth * values.factor;
+    const spineBleed = rows === 2 ? 0 : values.spineBleed * values.factor;
+    const verticalPositions = rows === 2
+      ? [
+        [0, 'bleed'],
+        [horizontalBleed, 'content'],
+        [horizontalBleed + sideWidth, 'content'],
+        [width - horizontalBleed - sideWidth, 'content'],
+        [width - horizontalBleed, 'content'],
+        [width, 'bleed'],
+      ]
+      : [
+        [0, 'bleed'],
+        [horizontalBleed, 'content'],
+        [horizontalBleed + sideWidth, 'bleed'],
+        [horizontalBleed + sideWidth + spineBleed, 'content'],
+        [horizontalBleed + sideWidth + spineBleed + spineWidth, 'content'],
+        [horizontalBleed + sideWidth + spineBleed + spineWidth + spineBleed, 'bleed'],
+        [width - horizontalBleed, 'content'],
+        [width, 'bleed'],
+      ];
+    const rowGap = rows === 2
+      ? (nonnegativeOrNull(values.canvasRowGap) ?? CANVAS_ROW_GAP)
+      : 0;
+    const rowHeight = Math.max(1, (height - rowGap * (rows - 1)) / rows);
+    const guides = [];
+    const add = (orientation, position, kind) => {
+      const limit = orientation === 'vertical' ? width : height;
+      if (position < 0 || position > limit) return;
+      if (guides.some(guide => guide.orientation === orientation && Math.abs(guide.position - position) < 0.01)) return;
+      guides.push({ orientation, position, kind });
+    };
+
+    verticalPositions.forEach(([position, kind]) => add('vertical', position, kind));
+    for (let row = 0; row < rows; row += 1) {
+      const rowTop = row * (rowHeight + rowGap);
+      const rowBottom = rowTop + rowHeight;
+      add('horizontal', rowTop, 'bleed');
+      add('horizontal', rowTop + verticalBleed, 'content');
+      add('horizontal', rowBottom - verticalBleed, 'content');
+      add('horizontal', rowBottom, 'bleed');
+    }
+    return guides;
   }
 
   function resolveWorkareaBounds(workarea) {
@@ -175,8 +647,73 @@
     return local;
   }
 
+  function collectFontSources(objects, options = {}) {
+    const fonts = new Map();
+    visit(objects, object => {
+      const family = String(object.fontFamily || '').trim();
+      const url = String(object.fontUrl || object.font_url || '').trim();
+      const loadUrl = String(object.fontDataUrl || '').trim() || url;
+      if (!family || !url) return;
+      const weight = object.fontWeight || 'normal';
+      const style = object.fontStyle || 'normal';
+      const key = `${family}\u0000${url}\u0000${weight}\u0000${style}`;
+      fonts.set(key, { family, url, loadUrl, weight, style });
+    });
+    return [...fonts.values()].map(font => options.textToSvg
+      ? { family: font.family, url: font.url, loadUrl: font.loadUrl }
+      : font);
+  }
+
+  function layerNames(objects) {
+    return new Map(objects.map(object => [
+      String(object?.id || ''),
+      String(object?.name || (String(object?.id || '').toLowerCase() === 'workarea' ? '画布' : object?.id) || object?.type || '图层'),
+    ]));
+  }
+
+  function renderedPrintGuides(workarea, bounds) {
+    const guides = Array.isArray(workarea.printGuides) ? workarea.printGuides : [];
+    const logicalWidth = numberOr(workarea.workareaWidth, bounds.width) || bounds.width;
+    const logicalHeight = numberOr(workarea.workareaHeight, bounds.height) || bounds.height;
+    const scaleX = bounds.width / logicalWidth;
+    const scaleY = bounds.height / logicalHeight;
+    return guides.map(guide => ({
+      ...guide,
+      position: (Number(guide.position) || 0) * (guide.orientation === 'vertical' ? scaleX : scaleY),
+    }));
+  }
+
+  function exportOptions(canvas, workarea, bounds, objects, textToSvg = false) {
+    const rawSvg = canvas.toSVG({
+      width: bounds.width,
+      height: bounds.height,
+      viewBox: { x: 0, y: 0, width: bounds.width, height: bounds.height },
+    });
+    return {
+      rawSvg,
+      bounds: { left: 0, top: 0, width: bounds.width, height: bounds.height },
+      backgroundColor: String(workarea.backgroundColor || '#ffffff'),
+      layerNames: layerNames(objects),
+      fontSources: collectFontSources(objects, { textToSvg }),
+      printGuides: renderedPrintGuides(workarea, bounds),
+    };
+  }
+
+  function buildSvg(canvas, workarea, bounds, objects) {
+    const exporter = global.ImageMapEditorSvgExport;
+    if (!exporter?.exportCorelCompatibleSvg) throw new Error('编辑器 SVG 导出模块未加载');
+    return exporter.exportCorelCompatibleSvg(exportOptions(canvas, workarea, bounds, objects));
+  }
+
+  async function buildTextToSvg(canvas, workarea, bounds, objects) {
+    const exporter = global.ImageMapEditorSvgExport;
+    if (!exporter?.exportTextToSvg) throw new Error('编辑器 text-to-svg 导出模块未加载');
+    return exporter.exportTextToSvg(exportOptions(canvas, workarea, bounds, objects, true));
+  }
+
   async function createObject(serialized, warnings) {
     const type = normalizeType(serialized.type);
+    if (type === 'textbox') return createNoWrapText(serialized);
     if (type === 'svg') return createSvg(serialized);
     if (type === 'arrow') return createArrow(serialized);
     if (type === 'cube') return createCube(serialized);
@@ -192,6 +729,13 @@
     } catch (error) {
       throw new Error(`无法还原对象 ${serialized.id || '<无 id>'} (${serialized.type || '未知类型'}): ${error.message}`);
     }
+  }
+
+  function createNoWrapText(serialized) {
+    const options = without(serialized, ['type', 'text', 'width', 'height']);
+    // FabricText only breaks on explicit newline characters. Keeping left/top
+    // and origin preserves the authored anchor while the natural width grows.
+    return new fabric.FabricText(String(serialized.text || ''), options);
   }
 
   async function createImageLike(serialized, warnings) {
@@ -284,74 +828,25 @@
     const fonts = new Map();
     visit(objects, object => {
       const family = String(object.fontFamily || '').trim();
-      const url = String(object.fontUrl || object.font_url || '').trim();
+      const url = String(object.fontDataUrl || object.fontUrl || object.font_url || '').trim();
       if (!family || !url) return;
       const weight = String(object.fontWeight || 'normal');
       const style = String(object.fontStyle || 'normal');
       fonts.set(`${family}\u0000${weight}\u0000${style}`, { family, url, weight, style });
     });
-    const loaded = [];
-    const status = [];
     for (const font of fonts.values()) {
       try {
-        fabric.cache?.clearFontCache?.(font.family);
         const face = new FontFace(font.family, `url(${JSON.stringify(font.url)})`, {
           weight: font.weight,
           style: font.style,
         });
         await face.load();
         global.document.fonts.add(face);
-        const descriptor = `${font.style} ${font.weight} 16px ${JSON.stringify(font.family)}`;
-        if (!global.document.fonts.check(descriptor)) {
-          global.document.fonts.delete(face);
-          throw new Error('字体已读取，但 Chromium 未匹配到请求的 family/weight/style');
-        }
-        loaded.push({ face, family: font.family, url: font.url });
-        status.push({ family: font.family, status: 'loaded', matched: true });
       } catch (error) {
         warnings.push(`字体 ${font.family} 加载失败: ${error.message}`);
-        status.push({ family: font.family, status: 'failed', error: error.message });
       }
     }
     await global.document.fonts.ready;
-    loaded.status = status;
-    return loaded;
-  }
-
-  function releaseFonts(fonts) {
-    for (const { face, family } of fonts) {
-      global.document.fonts.delete(face);
-      fabric.cache?.clearFontCache?.(family);
-    }
-  }
-
-  function exportSvg(canvas, fonts, outputCanvas, cropWidth, cropHeight, multiplier) {
-    const fontPaths = fabric.config?.fontPaths;
-    const previousPaths = [];
-    if (fontPaths && typeof fontPaths === 'object') {
-      for (const { family, url } of fonts) {
-        previousPaths.push({
-          family,
-          existed: Object.prototype.hasOwnProperty.call(fontPaths, family),
-          value: fontPaths[family],
-        });
-        fontPaths[family] = url;
-      }
-    }
-    try {
-      const width = outputCanvas?.width ?? Math.floor(cropWidth * multiplier);
-      const height = outputCanvas?.height ?? Math.floor(cropHeight * multiplier);
-      return canvas.toSVG({
-        width: String(width),
-        height: String(height),
-        viewBox: { x: 0, y: 0, width: cropWidth, height: cropHeight },
-      });
-    } finally {
-      for (const { family, existed, value } of previousPaths) {
-        if (existed) fontPaths[family] = value;
-        else delete fontPaths[family];
-      }
-    }
   }
 
   function visit(objects, callback) {
@@ -392,7 +887,7 @@
   function normalizeFormats(value) {
     const formats = Array.isArray(value) && value.length ? value : ['jpg', 'png'];
     const normalized = [...new Set(formats.map(item => String(item).toLowerCase() === 'jpeg' ? 'jpg' : String(item).toLowerCase()))];
-    if (normalized.some(item => !['jpg', 'png', 'svg'].includes(item))) throw new Error('仅支持 jpg、png 和 svg');
+    if (normalized.some(item => !['jpg', 'png', 'svg', 'text-to-svg'].includes(item))) throw new Error('仅支持 jpg、png、svg 和 text-to-svg');
     return normalized;
   }
 
@@ -444,6 +939,16 @@
   function finiteOrNull(value) {
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
+  }
+
+  function nonnegativeOrNull(value) {
+    const number = finiteOrNull(value);
+    return number !== null && number >= 0 ? number : null;
+  }
+
+  function positiveOrNull(value) {
+    const number = finiteOrNull(value);
+    return number !== null && number > 0 ? number : null;
   }
 
   function numberOr(value, fallback) {

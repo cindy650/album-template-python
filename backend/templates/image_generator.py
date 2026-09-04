@@ -3,11 +3,13 @@ from __future__ import annotations
 from copy import deepcopy
 import base64
 import binascii
+from hashlib import sha256
 import json
 from io import BytesIO
 from pathlib import Path
 import re
 import tempfile
+import time
 from urllib.parse import unquote, urlparse
 from typing import Any
 
@@ -165,9 +167,9 @@ class DeepSeekTemplateRuleResolver:
                             "source_fields、binding_key 和 literal，将订单字段转换为最终要绘制的文字。"
                             "尺寸方案和尺寸子布局已经由后端本地规则选定，selected_size 是最终值，禁止修改尺寸、"
                             "禁止选择其他尺寸子布局，也不要返回尺寸选择建议。只处理 selected_size 对应的当前字体布局中的"
-                            "自然语言 rule.description；如果本地没有匹配字体布局，可以返回字体布局名称供后端匹配。"
+                            "自然语言 rule.description；字体布局由尺寸模板配置，禁止选择或建议其他字体布局。"
                             "只返回 JSON，不要 Markdown，格式必须为："
-                            '{"font_layout_name":null,"elements":[{"id":"","text":""}]}。'
+                            '{"elements":[{"id":"","text":""}]}。'
                             "elements 只能包含模板中已有的文字元素；没有值时 text 返回空字符串。"
                             "保留姓名、日期、尺寸、编号和用户原文，不要添加省略号，不要编造内容。"
                         ),
@@ -208,7 +210,6 @@ class DeepSeekTemplateRuleResolver:
                 text = str(text)
             values[str(item["id"])] = (text or "").strip()
         return {
-            "font_layout_name": decoded.get("font_layout_name"),
             "text_values": values,
         }
 
@@ -239,6 +240,7 @@ class TemplateImageGenerator:
         self.order_repository = order_repository
         self.image_map_renderer = image_map_renderer
         self.font_cache_dir = self.output_dir.parent / "generated_fonts"
+        self._font_repository_source_cache: dict[tuple[str, str, str], str] = {}
 
     def _persist_template_resolution(
         self,
@@ -378,7 +380,10 @@ class TemplateImageGenerator:
                 and not template_was_provided
                 and reuse_snapshot
             ):
-                snapshot = self.template_resolver.restore_order_snapshot(saved_order)
+                snapshot = self.template_resolver.restore_order_snapshot(
+                    saved_order,
+                    template,
+                )
                 if snapshot is not None:
                     template = snapshot
                     template_resolved = True
@@ -395,7 +400,14 @@ class TemplateImageGenerator:
                         template,
                         selected_layout,
                     )
-                resolution_layers = self._template_resolution_layers(template)
+            selected_layout = template.get("_selected_font_layout")
+            enriched_fonts: set[str] = set()
+            if isinstance(selected_layout, dict):
+                enriched_fonts = self._enrich_layout_font_sources(
+                    selected_layout,
+                    order_number,
+                )
+            resolution_layers = self._template_resolution_layers(template)
             # Attach transiently for rendering, but persist only after the
             # image has rendered successfully. Invalid/legacy layers must not
             # be written back to the order snapshot.
@@ -426,7 +438,14 @@ class TemplateImageGenerator:
                 render_order,
                 metadata or {},
             )
-            if not template_resolved:
+            rendered_layers = template.pop("_fabric_resolved_layers", None)
+            if isinstance(rendered_layers, dict):
+                # Fabric applies horizontal/vertical alignment markers on a
+                # cloned document. Promote that exact post-alignment document
+                # to the canonical order snapshot used by later exports.
+                template["_selected_font_layout"] = deepcopy(rendered_layers)
+                resolution_layers = deepcopy(rendered_layers)
+            if not template_resolved or enriched_fonts or isinstance(rendered_layers, dict):
                 resolution_layers = self._persist_template_resolution(template, saved_order)
                 self._attach_template_resolution(saved_order, template, resolution_layers)
             print(f"[图片] 正在写入：{path}", flush=True)
@@ -443,6 +462,15 @@ class TemplateImageGenerator:
             if native_svg:
                 svg_path = output_dir / order_resource_filename(file_order, "svg")
                 svg_path.write_text(native_svg, encoding="utf-8")
+            converted_svg = str(template.get("_fabric_render_text_to_svg") or "")
+            text_svg_path = None
+            if converted_svg:
+                text_svg_path = output_dir / order_resource_filename(
+                    file_order,
+                    "svg",
+                    artifact="转曲",
+                )
+                text_svg_path.write_text(converted_svg, encoding="utf-8")
         except Exception as exc:
             print(
                 f"[图片] 生成失败：订单号={order_number}，"
@@ -474,6 +502,8 @@ class TemplateImageGenerator:
             result["oss"] = self.storage_service.upload_file(path)
         if svg_path is not None:
             result["svg_path"] = str(svg_path)
+        if text_svg_path is not None:
+            result["text_to_svg_path"] = str(text_svg_path)
         print(
             f"[图片] 生成成功：订单号={order_number}，路径={path}，"
             f"像素={image.width}x{image.height}",
@@ -515,7 +545,10 @@ class TemplateImageGenerator:
             not template_resolved
             and not template_was_provided
         ):
-            snapshot = self.template_resolver.restore_order_snapshot(saved_order)
+            snapshot = self.template_resolver.restore_order_snapshot(
+                saved_order,
+                template,
+            )
             if snapshot is not None:
                 template = snapshot
                 template_resolved = True
@@ -528,7 +561,18 @@ class TemplateImageGenerator:
                     template,
                     selected_layout,
                 )
-            resolution_layers = self._template_resolution_layers(template)
+        selected_layout = template.get("_selected_font_layout")
+        enriched_fonts: set[str] = set()
+        if isinstance(selected_layout, dict):
+            enriched_fonts = self._enrich_layout_font_sources(
+                selected_layout,
+                str(
+                    render_order.get("order_number")
+                    or render_order.get("订单号")
+                    or "未知订单"
+                ),
+            )
+        resolution_layers = self._template_resolution_layers(template)
         self._attach_template_resolution(saved_order, template, resolution_layers or {})
         if self.dpi <= 0:
             raise RuntimeError(f"图片 DPI 必须大于 0，当前值：{self.dpi}")
@@ -537,7 +581,11 @@ class TemplateImageGenerator:
             render_order,
             metadata or {},
         )
-        if not template_resolved:
+        rendered_layers = template.pop("_fabric_resolved_layers", None)
+        if isinstance(rendered_layers, dict):
+            template["_selected_font_layout"] = deepcopy(rendered_layers)
+            resolution_layers = deepcopy(rendered_layers)
+        if not template_resolved or enriched_fonts or isinstance(rendered_layers, dict):
             resolution_layers = self._persist_template_resolution(template, saved_order)
             self._attach_template_resolution(saved_order, template, resolution_layers)
         return {
@@ -648,10 +696,6 @@ class TemplateImageGenerator:
             pairs.add((left, right))
             pairs.add((right, left))
         return pairs
-
-    @classmethod
-    def _match_font_layout(cls, layouts: Any, information: dict[str, Any]):
-        return OrderTemplateResolver.match_font_layout(layouts, information)
 
     @staticmethod
     def _layout_name(value: Any) -> str:
@@ -1637,17 +1681,12 @@ class TemplateImageGenerator:
         spine_x = back_right + spine_bleed
         cover_x = spine_x + spine_w + spine_bleed
         content_y = trim_y
-        trim_w = side_w * 2 + spine_w + spine_bleed * 2
-        spine_safe_left = max(trim_x, spine_x - spine_bleed)
-        spine_safe_right = min(trim_x + trim_w, spine_x + spine_w + spine_bleed)
 
         front_center_x = cover_x + side_w / 2
         back_center_x = back_x + side_w / 2
         spine_center_x = spine_x + spine_w / 2
 
         dark = "#26364f"
-        light_blue = "#77c9df"
-        orange = "#dc8b45"
         raw_background = (
             template.get("background_color")
             or (template.get("fields") or {}).get("background_color")
@@ -1657,8 +1696,6 @@ class TemplateImageGenerator:
             paper = ImageColor.getrgb(str(raw_background)) if raw_background else (255, 255, 255)
         except (TypeError, ValueError):
             paper = (255, 255, 255)
-        line_width = max(2, round(scale / 150))
-
         selected_layout = template.get("_selected_font_layout")
         if selected_layout and self._fabric_layout_objects(selected_layout):
             if self.image_map_renderer is None or not getattr(self.image_map_renderer, "enabled", False):
@@ -1670,41 +1707,17 @@ class TemplateImageGenerator:
                     canvas_w,
                     canvas_h,
                     paper,
+                    order_number=str(
+                        order.get("order_number")
+                        or order.get("订单号")
+                        or "未知订单"
+                    ),
                 ),
                 dimensions,
             )
 
         image = Image.new("RGB", (canvas_w, canvas_h), paper)
         draw = ImageDraw.Draw(image)
-        draw.rectangle(
-            (trim_x, trim_y, trim_x + trim_w, trim_y + side_h),
-            outline=light_blue,
-            width=line_width,
-        )
-        self._draw_dashed_rectangle(
-            draw,
-            (bleed / 2, bleed / 2, canvas_w - bleed / 2, canvas_h - bleed / 2),
-            fill=orange,
-            width=line_width,
-            dash_length=max(8, round(scale * 0.08)),
-            gap_length=max(6, round(scale * 0.05)),
-        )
-        for x in (spine_x, spine_x + spine_w):
-            draw.line(
-                (x, content_y, x, content_y + side_h),
-                fill=light_blue,
-                width=line_width,
-            )
-        for x in (spine_safe_left, spine_safe_right):
-            self._draw_dashed_line(
-                draw,
-                (x, content_y),
-                (x, content_y + side_h),
-                fill="#62b7cf",
-                width=max(1, line_width // 2),
-                dash_length=max(8, round(scale * 0.08)),
-                gap_length=max(6, round(scale * 0.05)),
-            )
 
         font_title = self._font(side_h * 0.055)
         font_body = self._font(side_h * 0.032)
@@ -1920,7 +1933,10 @@ class TemplateImageGenerator:
         source_spine_width = source_width - fixed_width
         target_spine_width = dimensions["spine_width"] * css_per_unit
         delta = target_spine_width - source_spine_width
-        if source_spine_width <= 0 or abs(delta) < 0.01:
+        # Even when the requested spine width is already equal to the
+        # serialized width, continue below to normalize legacy printGuides
+        # that do not contain the editor's `kind` field.
+        if source_spine_width <= 0:
             return adapted
 
         spine_left = bounds_left + (
@@ -1982,14 +1998,54 @@ class TemplateImageGenerator:
             bleed_css + side_height_css,
             dimensions["total_height"] * css_per_unit,
         ]
+        # Keep the same guide classification as the editor's
+        # WorkareaHandler.buildPrintGuides(). Raster previews omit guides,
+        # while SVG export still uses this normalized metadata.
+        vertical_kinds = (
+            "bleed",
+            "content",
+            "bleed",
+            "content",
+            "content",
+            "bleed",
+            "content",
+            "bleed",
+        )
+        horizontal_kinds = ("bleed", "content", "content", "bleed")
+        def append_guides(
+            orientation: str,
+            positions: list[float],
+            kinds: tuple[str, ...],
+            limit: float,
+        ) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            # WorkareaHandler.add() keeps the first guide at a duplicated
+            # position, matching the editor when a bleed value is zero.
+            for position, kind in zip(positions, kinds):
+                if position < 0 or position > limit:
+                    continue
+                if any(
+                    item["orientation"] == orientation
+                    and abs(float(item["position"]) - position) < 0.01
+                    for item in result
+                ):
+                    continue
+                result.append(
+                    {
+                        "orientation": orientation,
+                        "position": position,
+                        "kind": kind,
+                    }
+                )
+            return result
+
         workarea["printGuides"] = [
-            *(
-                {"orientation": "vertical", "position": position}
-                for position in vertical_guides
-            ),
-            *(
-                {"orientation": "horizontal", "position": position}
-                for position in horizontal_guides
+            *append_guides("vertical", vertical_guides, vertical_kinds, target_width),
+            *append_guides(
+                "horizontal",
+                horizontal_guides,
+                horizontal_kinds,
+                dimensions["total_height"] * css_per_unit,
             ),
         ]
         print(
@@ -2008,6 +2064,7 @@ class TemplateImageGenerator:
         canvas_w: int,
         canvas_h: int,
         paper: tuple[int, int, int],
+        order_number: str,
     ) -> Image.Image:
         objects = self._fabric_layout_objects(layout)
         render_layout = self._adapt_fabric_layout_to_spine_width(template, layout)
@@ -2031,6 +2088,25 @@ class TemplateImageGenerator:
         )
         if not isinstance(workarea, dict):
             raise RuntimeError("Fabric JSON 缺少 workarea，无法按前端源码渲染器绘制")
+        # Safety distances are product-level configuration. The matched
+        # template carries the normalized product relation, so inject a
+        # renderer-only copy into workarea metadata for the browser core.
+        product = template.get("product")
+        if not isinstance(product, dict) and template.get("product_id") is not None:
+            try:
+                product = self.repository.get_product(int(template["product_id"]))
+            except (LookupError, TypeError, ValueError):
+                product = None
+        safe_distances = None
+        if isinstance(product, dict):
+            safe_distances = {
+                key: deepcopy(product.get(key) or {})
+                for key in (
+                    "cover_safe_distance",
+                    "spine_safe_distance",
+                    "back_cover_safe_distance",
+                )
+            }
         # Preserve the exact editor object order and include workarea so the
         # browser can calculate the crop origin. Workarea is consumed as
         # metadata and is never painted as a content layer.
@@ -2070,11 +2146,74 @@ class TemplateImageGenerator:
                 layout={"objects": image_map_objects, "version": render_layout.get("version") or "7.4.0"},
                 reference_canvas=reference,
                 background_color=f"rgb({paper[0]},{paper[1]},{paper[2]})",
-                font_files=self._image_map_font_files(objects),
+                font_files=self._image_map_font_files(
+                    objects,
+                    order_number=order_number,
+                ),
                 output_format="jpg",
                 include_svg=True,
+                include_text_to_svg=True,
                 print_spec=print_spec,
+                safe_distances=safe_distances,
+                order_number=order_number,
             )
+            resolved_json = result.get("resolved_json")
+            resolved_objects = (
+                resolved_json.get("objects")
+                if isinstance(resolved_json, dict)
+                else None
+            )
+            if isinstance(resolved_objects, list):
+                # Keep the selected layout's metadata while replacing its
+                # objects with the exact post-alignment Fabric JSON returned
+                # by the browser renderer.
+                resolved_layout = deepcopy(render_layout)
+                def merge_rendered_objects(original_objects):
+                    if not isinstance(original_objects, list):
+                        return deepcopy(resolved_objects)
+                    rendered_by_id = {
+                        str(item.get("id")): item
+                        for item in resolved_objects
+                        if isinstance(item, dict) and item.get("id") is not None
+                    }
+                    merged = []
+                    consumed = set()
+                    for item in original_objects:
+                        if isinstance(item, dict) and item.get("id") is not None:
+                            key = str(item["id"])
+                            replacement = rendered_by_id.get(key)
+                            if replacement is not None:
+                                merged.append(deepcopy(replacement))
+                                consumed.add(key)
+                                continue
+                        merged.append(deepcopy(item))
+                    merged.extend(
+                        deepcopy(item)
+                        for item in resolved_objects
+                        if isinstance(item, dict)
+                        and item.get("id") is not None
+                        and str(item["id"]) not in consumed
+                        and not any(
+                            isinstance(existing, dict)
+                            and str(existing.get("id")) == str(item["id"])
+                            for existing in original_objects
+                        )
+                    )
+                    return merged
+
+                if isinstance(resolved_layout.get("objects"), list):
+                    resolved_layout["objects"] = merge_rendered_objects(
+                        resolved_layout["objects"]
+                    )
+                elif isinstance(resolved_layout.get("layers"), dict) and isinstance(
+                    resolved_layout["layers"].get("objects"), list
+                ):
+                    resolved_layout["layers"]["objects"] = merge_rendered_objects(
+                        resolved_layout["layers"]["objects"]
+                    )
+                else:
+                    resolved_layout["objects"] = deepcopy(resolved_objects)
+                template["_fabric_resolved_layers"] = resolved_layout
             # Transient browser geometry for the PSD conversion. Keep it out
             # of the selected layout so resolved_layers_json remains exactly
             # the current Fabric document stored for the order.
@@ -2082,6 +2221,7 @@ class TemplateImageGenerator:
                 result.get("layer_geometry") or []
             )
             template["_fabric_render_svg"] = result.get("svg") or ""
+            template["_fabric_render_text_to_svg"] = result.get("text_to_svg") or ""
             with Image.open(output) as rendered:
                 image = rendered.convert("RGB").copy()
         print(
@@ -2145,6 +2285,8 @@ class TemplateImageGenerator:
     def _image_map_font_files(
         self,
         elements: list[dict[str, Any]],
+        *,
+        order_number: str = "",
     ) -> list[dict[str, Any]]:
         files = []
         seen = set()
@@ -2154,29 +2296,286 @@ class TemplateImageGenerator:
             if not family or family in seen:
                 continue
             url = str(font.get("fontUrl") or font.get("font_url") or "").strip()
-            filename = Path(unquote(urlparse(url).path)).name if url else ""
-            # The template URL is authoritative. A same-named file in the
-            # persistent cache may belong to an older font upload, while the
-            # renderer's resource loader already provides a bounded in-memory
-            # cache for remote resources.
-            candidates = [] if url else ([self.font_cache_dir / filename] if filename else [])
+            weight = str(font.get("fontWeight") or "normal")
+            style = str(font.get("fontStyle") or "normal")
             if not url:
-                candidates.extend(self._font_candidates(font))
+                url = self._font_repository_source(
+                    family,
+                    weight=weight,
+                    style=style,
+                )
+                if url:
+                    print(
+                        f"[IMAGE MAP][FONT] 图层缺少 fontUrl，已从字体库补全："
+                        f"订单号={order_number or '未知订单'}，字体={family}，来源={url}",
+                        flush=True,
+                    )
+            if url:
+                path = self._cached_remote_font(
+                    family,
+                    url,
+                    order_number=order_number,
+                )
+                candidates = [path]
+            else:
+                candidates = self._exact_local_font_candidates(font)
             path = next((candidate for candidate in candidates if candidate.is_file()), None)
-            if path is None and not url:
-                continue
+            if path is None:
+                detail = f"字体={family}，未找到可读取的字体文件"
+                self._raise_font_failure(order_number, detail)
+            try:
+                ImageFont.truetype(str(path), 16)
+            except (OSError, ValueError) as exc:
+                self._raise_font_failure(
+                    order_number,
+                    f"字体={family}，文件={path}，校验失败={type(exc).__name__}: {exc}",
+                )
             item = {
                 "family": family,
-                "weight": str(font.get("fontWeight") or "normal"),
-                "style": str(font.get("fontStyle") or "normal"),
+                "weight": weight,
+                "style": style,
             }
+            # Keep the authored remote URL for SVG export while using the
+            # downloaded cache file for Chromium's local rendering.
             if url:
                 item["url"] = url
-            elif path is not None:
-                item["path"] = str(path.resolve())
+            item["path"] = str(path.resolve())
             files.append(item)
             seen.add(family)
         return files
+
+    def _exact_local_font_candidates(
+        self,
+        font: dict[str, Any],
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        for key in ("file_path", "path", "font_path"):
+            source = str(font.get(key) or "").strip()
+            if source and not source.startswith(("http://", "https://")):
+                candidates.append(Path(source))
+        identifiers = []
+        for key in (
+            "fontFamily",
+            "font_family",
+            "family",
+            "font_name",
+            "postscript_name",
+            "post_script_name",
+        ):
+            identifier = str(font.get(key) or "").strip()
+            if identifier and identifier.casefold() not in {
+                item.casefold() for item in identifiers
+            }:
+                identifiers.append(identifier)
+        windows_fonts = Path("C:/Windows/Fonts")
+        for identifier in identifiers:
+            for extension in (".ttf", ".otf", ".ttc"):
+                candidates.append(windows_fonts / f"{identifier}{extension}")
+        return candidates
+
+    def _font_repository_source(
+        self,
+        family: str,
+        *,
+        weight: str,
+        style: str,
+    ) -> str:
+        key = (family.casefold(), weight.casefold(), style.casefold())
+        if key in self._font_repository_source_cache:
+            return self._font_repository_source_cache[key]
+        list_fonts = getattr(self.repository, "list_fonts", None)
+        if not callable(list_fonts):
+            self._font_repository_source_cache[key] = ""
+            return ""
+        try:
+            records = list_fonts(1000, 0, True, family).get("items", [])
+        except Exception as exc:
+            print(
+                f"[IMAGE MAP][FONT] 字体库查询失败：字体={family}，"
+                f"错误={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return ""
+
+        family_key = family.casefold()
+        wants_italic = style.casefold() in {"italic", "oblique"}
+        wants_bold = weight.casefold() in {"bold", "bolder", "600", "700", "800", "900"}
+
+        def score(record: dict[str, Any]) -> tuple[int, int]:
+            names = [
+                str(record.get(field) or "").strip().casefold()
+                for field in (
+                    "font_family",
+                    "font_preferred",
+                    "font_en",
+                    "font_all_name",
+                )
+            ]
+            if family_key not in names:
+                return (-1, 0)
+            descriptor = " ".join(
+                str(record.get(field) or "").casefold()
+                for field in ("font_name", "post_script_name", "file_path")
+            )
+            is_italic = "italic" in descriptor or "oblique" in descriptor
+            is_bold = "bold" in descriptor or "semibold" in descriptor
+            style_score = 20 if is_italic == wants_italic else -20
+            weight_score = 10 if is_bold == wants_bold else -10
+            exact_family_score = 20 if names[0] == family_key else 0
+            try:
+                record_id = int(record.get("id") or 0)
+            except (TypeError, ValueError):
+                record_id = 0
+            return (100 + exact_family_score + style_score + weight_score, -record_id)
+
+        candidates = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and record.get("enabled", True)
+            and str(record.get("file_path") or "").strip()
+            and score(record)[0] >= 0
+        ]
+        selected = max(candidates, key=score, default=None)
+        source = str((selected or {}).get("file_path") or "").strip()
+        self._font_repository_source_cache[key] = source
+        return source
+
+    def _enrich_layout_font_sources(
+        self,
+        layout: dict[str, Any],
+        order_number: str,
+    ) -> set[str]:
+        enriched: set[str] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, dict):
+                return
+            family = str(
+                value.get("fontFamily") or value.get("font_family") or ""
+            ).strip()
+            current_url = str(
+                value.get("fontUrl") or value.get("font_url") or ""
+            ).strip()
+            if family and not current_url:
+                source = self._font_repository_source(
+                    family,
+                    weight=str(value.get("fontWeight") or "normal"),
+                    style=str(value.get("fontStyle") or "normal"),
+                )
+                if source:
+                    value["fontUrl"] = source
+                    enriched.add(family)
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+        visit(layout)
+        if enriched:
+            print(
+                f"[模板解析] 已从字体库补全订单图层字体："
+                f"订单号={order_number or '未知订单'}，字体={','.join(sorted(enriched))}",
+                flush=True,
+            )
+        return enriched
+
+    def _cached_remote_font(
+        self,
+        family: str,
+        url: str,
+        *,
+        order_number: str,
+    ) -> Path:
+        suffix = Path(unquote(urlparse(url).path)).suffix.lower()
+        if suffix not in {".ttf", ".otf", ".ttc"}:
+            suffix = ".font"
+        safe_family = re.sub(r"[^A-Za-z0-9._-]+", "_", family).strip("._") or "font"
+        cache_name = f"{safe_family}-{sha256(url.encode('utf-8')).hexdigest()[:16]}{suffix}"
+        cache_path = (self.font_cache_dir / cache_name).resolve()
+        self.font_cache_dir.mkdir(parents=True, exist_ok=True)
+        if cache_path.is_file():
+            try:
+                ImageFont.truetype(str(cache_path), 16)
+                print(
+                    f"[IMAGE MAP][FONT] 使用字体缓存：订单号={order_number or '未知订单'}，"
+                    f"字体={family}，文件={cache_path.name}",
+                    flush=True,
+                )
+                return cache_path
+            except (OSError, ValueError):
+                cache_path.unlink(missing_ok=True)
+                print(
+                    f"[IMAGE MAP][FONT] 字体缓存损坏，已删除并重新下载："
+                    f"订单号={order_number or '未知订单'}，字体={family}，文件={cache_path.name}",
+                    flush=True,
+                )
+
+        attempts = max(
+            1,
+            int(getattr(self.image_map_renderer, "resource_retry_attempts", 3)),
+        )
+        delay = max(
+            0.0,
+            float(getattr(self.image_map_renderer, "resource_retry_delay_seconds", 1)),
+        )
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                content = response.content
+                if not content:
+                    raise RuntimeError("服务器返回空字体文件")
+                if len(content) > 50 * 1024 * 1024:
+                    raise RuntimeError(f"字体文件超过 50 MB：{len(content)} 字节")
+                ImageFont.truetype(BytesIO(content), 16)
+                with tempfile.NamedTemporaryFile(
+                    dir=self.font_cache_dir,
+                    prefix=f".{cache_name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary.write(content)
+                    temporary_path = Path(temporary.name)
+                temporary_path.replace(cache_path)
+                print(
+                    f"[IMAGE MAP][FONT] 字体下载并写入缓存成功："
+                    f"订单号={order_number or '未知订单'}，字体={family}，"
+                    f"文件={cache_path.name}，第={attempt}/{attempts}次",
+                    flush=True,
+                )
+                return cache_path
+            except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+                last_error = exc
+                print(
+                    f"[IMAGE MAP][FONT] 字体下载失败：订单号={order_number or '未知订单'}，"
+                    f"字体={family}，第={attempt}/{attempts}次，"
+                    f"错误={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if attempt < attempts and delay:
+                    time.sleep(delay * (2 ** (attempt - 1)))
+        self._raise_font_failure(
+            order_number,
+            f"字体={family}，下载重试={attempts}次，"
+            f"错误={type(last_error).__name__}: {last_error}",
+        )
+        raise AssertionError("unreachable")
+
+    def _raise_font_failure(self, order_number: str, detail: str) -> None:
+        recorder = getattr(self.image_map_renderer, "record_font_failure", None)
+        if callable(recorder):
+            message = recorder(order_number, detail)
+        else:
+            message = (
+                f"订单字体加载失败：订单号={order_number or '未知订单'}，{detail}"
+            )
+            print(f"[IMAGE MAP][FONT][ERROR] {message}", flush=True)
+        raise RuntimeError(message)
 
     @staticmethod
     def _draw_dashed_rectangle(

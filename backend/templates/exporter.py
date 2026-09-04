@@ -6,8 +6,9 @@ from hashlib import md5
 from io import BytesIO
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import struct
+from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
@@ -27,6 +28,19 @@ from backend.templates.rendering_rules import fabric_layer_geometry
 
 EXPORT_FORMATS = ("psd", "eps", "svg", "jpg", "png")
 PSD_ARCHIVE_VERSION = b"psd-layout-v9-fabric-scene"
+
+
+def stream_and_close(buffer, chunk_size: int = 1024 * 1024):
+    """Stream one in-memory ZIP and release it after completion or disconnect."""
+    try:
+        while True:
+            chunk = buffer.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        buffer.close()
+        print("[DOWNLOAD] ZIP 内存缓冲区已释放", flush=True)
 
 
 class TemplateExportService:
@@ -74,7 +88,7 @@ class TemplateExportService:
         if file_format:
             print(
                 f"[EXPORT] [COMPAT] 已忽略源文件格式参数：{file_format}；"
-                "订单目录固定生成四个生产文件",
+                "订单目录固定生成五个生产文件",
                 flush=True,
             )
         return self.generate_order_artifacts(
@@ -92,8 +106,9 @@ class TemplateExportService:
         template_json: dict[str, Any] | None = None,
         preview_result: dict[str, Any] | None = None,
         update_status: bool = False,
+        upload_to_oss: bool = True,
     ):
-        """Generate the four fixed order artifacts, then upload them together."""
+        """Generate the five fixed order artifacts, then upload them together."""
         if source_format:
             print(
                 f"[EXPORT] [COMPAT] 已忽略源文件格式参数：{source_format}",
@@ -169,6 +184,17 @@ class TemplateExportService:
             svg_name,
             self._svg_bytes(image, order, native_svg=native_svg),
         )
+        converted_svg = str(
+            (rendered.get("template") or {}).get("_fabric_render_text_to_svg") or ""
+        )
+        if not converted_svg:
+            raise RuntimeError("转曲 SVG 生成失败")
+        persist(
+            "converted_svg",
+            "svg",
+            order_resource_filename(order, "svg", artifact="转曲"),
+            converted_svg.encode("utf-8"),
+        )
 
         if self.order_print_image_generator is None:
             raise RuntimeError("未配置 A4 订单打印图生成器")
@@ -212,7 +238,7 @@ class TemplateExportService:
             raise RuntimeError("企业微信辅助图生成失败")
         persist("wecom", "jpg", wecom_path.name, wecom_path.read_bytes())
 
-        required_types = {"preview", "svg", "wecom", "production_sheet"}
+        required_types = {"preview", "svg", "converted_svg", "wecom", "production_sheet"}
         artifact_types = [item["artifact_type"] for item in artifacts]
         missing_types = sorted(required_types.difference(artifact_types))
         duplicate_types = sorted(
@@ -225,38 +251,58 @@ class TemplateExportService:
             for item in artifacts
             if not Path(item["local_path"]).is_file()
         ]
-        if missing_types or duplicate_types or missing_files or len(artifacts) != 4:
+        if missing_types or duplicate_types or missing_files or len(artifacts) != 5:
             raise RuntimeError(
-                "订单四个生产文件未完整生成："
+                "订单五个生产文件未完整生成："
                 f"缺少类型={missing_types or '无'}，"
                 f"重复类型={duplicate_types or '无'}，"
                 f"缺少文件={missing_files or '无'}，实际数量={len(artifacts)}"
             )
-        print(
-            "[EXPORT] [FILE] 四个订单文件已全部生成，开始统一上传 OSS："
-            + "、".join(item["filename"] for item in artifacts),
-            flush=True,
-        )
+        if upload_to_oss:
+            print(
+                "[EXPORT] [FILE] 五个订单文件已全部生成，开始统一上传 OSS："
+                + "、".join(item["filename"] for item in artifacts),
+                flush=True,
+            )
+        else:
+            print(
+                "[EXPORT] [FILE] 五个订单文件已全部生成，仅保存在本地："
+                + "、".join(item["filename"] for item in artifacts),
+                flush=True,
+            )
 
-        for artifact in artifacts:
-            path = Path(artifact["local_path"])
-            oss = self.storage_service.upload_file(path) if self.storage_service is not None else {
-                "status": "disabled", "url": None, "object_key": None,
-            }
-            if (
-                self.storage_service is not None
-                and self.storage_service.configured
-                and (not oss.get("ok") or oss.get("status") != "uploaded")
-            ):
-                raise RuntimeError(
-                    f"订单文件上传 OSS 失败：文件={path.name}，"
-                    f"原因={oss.get('error') or oss.get('status') or '未知错误'}"
-                )
-            artifact["oss"] = oss
-            artifact["oss_url"] = oss.get("url")
+        if upload_to_oss:
+            for artifact in artifacts:
+                path = Path(artifact["local_path"])
+                oss = self.storage_service.upload_file(path) if self.storage_service is not None else {
+                    "status": "disabled", "url": None, "object_key": None,
+                }
+                if (
+                    self.storage_service is not None
+                    and self.storage_service.configured
+                    and (not oss.get("ok") or oss.get("status") != "uploaded")
+                ):
+                    raise RuntimeError(
+                        f"订单文件上传 OSS 失败：文件={path.name}，"
+                        f"原因={oss.get('error') or oss.get('status') or '未知错误'}"
+                    )
+                artifact["oss"] = oss
+                artifact["oss_url"] = oss.get("url")
+        else:
+            print("[EXPORT] [OSS] 本次仅本地生成，跳过 OSS 上传", flush=True)
+            for artifact in artifacts:
+                artifact["oss"] = {
+                    "ok": True,
+                    "status": "local_only",
+                    "url": None,
+                    "object_key": None,
+                }
+                artifact["oss_url"] = None
 
         print(
-            "[EXPORT] [OSS] 四个订单文件统一上传阶段完成，开始写入产物记录",
+            "[EXPORT] [OSS] 五个订单文件上传阶段完成，开始写入产物记录"
+            if upload_to_oss
+            else "[EXPORT] [OSS] 已跳过上传，开始写入本地产物记录",
             flush=True,
         )
         for artifact in artifacts:
@@ -282,6 +328,181 @@ class TemplateExportService:
             "order_status_text": updated_order.get("status_text"),
         }
 
+    def regenerate_customer_confirmation_artifacts(
+        self,
+        order_id: int,
+        order_number: str,
+    ) -> dict[str, Any]:
+        """Regenerate all five local artifacts, then replace their OSS objects."""
+        order = self.order_repository.get_by_id_and_order_number(
+            order_id,
+            order_number,
+        )
+        payload = self.order_repository.order_payload(order_id)
+        database_template = self.catalog_repository.find_render_template(
+            product_name=order.get("product", ""),
+            shop_id=order.get("shop_id"),
+            shop=order.get("shop", ""),
+            template_id=order.get("size_template_id"),
+        )
+        if database_template is None:
+            raise LookupError("未找到订单关联的商品尺寸模板")
+
+        snapshot = self._restore_order_template_snapshot(order)
+        template = snapshot if snapshot is not None else database_template
+        template_resolved = snapshot is not None
+        print(
+            f"[客户确认] 开始重新生成五个订单文件：订单号={order_number}，"
+            f"模板来源={'订单快照' if template_resolved else '数据库模板'}",
+            flush=True,
+        )
+        rendered = self._render_image(
+            payload,
+            order,
+            template,
+            template_resolved=template_resolved,
+        )
+        image = rendered["image"].convert("RGB")
+        output_dir = order_resource_dir(self.output_dir, order)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save all five fresh artifacts locally first. OSS is touched only
+        # after every local file exists and has a non-zero size.
+        preview_path = output_dir / order_resource_filename(order, "jpg", artifact="预览图")
+        preview_buffer = BytesIO()
+        image.save(
+            preview_buffer,
+            format="JPEG",
+            quality=95,
+            dpi=(self.image_generator.dpi, self.image_generator.dpi),
+        )
+        self._save_file(output_dir, preview_path.name, preview_buffer.getvalue())
+        print(f"[客户确认] 订单预览图已覆盖本地文件：文件={preview_path.name}", flush=True)
+
+        if self.wecom_order_info_image_generator is None:
+            raise RuntimeError("未配置企业微信辅助图生成器")
+        wecom_result = self.wecom_order_info_image_generator.generate(
+            order_id,
+            order_number,
+            preview_result={"path": str(preview_path)},
+            upload_to_oss=False,
+        )
+        wecom_path = Path(str(wecom_result.get("path") or ""))
+        if not wecom_path.is_file():
+            raise RuntimeError("客户确认后企业微信辅助图重新生成失败")
+        print(f"[客户确认] 企业微信辅助图已覆盖本地文件：文件={wecom_path.name}", flush=True)
+
+        native_svg = str((rendered.get("template") or {}).get("_fabric_render_svg") or "")
+        svg_path = self._save_file(
+            output_dir,
+            order_resource_filename(order, "svg"),
+            self._svg_bytes(image, order, native_svg=native_svg),
+        )
+        converted_svg = str(
+            (rendered.get("template") or {}).get("_fabric_render_text_to_svg") or ""
+        )
+        if not converted_svg:
+            raise RuntimeError("客户确认后转曲 SVG 重新生成失败")
+        converted_svg_path = self._save_file(
+            output_dir,
+            order_resource_filename(order, "svg", artifact="转曲"),
+            converted_svg.encode("utf-8"),
+        )
+        print(
+            f"[客户确认] SVG 和转曲 SVG 已覆盖本地文件："
+            f"{svg_path.name}、{converted_svg_path.name}",
+            flush=True,
+        )
+
+        if self.order_print_image_generator is None:
+            raise RuntimeError("未配置 A4 订单打印图生成器")
+        a4_result = self.order_print_image_generator.generate(
+            order_id,
+            order_number,
+            upload_to_oss=False,
+            preview_path=preview_path,
+        )
+        a4_path = Path(str(a4_result.get("path") or ""))
+        if not a4_path.is_file():
+            raise RuntimeError("客户确认后 A4 生产单重新生成失败")
+        print(f"[客户确认] 生产单已覆盖本地文件：文件={a4_path.name}", flush=True)
+
+        artifacts = [
+            self._confirmation_artifact(order_id, "preview", "jpg", preview_path),
+            self._confirmation_artifact(order_id, "wecom", "jpg", wecom_path),
+            self._confirmation_artifact(order_id, "svg", "svg", svg_path),
+            self._confirmation_artifact(order_id, "converted_svg", "svg", converted_svg_path),
+            self._confirmation_artifact(order_id, "production_sheet", "jpg", a4_path),
+        ]
+        missing = [item["filename"] for item in artifacts if not Path(item["local_path"]).is_file() or Path(item["local_path"]).stat().st_size <= 0]
+        if missing:
+            raise RuntimeError(f"客户确认后订单文件未完整生成：缺少文件={missing}")
+        print(
+            "[客户确认] 五个订单文件已全部生成，开始统一上传 OSS："
+            + "、".join(item["filename"] for item in artifacts),
+            flush=True,
+        )
+        for artifact in artifacts:
+            path = Path(artifact["local_path"])
+            oss = (
+                self.storage_service.upload_file(path)
+                if self.storage_service is not None
+                else {"ok": False, "status": "disabled", "url": None, "object_key": None}
+            )
+            if (
+                self.storage_service is not None
+                and self.storage_service.configured
+                and (not oss.get("ok") or oss.get("status") != "uploaded")
+            ):
+                raise RuntimeError(
+                    f"客户确认文件覆盖 OSS 失败：文件={path.name}，"
+                    f"原因={oss.get('error') or oss.get('status') or '未知错误'}"
+                )
+            artifact["oss"] = oss
+            artifact["oss_url"] = oss.get("url")
+
+        saver = getattr(self.order_repository, "save_artifact", None)
+        for artifact in artifacts:
+            if callable(saver):
+                saver(order_id, artifact)
+            print(
+                f"[客户确认] OSS 文件已覆盖并更新记录："
+                f"订单号={order_number}，文件={artifact['filename']}，"
+                f"状态={artifact['oss'].get('status')}，"
+                f"地址={artifact['oss'].get('url') or '无'}",
+                flush=True,
+            )
+        return {
+            "artifacts": artifacts,
+            "files": [artifact["filename"] for artifact in artifacts],
+            "oss_folder": (
+                self.storage_service.public_url(
+                    self.storage_service.object_key_for_path(output_dir).rstrip("/") + "/"
+                )
+                if self.storage_service is not None
+                and callable(getattr(self.storage_service, "public_url", None))
+                and callable(getattr(self.storage_service, "object_key_for_path", None))
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _confirmation_artifact(
+        order_id: int,
+        artifact_type: str,
+        file_format: str,
+        path: Path,
+    ) -> dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "artifact_type": artifact_type,
+            "file_format": file_format,
+            "filename": path.name,
+            "local_path": str(path),
+            "oss": {"status": "pending", "url": None, "object_key": None},
+            "file_size": path.stat().st_size,
+        }
+
     def _remove_obsolete_source_artifacts(self, output_dir: Path, order_id: int) -> None:
         for path in output_dir.glob("*-源文件.*"):
             if path.is_file():
@@ -298,15 +519,56 @@ class TemplateExportService:
         if callable(delete_records):
             delete_records(order_id, "source")
 
-    def package_for_download(self, order_id: int, order_number: str) -> tuple[bytes, str]:
-        """Package existing order files only when the frontend downloads."""
+    def package_for_download(self, order_id: int, order_number: str) -> tuple[BytesIO, str]:
+        """Read the existing OSS order folder and return a temporary ZIP."""
         order = self.order_repository.get_by_id_and_order_number(order_id, order_number)
         records = self.order_repository.list_artifacts(order_id, order_number)
-        paths = [Path(item["local_path"]) for item in records if Path(item["local_path"]).is_file()]
-        if not paths:
-            raise LookupError("订单尚未生成可下载文件")
         order_dir = order_resource_dir(self.output_dir, order)
-        return self._zip_order_files(order_dir, paths), f"{order_resource_stem(order)}.zip"
+        if self.storage_service is not None and self.storage_service.configured:
+            recorded_keys = [
+                str(item.get("oss_object_key") or "").strip(" /")
+                for item in records
+                if str(item.get("oss_object_key") or "").strip(" /")
+            ]
+            recorded_folders = {
+                str(PurePosixPath(key).parent).strip("./")
+                for key in recorded_keys
+            }
+            if len(recorded_folders) == 1:
+                object_prefix = recorded_folders.pop()
+            else:
+                object_prefix = self.storage_service.object_key_for_path(order_dir)
+            print(
+                f"[DOWNLOAD] 开始读取 OSS 订单文件夹："
+                f"订单号={order_number}，前缀={object_prefix}",
+                flush=True,
+            )
+            objects = self.storage_service.download_folder(object_prefix)
+            if not objects:
+                raise LookupError("OSS 订单文件夹中没有可下载文件")
+            archive = self._zip_order_objects(order_dir.name, objects)
+            file_count = len(objects)
+            objects.clear()
+            print(
+                f"[DOWNLOAD] OSS 订单文件夹打包完成："
+                f"订单号={order_number}，文件数={file_count}，"
+                "原始文件内存已释放",
+                flush=True,
+            )
+            return archive, f"{order_resource_stem(order)}.zip"
+
+        # Local fallback keeps development usable when OSS is not configured.
+        paths = [
+            Path(item["local_path"])
+            for item in records
+            if Path(item["local_path"]).is_file()
+        ]
+        if not paths:
+            raise LookupError("订单尚未生成可下载文件，且 OSS 未配置")
+        return (
+            BytesIO(self._zip_order_files(order_dir, paths)),
+            f"{order_resource_stem(order)}.zip",
+        )
 
     def _generate_export(
         self,
@@ -892,6 +1154,25 @@ class TemplateExportService:
                 path = Path(path)
                 archive.write(path, arcname=f"{order_dir.name}/{path.name}")
         return output.getvalue()
+
+    @staticmethod
+    def _zip_order_objects(
+        order_folder: str,
+        objects: list[dict[str, Any]],
+    ) -> BytesIO:
+        output = BytesIO()
+        with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+            archive.comment = PSD_ARCHIVE_VERSION
+            for item in objects:
+                relative = PurePosixPath(str(item["relative_name"]))
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("OSS 订单文件夹包含非法对象路径")
+                archive.writestr(
+                    PurePosixPath(order_folder, relative).as_posix(),
+                    item["content"],
+                )
+        output.seek(0)
+        return output
 
     def _render_image(
         self,

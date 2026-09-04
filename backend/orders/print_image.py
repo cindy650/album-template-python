@@ -383,6 +383,7 @@ class OrderPrintImageGenerator:
         result = self.template_image_generator.generate_for_order(
             payload,
             saved_order=order,
+            upload_to_oss=False,
         )
         return Path(result["path"])
 
@@ -411,19 +412,24 @@ class OrderPrintImageGenerator:
         right_x = margin + left_width + gap
         right_width = width - margin - right_x
 
-        # Keep the production sheet predictable: order details, preview and
-        # check table each receive exactly one third of the main A4 area.
+        # Order details and preview each use two fifths of the A4 content
+        # area; the production check table uses the remaining fifth.
         content_top = px(110)
         content_bottom = px(3270)
-        section_height = (content_bottom - content_top) / 3
-        first_bottom = content_top + section_height
-        second_bottom = content_top + section_height * 2
+        content_height = content_bottom - content_top
+        first_bottom = content_top + content_height * 2 / 5
+        second_bottom = content_top + content_height * 4 / 5
+        # Leave only a compact breathing gap between the information block and
+        # the preview while keeping the table tightly attached below it.
+        preview_top = first_bottom + px(55)
 
-        title_font = self._font(px(56), bold=True)
-        heading_font = self._font(px(35), bold=True)
-        body_font = self._font(px(34))
+        title_font = self._font(px(80), bold=True)
+        heading_font = self._font(px(50), bold=True)
+        body_font = self._font(px(49))
         small_font = self._font(px(24))
-        shop_font = self._font(px(76), bold=True)
+        shop_font = self._font(px(105), bold=True)
+        table_heading_font = self._font(px(35), bold=True)
+        table_body_font = self._font(px(34))
 
         y = content_top + px(25)
         draw.text(
@@ -432,7 +438,7 @@ class OrderPrintImageGenerator:
             font=title_font,
             fill=ink,
         )
-        y += px(72)
+        y += px(102)
         y = self._draw_block(
             draw,
             order.get("product") or "",
@@ -440,13 +446,13 @@ class OrderPrintImageGenerator:
             left_width,
             body_font,
             muted,
-            px(44),
+            px(62),
             max_lines=3,
         )
 
-        y += px(20)
+        y += px(28)
         draw.text((margin, y), "Ship to", font=heading_font, fill=ink)
-        y += px(42)
+        y += px(60)
         y = self._draw_block(
             draw,
             order.get("shipping_address") or "",
@@ -454,30 +460,30 @@ class OrderPrintImageGenerator:
             left_width,
             body_font,
             ink,
-            px(42),
+            px(60),
             max_lines=7,
         )
-        y += px(20)
+        y += px(28)
         draw.text((margin, y), "Shop", font=heading_font, fill=ink)
-        y += px(42)
+        y += px(60)
         draw.text(
             (margin, y),
             order.get("shop") or "",
             font=body_font,
             fill=ink,
         )
-        y += px(58)
+        y += px(82)
         draw.text((margin, y), "Order date", font=heading_font, fill=ink)
-        y += px(42)
+        y += px(60)
         draw.text(
             (margin, y),
             self._format_date(order.get("created_at")),
             font=body_font,
             fill=ink,
         )
-        y += px(58)
+        y += px(82)
         draw.text((margin, y), "Payment method", font=heading_font, fill=ink)
-        y += px(42)
+        y += px(60)
         y = self._draw_block(
             draw,
             order.get("payment_method") or "",
@@ -485,7 +491,7 @@ class OrderPrintImageGenerator:
             left_width,
             body_font,
             ink,
-            px(42),
+            px(60),
             max_lines=2,
         )
 
@@ -498,17 +504,17 @@ class OrderPrintImageGenerator:
             fill=red,
         )
         draw.text(
-            (right_x, content_top + px(110)),
+            (right_x, content_top + px(125)),
             f"{order.get('quantity') or 1} item",
             font=heading_font,
             fill=ink,
         )
         draw.line(
-            (right_x, content_top + px(158), width - margin, content_top + px(158)),
+            (right_x, content_top + px(188), width - margin, content_top + px(188)),
             fill=line,
             width=px(2),
         )
-        right_y = content_top + px(185)
+        right_y = content_top + px(220)
         right_y = self._draw_block(
             draw,
             order.get("product") or "",
@@ -516,27 +522,48 @@ class OrderPrintImageGenerator:
             right_width,
             heading_font,
             ink,
-            px(46),
+            px(64),
             max_lines=3,
         )
-        right_y += px(14)
+        right_y += px(20)
         original_entries = product_information_entries(
             order.get("product_information") or {},
             user_message_indexes,
         )
-
-        # Product details remain in the first third. Long lines are reduced
-        # only as needed, while the preferred sizes are larger than before.
+        prepared_entries = []
         for index, (label_text, value_text, is_user_message) in enumerate(
             original_entries,
             start=1,
         ):
-            translation = self._normalize_translation(
-                translated_lines[index - 1]
-                if index <= len(translated_lines)
-                else ""
+            prepared_entries.append(
+                (
+                    index,
+                    label_text,
+                    value_text,
+                    is_user_message,
+                    self._normalize_translation(
+                        translated_lines[index - 1]
+                        if index <= len(translated_lines)
+                        else ""
+                    ),
+                )
             )
-            right_y = self._draw_fitted_segments_single_line(
+
+        entries_bottom = preview_top - px(20)
+        # Product details remain in the first section. Long lines are reduced
+        # only as needed. Wrapped rows advance by their actual rendered height,
+        # so a long field never overlaps the following entry.
+        for (
+            index,
+            label_text,
+            value_text,
+            is_user_message,
+            translation,
+        ) in prepared_entries:
+            row_y = right_y
+            source_line_height = px(52)
+            source_size = px(46)
+            source_height = self._draw_wrapped_segments(
                 draw,
                 [
                     (
@@ -548,43 +575,53 @@ class OrderPrintImageGenerator:
                         red if is_user_message else ink,
                     ),
                 ],
-                (right_x, right_y),
-                right_width,
-                preferred_size=px(34),
-                minimum_size=px(17),
-                line_height=px(40),
+                (right_x, row_y),
+                preferred_size=source_size,
+                max_width=right_width,
+                fill=None,
+                line_height=max(1, round(source_line_height)),
             )
             if translation:
-                right_y = self._draw_fitted_single_line(
+                translation_line_height = px(54)
+                translation_size = px(50)
+                translation_height = self._draw_wrapped_single_line(
                     draw,
                     translation,
-                    (right_x + px(38), right_y),
+                    (right_x + px(38), row_y + source_height),
                     right_width - px(38),
-                    preferred_size=px(40),
-                    minimum_size=px(19),
+                    font_size=translation_size,
                     fill=red,
-                    line_height=px(47),
+                    line_height=translation_line_height,
                     bold=True,
                 )
-            right_y += px(5)
+            else:
+                translation_height = 0
+            right_y = row_y + source_height + translation_height + px(2)
 
         preview_box = (
             margin,
-            first_bottom + px(35),
+            preview_top,
             width - margin,
-            second_bottom - px(35),
+            second_bottom - px(15),
         )
-        self._paste_preview(image, preview_path, preview_box)
+        self._paste_preview(
+            image,
+            preview_path,
+            preview_box,
+            border_color=line,
+            border_width=px(2),
+            vertical_align="bottom",
+        )
         self._draw_check_table(
             draw,
             (
                 margin,
-                second_bottom + px(22),
+                second_bottom + px(6),
                 width - margin,
                 content_bottom - px(22),
             ),
-            body_font,
-            heading_font,
+            table_body_font,
+            table_heading_font,
             line,
             px(2),
         )
@@ -698,6 +735,73 @@ class OrderPrintImageGenerator:
             draw._image.paste(compressed, (round(x), round(y)), compressed)
         return y + line_height
 
+    @classmethod
+    def _draw_wrapped_segments(
+        cls,
+        draw,
+        segments: list[tuple[str, str]],
+        position,
+        max_width,
+        preferred_size,
+        line_height,
+        fill=None,
+    ):
+        """Draw colored segments with word wrapping and no horizontal squashing."""
+        x, y = position
+        font = cls._font(max(1, int(preferred_size)))
+        tokens: list[tuple[str, str]] = []
+        for text, segment_fill in segments:
+            normalized = cls._normalize_single_line(text)
+            if not normalized:
+                continue
+            parts = re.findall(
+                r"[A-Za-z0-9]+(?:['’._/&|:-][A-Za-z0-9]+)*\s*|.",
+                normalized,
+            )
+            tokens.extend((part, segment_fill or fill or "#222222") for part in parts)
+        lines: list[list[tuple[str, str]]] = []
+        current: list[tuple[str, str]] = []
+        current_width = 0.0
+        for token, token_fill in tokens:
+            token_width = draw.textlength(token, font=font)
+            if current and current_width + token_width > max_width:
+                lines.append(current)
+                current = []
+                current_width = 0.0
+                token = token.lstrip()
+                token_width = draw.textlength(token, font=font)
+            current.append((token, token_fill))
+            current_width += token_width
+        if current or not lines:
+            lines.append(current)
+        for line in lines:
+            cursor = x
+            for text, segment_fill in line:
+                draw.text((cursor, y), text, font=font, fill=segment_fill)
+                cursor += draw.textlength(text, font=font)
+            y += line_height
+        return max(line_height, len(lines) * line_height)
+
+    @classmethod
+    def _draw_wrapped_single_line(
+        cls,
+        draw,
+        text,
+        position,
+        max_width,
+        font_size,
+        fill,
+        line_height,
+        bold=False,
+    ):
+        x, y = position
+        font = cls._font(max(1, int(font_size)), bold=bold)
+        lines = cls._wrap_text(draw, cls._normalize_single_line(text), font, max_width)
+        for line in lines:
+            draw.text((x, y), line, font=font, fill=fill)
+            y += line_height
+        return max(line_height, len(lines) * line_height)
+
     @staticmethod
     def _normalize_single_line(text: Any) -> str:
         return " ".join(str(text or "").replace("\r", " ").split())
@@ -761,7 +865,14 @@ class OrderPrintImageGenerator:
         )
 
     @staticmethod
-    def _paste_preview(image: Image.Image, path: Path, box):
+    def _paste_preview(
+        image: Image.Image,
+        path: Path,
+        box,
+        border_color=None,
+        border_width: int = 0,
+        vertical_align: str = "center",
+    ):
         x1, y1, x2, y2 = box
         box_width = max(1, round(x2 - x1))
         box_height = max(1, round(y2 - y1))
@@ -772,8 +883,26 @@ class OrderPrintImageGenerator:
                 Image.Resampling.LANCZOS,
             )
         x = round(x1 + (x2 - x1 - preview.width) / 2)
-        y = round(y1 + (y2 - y1 - preview.height) / 2)
+        if vertical_align == "bottom":
+            y = round(y2 - preview.height)
+        elif vertical_align == "top":
+            y = round(y1)
+        else:
+            y = round(y1 + (y2 - y1 - preview.height) / 2)
         image.paste(preview, (x, y))
+        border_width = max(0, int(border_width))
+        if border_color and border_width:
+            preview_draw = ImageDraw.Draw(image)
+            preview_draw.rectangle(
+                (
+                    x,
+                    y,
+                    x + preview.width - 1,
+                    y + preview.height - 1,
+                ),
+                outline=border_color,
+                width=border_width,
+            )
 
     @classmethod
     def _font(cls, size: int, bold: bool = False):
@@ -1002,6 +1131,7 @@ class WeComOrderInfoImageGenerator:
         result = self.template_image_generator.generate_for_order(
             payload,
             saved_order=order,
+            upload_to_oss=False,
         )
         return Path(result["path"])
 

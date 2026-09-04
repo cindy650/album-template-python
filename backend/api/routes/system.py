@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 import qq_idleCopy as core
 from backend.config import settings
-from backend.context import listener
+from backend.context import catalog_repository, listener
 from backend.responses import api_success
 
 
@@ -15,6 +15,7 @@ router = APIRouter(tags=["系统"])
     description="查询邮箱、企业微信、OSS、数据库、文件目录和后台任务的配置状态；敏感密钥不会返回。",
 )
 async def get_config():
+    shop_robot_configured = catalog_repository.has_configured_shop_wecom_robot()
     return api_success(
         {
             "imap": {
@@ -30,7 +31,14 @@ async def get_config():
                 "enabled": False,
             },
             "wecom_robot": {
-                "configured": bool(settings.wecom_robot_webhook_url),
+                "configured": shop_robot_configured,
+                "scope": "shop",
+                "field": "shops.wecom_robot_webhook_url",
+                "order_notifications_configured": bool(
+                    shop_robot_configured
+                ),
+                "automation_exception_configured": shop_robot_configured,
+                "automation_exception_uses_separate_robot": False,
             },
             "oss": {
                 "configured": bool(

@@ -299,6 +299,53 @@ class FileStorageService:
         )
         return {**checked, "ok": True, "status": "downloaded", "path": str(path)}
 
+    def download_folder(self, object_prefix: str) -> list[dict[str, Any]]:
+        """Download every OSS object below one folder prefix into memory."""
+        object_prefix = str(object_prefix or "").strip(" /")
+        if not object_prefix:
+            raise ValueError("OSS 文件夹前缀不能为空")
+        if not self.configured:
+            raise RuntimeError("OSS 未配置，无法下载订单文件夹")
+        prefix = object_prefix + "/"
+        try:
+            import oss2
+
+            bucket = self._bucket()
+            objects = []
+            for item in oss2.ObjectIterator(bucket, prefix=prefix):
+                object_key = str(getattr(item, "key", "") or "")
+                if not object_key or object_key.endswith("/"):
+                    continue
+                relative_name = object_key[len(prefix):]
+                if not relative_name:
+                    continue
+                content = bucket.get_object(object_key).read()
+                objects.append(
+                    {
+                        "object_key": object_key,
+                        "relative_name": relative_name,
+                        "content": content,
+                    }
+                )
+                print(
+                    f"[OSS] 订单文件读取成功：对象键={object_key}，"
+                    f"字节数={len(content)}",
+                    flush=True,
+                )
+        except ImportError as exc:
+            raise RuntimeError(
+                "未安装 oss2，无法从 OSS 下载订单文件夹"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"OSS 订单文件夹下载失败：{type(exc).__name__}: {exc}"
+            ) from exc
+        print(
+            f"[OSS] 订单文件夹读取完成：前缀={prefix}，文件数={len(objects)}",
+            flush=True,
+        )
+        return objects
+
     def object_key_for_path(self, path: Path) -> str:
         path = Path(path)
         try:

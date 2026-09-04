@@ -1,4 +1,7 @@
+from urllib.parse import quote
+
 from fastapi import APIRouter, HTTPException, Path, Query, Response, status as http_status
+from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from backend.context import (
@@ -10,12 +13,12 @@ from backend.context import (
     parse_order_payload,
 )
 from backend.responses import api_success
+from backend.templates.exporter import stream_and_close
 from backend.schemas import (
     OrderData,
     OrderPrintImageRequest,
     OrderStatusAdvanceRequest,
     OrderStatusUpdate,
-    OrderTemplateExportRequest,
     OrderTemplateJsonUpdate,
     ParseOrderRequest,
 )
@@ -39,6 +42,7 @@ async def list_order_statuses():
     summary="查询订单列表",
     description=(
         "从第 1 页开始分页查询订单，可按订单号、交易编号、店铺、店铺 ID 和状态值筛选。"
+        "同一 Etsy 订单号可能返回多条商品项；请使用每条记录的 id 操作模板、状态和导出。"
         "响应包含当前页 pages、每页数量 limit、总记录数 total 和总页数 total_pages。"
         "每条订单都会返回 status、status_text 和 status_button_text。"
     ),
@@ -80,6 +84,38 @@ async def list_orders(
     return api_success(result, message="订单查询成功")
 
 
+@router.get(
+    "/monthly-statistics",
+    summary="查询店铺月累计订单统计",
+    description="返回入库时累计的 CAD 金额、运费、订单数和商品件数；不会重新计算历史订单。",
+)
+async def list_monthly_statistics(
+    shop_id: int | None = Query(default=None, gt=0),
+    stat_month: str | None = Query(default=None, description="月份，YYYY-MM"),
+):
+    try:
+        result = await run_in_threadpool(
+            order_repository.monthly_statistics, shop_id, stat_month
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return api_success(result, message="月统计查询成功")
+
+
+@router.get("/daily-statistics", summary="查询店铺日累计订单统计")
+async def list_daily_statistics(
+    shop_id: int | None = Query(default=None, gt=0),
+    stat_date: str | None = Query(default=None, description="日期，YYYY-MM-DD"),
+):
+    try:
+        result = await run_in_threadpool(order_repository.daily_statistics, shop_id, stat_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return api_success(result, message="日统计查询成功")
+
+
 @router.patch(
     "/{order_id}/status",
     deprecated=True,
@@ -114,6 +150,8 @@ async def update_order_status(
     summary="推进订单状态",
     description=(
         "根据订单 ID 和订单号校验订单，并按状态表配置推进到下一状态。"
+        "当前状态为 1（客户已确认）时，会先重新生成并覆盖 SVG 和 A4 生产单的"
+        "本地文件及 OSS 文件，全部成功后才推进到状态 2。"
         "订单已完成后不能继续推进。"
     ),
     operation_id="推进订单状态",
@@ -121,7 +159,7 @@ async def update_order_status(
 async def advance_order_status(payload: OrderStatusAdvanceRequest):
     try:
         result = await run_in_threadpool(
-            order_repository.advance_status,
+            order_service.advance_status,
             payload.order_id,
             payload.order_number,
         )
@@ -130,7 +168,7 @@ async def advance_order_status(payload: OrderStatusAdvanceRequest):
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -211,6 +249,7 @@ async def generate_order_print_image(payload: OrderPrintImageRequest):
             order_print_image_generator.generate,
             payload.order_id,
             payload.order_number,
+            upload_to_oss=False,
         )
     except LookupError as exc:
         raise HTTPException(
@@ -226,34 +265,62 @@ async def generate_order_print_image(payload: OrderPrintImageRequest):
 
 
 @router.post(
-    "/template-export",
-    summary="确认生产并导出订单文件",
+    "/regenerate-local",
+    summary="重新生成订单全部文件（仅本地）",
     description=(
-        "根据订单和模板固定生成预览图、SVG、企业微信辅助图和 A4 生产单。"
-        "四个文件全部保存成功后统一上传 OSS；不生成源文件或上传 ZIP。"
-        "前端未传 template_json 时使用订单关联的数据库模板。"
+        "根据订单当前保存的模板和图层 JSON，重新生成预览图、企业微信辅助图、"
+        "SVG、转曲 SVG 和 A4 生产单。仅写入 generated_orders，不发送企业微信，"
+        "不上传 OSS，也不修改订单状态。"
+    ),
+)
+async def regenerate_order_artifacts_local(payload: OrderPrintImageRequest):
+    try:
+        result = await run_in_threadpool(
+            template_export_service.generate_order_artifacts,
+            payload.order_id,
+            payload.order_number,
+            update_status=False,
+            upload_to_oss=False,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return api_success(result, message="订单全部文件已重新生成并保存到本地")
+
+
+@router.post(
+    "/template-export",
+    summary="下载订单 OSS 文件夹",
+    description=(
+        "读取订单已经生成并上传到 OSS 文件夹中的全部文件，"
+        "由后端临时打包为 ZIP 并直接返回下载；不重新生成文件、不上传 ZIP，"
+        "也不修改订单状态。"
     ),
 )
 @router.post(
     "/export-template",
     deprecated=True,
-    summary="确认生产并导出订单文件（兼容地址）",
+    summary="下载订单 OSS 文件夹（兼容地址）",
     description="订单生产文件导出的旧版兼容地址，功能与 /api/v1/orders/template-export 相同。",
 )
-async def export_order_template(payload: OrderTemplateExportRequest):
-    """确认生产并返回订单文件及 OSS 地址，不在生产阶段打包。"""
+async def export_order_template(payload: OrderPrintImageRequest):
     try:
-        result = await run_in_threadpool(
-            template_export_service.export,
+        archive, filename = await run_in_threadpool(
+            template_export_service.package_for_download,
             payload.order_id,
             payload.order_number,
-            payload.file_format,
-            payload.template_json,
         )
     except LookupError as exc:
         print(
-            f"[EXPORT] 导出失败：订单ID={payload.order_id}，订单号={payload.order_number}，"
-            f"格式={payload.file_format}，错误={type(exc).__name__}: {exc}",
+            f"[DOWNLOAD] 下载失败：订单ID={payload.order_id}，"
+            f"订单号={payload.order_number}，错误={type(exc).__name__}: {exc}",
             flush=True,
         )
         raise HTTPException(
@@ -262,38 +329,54 @@ async def export_order_template(payload: OrderTemplateExportRequest):
         ) from exc
     except (RuntimeError, ValueError) as exc:
         print(
-            f"[EXPORT] 导出失败：订单ID={payload.order_id}，订单号={payload.order_number}，"
-            f"格式={payload.file_format}，错误={type(exc).__name__}: {exc}",
+            f"[DOWNLOAD] 下载失败：订单ID={payload.order_id}，"
+            f"订单号={payload.order_number}，错误={type(exc).__name__}: {exc}",
             flush=True,
         )
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-    return api_success(result, message="订单已确认生产，订单文件已上传 OSS")
+    fallback_filename = f"order-{payload.order_id}.zip"
+    encoded_filename = quote(filename)
+    return StreamingResponse(
+        stream_and_close(archive),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{fallback_filename}"; '
+                f"filename*=UTF-8''{encoded_filename}"
+            )
+        },
+    )
 
 
 @router.post(
     "/template-export/download",
     summary="下载订单生产文件",
     description=(
-        "读取订单目录中已经生成的预览图、企业微信辅助图、A4 生产单和 SVG，"
-        "仅在本次下载请求中临时打包为 ZIP 返回；不会把 ZIP 保存或上传到 OSS。"
+        "兼容下载地址，功能与 /api/v1/orders/template-export 相同。"
     ),
 )
 async def download_order_template(payload: OrderPrintImageRequest):
     try:
-        content, filename = await run_in_threadpool(
+        archive, filename = await run_in_threadpool(
             template_export_service.package_for_download,
             payload.order_id,
             payload.order_number,
         )
     except LookupError as exc:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return Response(
-        content=content,
+    fallback_filename = f"order-{payload.order_id}.zip"
+    return StreamingResponse(
+        stream_and_close(archive),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{fallback_filename}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
     )
 
 

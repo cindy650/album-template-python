@@ -10,6 +10,7 @@ from backend.api.routes import (
     tasks,
     template_catalog,
     template_imports,
+    uploads,
 )
 from backend.security import verify_api_key
 
@@ -27,3 +28,4 @@ api_router.include_router(tasks.router)
 api_router.include_router(events.router)
 api_router.include_router(template_imports.router)
 api_router.include_router(image_map.router)
+api_router.include_router(uploads.router)

@@ -8,8 +8,13 @@ import sys
 import tempfile
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python builds without zoneinfo
+    ZoneInfo = None
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -78,6 +83,45 @@ PRODUCT_BLOCK_BOUNDARY_PATTERN = re.compile(
 
 PRODUCT_OPTION_LINE_PATTERN = re.compile(
     r"^(?P<label>[^:：]{1,100}?)\s*[:：]\s*(?P<value>.*)$"
+)
+
+# Etsy listing titles may contain a colon. These labels are the stable option
+# anchors used by the order email layout; dynamic labels remain supported once
+# the first real option has been found.
+KNOWN_PRODUCT_OPTION_LABEL_PATTERN = re.compile(
+    r"^(?:"
+    r"Book Size\s*\|\s*Page Count|"
+    r"Pages Quantity\s*\|\s*Album Size|"
+    r"Inside Page Options|"
+    r"Inner Page Layout|"
+    r"Photo size\s*&\s*Page color|"
+    r"Instant photo size|"
+    r"Quantity of pages\s*&\s*photos|"
+    r"Names/date/location for the cover|"
+    r"Phone Number for Delivery|"
+    r"Font Style\s*&\s*Lettering color|"
+    r"(?:Size|Style|Color|Colour|Cover(?:\s+(?:Color|Colour))?|"
+    r"Font(?:\s+Style)?|Paper|Material|Page Count|Pages|Option|Finish)"
+    r")\s*[:：]",
+    re.IGNORECASE,
+)
+
+KNOWN_PRODUCT_OPTION_INLINE_PATTERN = re.compile(
+    r"(?P<label>"
+    r"Book Size\s*\|\s*Page Count|"
+    r"Pages Quantity\s*\|\s*Album Size|"
+    r"Inside Page Options|"
+    r"Inner Page Layout|"
+    r"Photo size\s*&\s*Page color|"
+    r"Instant photo size|"
+    r"Quantity of pages\s*&\s*photos|"
+    r"Names/date/location for the cover|"
+    r"Phone Number for Delivery|"
+    r"Font Style\s*&\s*Lettering color|"
+    r"(?:Size|Style|Color|Colour|Cover(?:\s+(?:Color|Colour))?|"
+    r"Font(?:\s+Style)?|Paper|Material|Page Count|Pages|Option|Finish)"
+    r")\s*[:：]",
+    re.IGNORECASE,
 )
 
 RESERVED_PRODUCT_OPTION_LABELS = {
@@ -164,6 +208,7 @@ class HTMLTextExtractor(HTMLParser):
         "p",
         "pre",
         "section",
+        "span",
         "table",
         "tbody",
         "thead",
@@ -177,6 +222,9 @@ class HTMLTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.skip_depth = 0
+        self.listing_link_depth = 0
+        self.product_title_parts = []
+        self.product_titles = []
 
     def add_newline(self):
         if not self.parts or self.parts[-1] != "\n":
@@ -188,11 +236,21 @@ class HTMLTextExtractor(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
+        attributes = {str(key).lower(): str(value or "") for key, value in attrs}
         if tag in self.SKIP_TAGS:
             self.skip_depth += 1
             return
         if self.skip_depth:
             return
+        href = attributes.get("href", "").casefold()
+        if tag == "a" and (
+            "/listing/" in href or "/transaction/" in href
+        ):
+            # Keep the Etsy listing title as its own logical line before HTML
+            # cleanup. Listing titles may contain colons and arbitrary labels.
+            self.add_newline()
+            self.listing_link_depth += 1
+            self.product_title_parts = []
         if tag in {"br", "hr"} or tag in self.BLOCK_TAGS:
             self.add_newline()
         elif tag in {"td", "th"}:
@@ -210,6 +268,12 @@ class HTMLTextExtractor(HTMLParser):
             return
         if self.skip_depth:
             return
+        if tag == "a" and self.listing_link_depth:
+            self.add_newline()
+            title = " ".join("".join(self.product_title_parts).split()).strip()
+            if title:
+                self.product_titles.append(title)
+            self.listing_link_depth -= 1
         if tag == "tr" or tag in self.BLOCK_TAGS:
             self.add_newline()
         elif tag in {"td", "th"}:
@@ -218,6 +282,8 @@ class HTMLTextExtractor(HTMLParser):
     def handle_data(self, data):
         if not self.skip_depth:
             self.parts.append(data)
+            if self.listing_link_depth:
+                self.product_title_parts.append(data)
 
     def get_text(self):
         text = "".join(self.parts)
@@ -231,12 +297,31 @@ class HTMLTextExtractor(HTMLParser):
                 lines.append(line)
         return "\n".join(lines).strip()
 
+    def get_product_title(self):
+        if self.product_titles:
+            return self.product_titles[0]
+        return " ".join("".join(self.product_title_parts).split()).strip()
+
+
+class ExtractedMailBody(str):
+    """Plain email text carrying fields captured before HTML flattening."""
+
+    def __new__(cls, value, product_title="", product_titles=None):
+        instance = super().__new__(cls, value)
+        instance.product_title = str(product_title or "").strip()
+        instance.product_titles = list(product_titles or ([] if not product_title else [product_title]))
+        return instance
+
 
 def html_to_text(html_content):
     parser = HTMLTextExtractor()
     parser.feed(html_content)
     parser.close()
-    return parser.get_text()
+    return ExtractedMailBody(
+        parser.get_text(),
+        product_title=parser.get_product_title(),
+        product_titles=parser.product_titles,
+    )
 
 
 def decode_header_value(value):
@@ -308,7 +393,27 @@ def prepare_body_lines(body):
         line = raw_line.replace("\xa0", " ")
         line = re.sub(r"[ \t]+", " ", line).strip()
         if line:
-            lines.append(line)
+            if isinstance(body, ExtractedMailBody):
+                # HTML extraction already preserved the listing link and each
+                # option node as separate lines. Do not infer boundaries from
+                # option-label allowlists on this structured path.
+                lines.append(line)
+                continue
+            inline_matches = list(KNOWN_PRODUCT_OPTION_INLINE_PATTERN.finditer(line))
+            if len(inline_matches) >= 2:
+                prefix = line[: inline_matches[0].start()].strip()
+                if prefix:
+                    lines.append(prefix)
+                for index, match in enumerate(inline_matches):
+                    value_end = (
+                        inline_matches[index + 1].start()
+                        if index + 1 < len(inline_matches)
+                        else len(line)
+                    )
+                    value = line[match.end() : value_end].strip()
+                    lines.append(f"{match.group('label').strip()}: {value}".rstrip())
+            else:
+                lines.append(line)
     return lines
 
 
@@ -329,6 +434,10 @@ def split_product_option_line(line):
     return canonical_product_option_label(label), match.group("value").strip()
 
 
+def is_known_product_option_line(line):
+    return KNOWN_PRODUCT_OPTION_LABEL_PATTERN.match(str(line or "")) is not None
+
+
 def find_product_option_span(lines):
     shop_index = find_line_index(lines, r"^(?:Shop|Store)\s*:")
     if shop_index < 0:
@@ -337,21 +446,52 @@ def find_product_option_span(lines):
     for index in range(shop_index):
         if PRODUCT_BLOCK_BOUNDARY_PATTERN.search(lines[index]):
             search_start = index + 1
+    generic_candidate = None
     for index in range(search_start, shop_index):
-        if split_product_option_line(lines[index]) is not None:
+        if split_product_option_line(lines[index]) is None:
+            continue
+        if is_known_product_option_line(lines[index]):
             return index, shop_index
+        if generic_candidate is None:
+            generic_candidate = index
+    # Preserve support for listing-specific option labels when the email does
+    # not contain one of the stable Etsy option labels above.
+    if generic_candidate is not None:
+        return generic_candidate, shop_index
     return -1, shop_index
 
 
-def extract_product_options_from_lines(lines):
-    start_index, end_index = find_product_option_span(lines)
-    if start_index < 0 or end_index < 0:
+def extract_product_options_from_lines(lines, product_title=""):
+    end_index = find_line_index(lines, r"^(?:Shop|Store)\s*:")
+    if end_index < 0:
         return {}
+    # Product fields are delimited by the listing title and the structural
+    # shop/transaction metadata, never by a product-field allowlist. This
+    # keeps arbitrary Etsy option labels intact.
+    start_index = 0
+    title = str(product_title or "").strip()
+    if not title:
+        for line in lines[:end_index]:
+            if line.strip() and not re.match(r"^(?:Shop|Store|Transaction ID|Quantity|Qty|Price|Item price)\s*:", line, re.IGNORECASE):
+                title = line.strip()
+                break
+    for index, line in enumerate(lines[:end_index]):
+        if title and line.strip() == title:
+            start_index = index + 1
+            break
     values = {}
     current_field = None
     for line in lines[start_index:end_index]:
+        if re.match(r"^(?:Transaction ID|Quantity|Qty|Price|Item price)\s*:", line, re.IGNORECASE):
+            break
+        continuation = re.match(r"^Line\s+\d+\s*:\s*(.*)$", line, re.IGNORECASE)
+        if continuation and current_field and "personalization" in current_field.casefold():
+            values[current_field].append(continuation.group(1).strip())
+            continue
         labeled = split_product_option_line(line)
         if labeled is not None:
+            if labeled[0].casefold() in RESERVED_PRODUCT_OPTION_LABELS:
+                continue
             current_field, value = labeled
             values.setdefault(current_field, [])
             if value:
@@ -1012,27 +1152,49 @@ def extract_order_number(subject, body):
     )
 
 
-def extract_order_date(body, email_date):
-    value = find_first_value(
-        body,
-        [
-            r"^\s*Order date\s*:\s*([^\r\n]+)",
-            r"^\s*Date ordered\s*:\s*([^\r\n]+)",
-            r"^\s*Ordered on\s*:?\s*([^\r\n]+)",
-            r"^\s*Purchase date\s*:\s*([^\r\n]+)",
-            r"^\s*Sale date\s*:\s*([^\r\n]+)",
-            r"^\s*订单日期\s*[:：]\s*([^\r\n]+)",
-        ],
-    )
-    raw_date = value or email_date or ""
+def extract_email_sent_at(email_date):
+    """Normalize the RFC 5322 Date header without consulting email content."""
+    raw_date = str(email_date or "").strip()
     if not raw_date:
         return ""
-
     try:
         parsed = parsedate_to_datetime(raw_date)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if ZoneInfo is not None:
+            try:
+                parsed = parsed.astimezone(ZoneInfo("America/Vancouver"))
+            except Exception:
+                parsed = _to_vancouver_time(parsed)
+        else:
+            parsed = _to_vancouver_time(parsed)
         return parsed.strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError, OverflowError):
         return raw_date
+
+
+def _to_vancouver_time(value):
+    """Convert aware UTC time to Vancouver time when tzdata is unavailable."""
+    utc_value = value.astimezone(timezone.utc)
+    year = utc_value.year
+    # North American Pacific DST: second Sunday in March through first Sunday
+    # in November. Boundaries are 10:00 UTC and 09:00 UTC respectively.
+    march_first = datetime(year, 3, 1, tzinfo=timezone.utc)
+    dst_start = march_first + timedelta(days=(6 - march_first.weekday()) % 7 + 7, hours=10)
+    november_first = datetime(year, 11, 1, tzinfo=timezone.utc)
+    dst_end = november_first + timedelta(days=(6 - november_first.weekday()) % 7, hours=9)
+    offset = timedelta(hours=-7 if dst_start <= utc_value < dst_end else -8)
+    return (utc_value + offset).replace(tzinfo=timezone(offset))
+
+
+def extract_customer_and_country(shipping_address):
+    """Read the buyer name and country from the normalized address block."""
+    lines = [line.strip() for line in str(shipping_address or "").splitlines() if line.strip()]
+    if lines and re.fullmatch(r"Shipping address\s*:?", lines[0], re.IGNORECASE):
+        lines = lines[1:]
+    if not lines:
+        return "", ""
+    return lines[0], lines[-1]
 
 
 def extract_product_name(body):
@@ -1324,14 +1486,16 @@ def extract_mail_order_identity(body):
     """Extract only the fields needed to decide whether an order is supported."""
     lines = prepare_body_lines(body)
     product_section = extract_product_section(lines)
-    product_name = next(
-        (
-            line.strip()
-            for line in product_section.splitlines()
-            if line.strip()
-        ),
-        "",
-    )
+    product_name = str(getattr(body, "product_title", "") or "").strip()
+    if not product_name:
+        product_name = next(
+            (
+                line.strip()
+                for line in product_section.splitlines()
+                if line.strip()
+            ),
+            "",
+        )
     if not product_name:
         product_name = extract_product_name(body)
     return {
@@ -1408,6 +1572,62 @@ def extract_price_section(lines):
     return "\n".join(section).strip()
 
 
+def extract_order_totals(lines):
+    """Extract the shared Etsy order-total breakdown as a JSON-safe object."""
+    start = find_line_index(lines, r"^Order total\s*:?[\s]*$")
+    if start < 0:
+        start = find_line_index(lines, r"^Item total\s*:")
+    if start < 0:
+        start = find_line_index(lines, r"^Subtotal\s*:")
+    if start < 0:
+        return {}
+    labels = {
+        "item total": "item_total",
+        "discount": "discount",
+        "subtotal": "subtotal",
+        "shipping": "shipping",
+        "sales tax": "sales_tax",
+        "tax total": "tax_total",
+        "tax": "tax_total",
+        "qc gst": "qc_gst",
+        "gst/hst": "gst_hst",
+        "order total": "order_total",
+    }
+    label_pattern = re.compile(
+        r"^(Item total|Discount|Subtotal|Shipping|Sales tax|Tax total|Tax|"
+        r"QC GST|GST/HST|Order total)\s*:?\s*(.*)$",
+        re.IGNORECASE,
+    )
+    stop_pattern = re.compile(
+        r"^(?:Contacting the buyer|Questions|Shop policies|Transaction ID)\b",
+        re.IGNORECASE,
+    )
+    result = {}
+    pending = None
+    for line in lines[start:start + 40]:
+        if stop_pattern.search(line) and result:
+            break
+        match = label_pattern.match(line)
+        if match:
+            key = labels[match.group(1).casefold()]
+            value = match.group(2).strip()
+            if value:
+                result[key] = value
+                pending = None
+            else:
+                pending = key
+            continue
+        if pending and line.strip():
+            result[pending] = line.strip()
+            pending = None
+            continue
+        if line.casefold().startswith("the buyer applied these discounts"):
+            note = line.split(":", 1)[1].strip() if ":" in line else ""
+            if note:
+                result["discount_note"] = note
+    return result
+
+
 def extract_grouped_order_fields(body):
     lines = prepare_body_lines(body)
     payment_method = extract_payment_method_section(lines)
@@ -1420,6 +1640,7 @@ def extract_grouped_order_fields(body):
         "商品信息": extract_product_options_from_lines(lines),
         "个人定制信息": extract_personalization_section(product_section),
         "订单价格": extract_price_section(lines),
+        "订单总计": extract_order_totals(lines),
     }
 
 
@@ -1444,17 +1665,19 @@ def parse_order_fields(
 
     lines = prepare_body_lines(body)
     product_section = extract_product_section(lines)
-    product_name = next(
-        (
-            line.strip()
-            for line in product_section.splitlines()
-            if line.strip()
-        ),
-        "",
-    )
+    product_name = str(getattr(body, "product_title", "") or "").strip()
+    if not product_name:
+        product_name = next(
+            (
+                line.strip()
+                for line in product_section.splitlines()
+                if line.strip()
+            ),
+            "",
+        )
     if not product_name:
         product_name = extract_product_name(body)
-    product_information = extract_product_options_from_lines(lines)
+    product_information = extract_product_options_from_lines(lines, product_name)
     payment_method = remove_section_heading(
         extract_payment_method_section(lines),
         "Payment method",
@@ -1475,6 +1698,146 @@ def parse_order_fields(
         "交易编号": extract_transaction_id(body),
         "数量": extract_quantity(body),
         "价格": extract_item_price(body),
+    }
+
+
+def _item_title_from_lines(lines, product_title=""):
+    """Best-effort title extraction for one Etsy transaction block."""
+    if product_title:
+        return str(product_title).strip()
+    for line in lines:
+        value = line.strip()
+        if not value or re.match(r"^(?:Shop|Store|Transaction ID|Quantity|Qty|Price|Item price)\s*:", value, re.IGNORECASE):
+            continue
+        if PRODUCT_BLOCK_BOUNDARY_PATTERN.search(value):
+            continue
+        return value
+    return ""
+
+
+def parse_mail_order_items(subject, body, email_date="", metadata=None, uid=None):
+    """Parse one Etsy message into a shared order group and transaction items.
+
+    Etsy can put several transaction blocks in one sale email.  Each block is
+    intentionally parsed independently so product options and downstream
+    template/image processing cannot leak between items.
+    """
+    lines = prepare_body_lines(body)
+    transaction_indexes = [
+        index for index, line in enumerate(lines)
+        if re.match(r"^Transaction ID\s*:", line, re.IGNORECASE)
+    ]
+    # Some listing emails omit transaction IDs. Preserve the historical
+    # single-item parser in that case.
+    if len(transaction_indexes) <= 1:
+        raw_shipping = remove_section_heading(
+            extract_shipping_address_section(lines), "Shipping address"
+        )
+        customer_name, country = extract_customer_and_country(raw_shipping)
+        item = parse_order_fields(subject, body, email_date, metadata, uid)
+        return {
+            "group": {
+                "订单号": extract_order_number(subject, body),
+                "店铺": extract_shop(body),
+                "店铺名": extract_shop_name(body),
+                "付款方式": remove_section_heading(extract_payment_method_section(lines), "Payment method"),
+                "邮寄地址": " ".join(raw_shipping.splitlines()),
+                "email_sent_at": extract_email_sent_at(email_date),
+                "客户姓名": customer_name,
+                "国家": country,
+                "产品数量": int(item.get("数量") or 0),
+                "订单数量": 1,
+                "订单总计": extract_order_totals(lines),
+            },
+            "items": [item],
+        }
+
+    titles = list(getattr(body, "product_titles", ()) or ())
+    items = []
+    # A transaction terminates at its own item price (or before the next
+    # transaction). Start each block after the previous transaction's price.
+    starts = [0]
+    for previous_index in transaction_indexes[:-1]:
+        end = previous_index + 1
+        while end < len(lines) and not re.match(r"^(?:Item price|Price)\s*:", lines[end], re.IGNORECASE):
+            end += 1
+        starts.append(end + 1 if end < len(lines) else previous_index + 1)
+    for item_index, transaction_index in enumerate(transaction_indexes):
+        start = starts[item_index]
+        end = transaction_indexes[item_index + 1] if item_index + 1 < len(transaction_indexes) else len(lines)
+        block = lines[start:end]
+        transaction_line = lines[transaction_index]
+        transaction_id = find_first_value(transaction_line, [r"^Transaction ID\s*:\s*([A-Za-z0-9-]+)"])
+        title = titles[item_index] if item_index < len(titles) else _item_title_from_lines(block)
+        # Parse every labeled option after this item's title.  Listing-specific
+        # labels such as "Cover Personalization" and "Album Color" are not in
+        # a fixed allowlist, so the transaction boundary is the authority.
+        info_values = {}
+        current_field = None
+        title_seen = not title
+        for line in block:
+            if title and line.strip() == title.strip():
+                title_seen = True
+                continue
+            if not title_seen:
+                continue
+            if re.match(r"^(?:Shop|Store|Transaction ID|Quantity|Qty|Price|Item price)\s*:", line, re.IGNORECASE):
+                if re.match(r"^(?:Shop|Store|Transaction ID)\s*:", line, re.IGNORECASE):
+                    break
+                continue
+            continuation = re.match(r"^Line\s+\d+\s*:\s*(.*)$", line, re.IGNORECASE)
+            if continuation and current_field and "personalization" in current_field.casefold():
+                info_values[current_field].append(continuation.group(1).strip())
+                continue
+            labeled = split_product_option_line(line)
+            if labeled is not None:
+                current_field, value = labeled
+                info_values.setdefault(current_field, [])
+                if value:
+                    info_values[current_field].append(value)
+            elif current_field and line.strip():
+                info_values[current_field].append(line.strip())
+        info = {field: " ".join(values).strip() for field, values in info_values.items()}
+        item = {
+            "订单号": extract_order_number(subject, body),
+            "店铺": extract_shop(body),
+            "店铺名": extract_shop_name(body),
+            "产品": title or extract_product_name(body),
+            "商品信息": info,
+            "付款方式": "",
+            "邮寄地址": "",
+            "交易编号": transaction_id,
+            "数量": extract_quantity("\n".join(block)),
+            "价格": extract_item_price("\n".join(block)),
+        }
+        items.append(item)
+
+    first = items[0]
+    shared_payment = remove_section_heading(extract_payment_method_section(lines), "Payment method")
+    raw_shipping = remove_section_heading(
+        extract_shipping_address_section(lines), "Shipping address"
+    )
+    shared_shipping = " ".join(raw_shipping.splitlines())
+    customer_name, country = extract_customer_and_country(raw_shipping)
+    for item in items:
+        item["付款方式"] = shared_payment
+        item["邮寄地址"] = shared_shipping
+    group_totals = extract_order_totals(lines)
+    return {
+        "group": {
+            "订单号": extract_order_number(subject, body),
+            "店铺": first.get("店铺", ""),
+            "店铺名": first.get("店铺名", ""),
+            "付款方式": shared_payment,
+            "邮寄地址": shared_shipping,
+            "email_sent_at": extract_email_sent_at(email_date),
+            "客户姓名": customer_name,
+            "国家": country,
+            "产品数量": sum(int(item.get("数量") or 0) for item in items),
+            "订单数量": 1,
+            "订单总计": group_totals,
+        },
+        "items": items,
     }
 
 
@@ -1577,47 +1940,64 @@ def process_new_messages(
             }
 
             identity = extract_mail_order_identity(body)
-            if shop_lookup is not None and not shop_lookup(
-                identity["original_shop"],
-                identity["shop_name"],
-            ):
-                raise ShopNotFoundError(
-                    "系统没有此店铺："
-                    f"{identity['original_shop'] or identity['shop_name'] or '空店铺名'}"
+            if shop_lookup is not None:
+                matched_shop = shop_lookup(
+                    identity["original_shop"],
+                    identity["shop_name"],
                 )
-            if product_lookup is not None and not product_lookup(
-                identity["shop"],
-                identity["shop_name"],
-                identity["product"],
-            ):
-                raise ProductNotFoundError(
-                    "店铺商品列表中没有匹配商品："
-                    f"店铺={identity['shop'] or identity['shop_name'] or '空'}，"
-                    f"商品={identity['product'] or '空'}"
+                if not matched_shop:
+                    raise ShopNotFoundError(
+                        "系统没有此店铺："
+                        f"{identity['original_shop'] or identity['shop_name'] or '空店铺名'}"
+                    )
+                if isinstance(matched_shop, dict):
+                    matched_shop_text = (
+                        matched_shop.get("shop")
+                        or matched_shop.get("shop_name")
+                        or identity["original_shop"]
+                    )
+                    matched_shop_id = matched_shop.get("id") or matched_shop.get("shop_id")
+                else:
+                    matched_shop_text = identity["original_shop"] or identity["shop_name"]
+                    matched_shop_id = None
+                print(
+                    "[邮件分类] 店铺匹配成功："
+                    f"原始店铺={identity['original_shop'] or '空'}，"
+                    f"匹配店铺={matched_shop_text or '空'}，"
+                    f"店铺ID={matched_shop_id or '未知'}",
+                    flush=True,
                 )
 
-            order_data = parse_order_fields(
+            parsed = parse_mail_order_items(
                 subject=subject,
                 body=body,
                 email_date=message.get("Date", ""),
                 metadata=metadata,
                 uid=uid,
-                # Shop and product were checked before full order parsing.
-                shop_lookup=None,
             )
-
-            print("\n解析后的订单字段：", flush=True)
-            print(json.dumps(order_data, ensure_ascii=False, indent=2), flush=True)
-            dispatch_order(
-                order_handler,
-                order_data,
-                uid=uid,
-                metadata=metadata,
-            )
+            items = parsed.get("items") or []
+            for item_index, order_data in enumerate(items, start=1):
+                if product_lookup is not None:
+                    product_match = product_lookup(
+                        order_data["店铺"], order_data["店铺名"],
+                        order_data["产品"], order_data["商品信息"],
+                    )
+                    if not product_match:
+                        print(
+                            "[邮件分类] 商品未自动关联产品，不影响订单入库，后续等待人工关联："
+                            f"店铺={order_data['店铺'] or order_data['店铺名'] or '空'}，"
+                            f"商品={order_data['产品'] or '空'}",
+                            flush=True,
+                        )
+                item_metadata = {**metadata, "order_group": parsed.get("group", {}),
+                                 "item_index": item_index, "item_count": len(items)}
+                print(f"\n解析后的订单字段（商品 {item_index}/{len(items)}）：", flush=True)
+                print(json.dumps(order_data, ensure_ascii=False, indent=2), flush=True)
+                dispatch_order(order_handler, order_data, uid=uid, metadata=item_metadata)
 
             last_uid = uid
             save_last_uid(last_uid)
-            order_number = order_data.get("订单号") or "未识别"
+            order_number = parsed.get("group", {}).get("订单号") or "未识别"
             print(
                 f"处理完成：UID={uid}，订单号={order_number}\n",
                 flush=True,

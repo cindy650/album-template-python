@@ -176,11 +176,6 @@ class Settings:
     template_image_retry_delay_seconds = float(
         os.getenv("TEMPLATE_IMAGE_RETRY_DELAY_SECONDS", "5")
     )
-    wecom_robot_webhook_url = os.getenv(
-        "WECOM_ROBOT_WEBHOOK_URL",
-        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key="
-        "0ec1dd8c-8714-4855-8a94-83b001a6fded",
-    ).strip()
     wecom_robot_timeout_seconds = float(
         os.getenv("WECOM_ROBOT_TIMEOUT_SECONDS", "10")
     )

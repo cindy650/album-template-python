@@ -116,15 +116,24 @@ class ImageMapRendererSession:
         jpg_path: Path | None = None,
         png_path: Path | None = None,
         svg_path: Path | None = None,
+        text_to_svg_path: Path | None = None,
         include_svg: bool = False,
+        include_text_to_svg: bool = False,
         dpi: float = 300,
         quality: float = 0.95,
         background_color: str | None = None,
+        safe_distances: dict[str, Any] | None = None,
         base_directory: Path | None = None,
     ) -> dict[str, Any]:
-        if not jpg_path and not png_path and not svg_path and not include_svg:
+        if not jpg_path and not png_path and not svg_path and not text_to_svg_path and not include_svg and not include_text_to_svg:
             raise ValueError("至少需要 jpg_path、png_path 或 svg_path")
         document = deepcopy(document)
+        # Preserve authored font URLs for SVG before embedding replaces them
+        # with data URLs used by Chromium for deterministic rendering.
+        font_sources = collect_font_sources(
+            document,
+            (base_directory or Path.cwd()).resolve(),
+        )
         embed_resources(
             document,
             (base_directory or Path.cwd()).resolve(),
@@ -136,6 +145,7 @@ class ImageMapRendererSession:
                 ("jpg", jpg_path),
                 ("png", png_path),
                 ("svg", svg_path or include_svg),
+                ("text-to-svg", text_to_svg_path or include_text_to_svg),
             )
             if path_value
         ]
@@ -144,7 +154,9 @@ class ImageMapRendererSession:
             "dpi": dpi,
             "quality": quality,
             "backgroundColor": background_color,
+            "safeDistances": safe_distances,
             "formats": formats,
+            "fontSources": font_sources,
         }
         if self.render_count >= self.recycle_after:
             self._close_browser()
@@ -165,6 +177,7 @@ class ImageMapRendererSession:
                         f"Chromium 渲染失败，已重试 {self.render_retry_attempts} 次：{exc}"
                     ) from exc
         self.render_count += 1
+        images = result.get("images") or {}
         for font_status in result.get("fontStatus") or []:
             if not isinstance(font_status, dict):
                 continue
@@ -180,11 +193,23 @@ class ImageMapRendererSession:
                 )
         for format_name, output_path in (("jpg", jpg_path), ("png", png_path)):
             if output_path:
-                write_data_url(Path(output_path), result["images"][format_name])
+                write_data_url(Path(output_path), images[format_name])
+        svg_content = result.get("svg") or images.get("svg") or ""
+        text_to_svg_content = result.get("textToSvg") or images.get("textToSvg") or ""
         if svg_path:
             svg_path = Path(svg_path)
             svg_path.parent.mkdir(parents=True, exist_ok=True)
-            svg_path.write_text(result["svg"], encoding="utf-8")
+            svg_path.write_text(svg_content, encoding="utf-8")
+        if text_to_svg_path:
+            text_to_svg_path = Path(text_to_svg_path)
+            text_to_svg_path.parent.mkdir(parents=True, exist_ok=True)
+            text_to_svg_path.write_text(text_to_svg_content, encoding="utf-8")
+        # The frontend renderer renamed resolvedJson to json and moved SVG
+        # payloads under images. Keep the server adapter's stable aliases so
+        # the order renderer and artifact exporter can consume either version.
+        result["resolvedJson"] = result.get("resolvedJson", result.get("json"))
+        result["svg"] = svg_content
+        result["textToSvg"] = text_to_svg_content
         return {key: value for key, value in result.items() if key != "images"}
 
     def close(self) -> None:
@@ -235,6 +260,8 @@ def render_json(
     input_path: Path,
     jpg_path: Path | None,
     png_path: Path | None,
+    text_to_svg_path: Path | None = None,
+    output_json_path: Path | None = None,
     dpi: float = 300,
     quality: float = 0.95,
     background_color: str | None = None,
@@ -251,18 +278,86 @@ def render_json(
         recycle_after=1,
     )
     try:
-        return session.render_document(
+        result = session.render_document(
             document,
             jpg_path=jpg_path,
             png_path=png_path,
             svg_path=svg_path,
+            text_to_svg_path=text_to_svg_path,
             dpi=dpi,
             quality=quality,
             background_color=background_color,
             base_directory=base_directory or input_path.parent,
+            include_svg=bool(
+                output_json_path
+                and not any((jpg_path, png_path, svg_path, text_to_svg_path))
+            ),
         )
+        apply_rendered_font_sizes(
+            document,
+            result.get("resolvedJson") or result.get("json"),
+        )
+        if output_json_path:
+            output_json_path = Path(output_json_path)
+            output_json_path.parent.mkdir(parents=True, exist_ok=True)
+            output_json_path.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return result
     finally:
         session.close()
+
+
+def apply_rendered_font_sizes(document: Any, rendered_document: Any) -> None:
+    """Copy final font sizes without persisting embedded resource data URLs."""
+    apply_object_font_sizes(
+        extract_objects(document),
+        extract_objects(rendered_document),
+    )
+
+
+def extract_objects(document: Any) -> list[Any]:
+    if isinstance(document, list):
+        return document
+    if not isinstance(document, dict):
+        return []
+    if isinstance(document.get("objects"), list):
+        return document["objects"]
+    layers = document.get("layers")
+    if isinstance(layers, dict) and isinstance(layers.get("objects"), list):
+        return layers["objects"]
+    return []
+
+
+def apply_object_font_sizes(
+    original_objects: list[Any],
+    rendered_objects: list[Any],
+) -> None:
+    rendered_by_id = {
+        item.get("id"): item
+        for item in rendered_objects
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    for index, original in enumerate(original_objects):
+        if not isinstance(original, dict):
+            continue
+        rendered = rendered_by_id.get(original.get("id"))
+        if rendered is None and index < len(rendered_objects):
+            candidate = rendered_objects[index]
+            rendered = candidate if isinstance(candidate, dict) else None
+        if not rendered:
+            continue
+        if "fontSize" in rendered:
+            original["fontSize"] = rendered["fontSize"]
+        apply_object_font_sizes(
+            original.get("objects")
+            if isinstance(original.get("objects"), list)
+            else [],
+            rendered.get("objects")
+            if isinstance(rendered.get("objects"), list)
+            else [],
+        )
 
 
 def launch_browser(playwright, *, browser_executable: str = "", no_sandbox: bool = False):
@@ -310,7 +405,7 @@ def embed_resources(
     for item in objects:
         if not isinstance(item, dict):
             continue
-        for key in ("src", "fontUrl", "font_url"):
+        for key in ("src",):
             value = item.get(key)
             if not isinstance(value, str) or not value or value.startswith(("data:", "blob:")):
                 continue
@@ -338,12 +433,76 @@ def embed_resources(
                         flush=True,
                     )
             item[key] = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+        # Keep fontUrl/font_url as the authored external reference. The
+        # browser renderer loads the embedded copy through fontDataUrl.
+        font_key = "fontDataUrl" if item.get("fontDataUrl") else (
+            "font_url" if item.get("font_url") else "fontUrl"
+        )
+        font_value = item.get(font_key)
+        if isinstance(font_value, str) and font_value and not font_value.startswith(("data:", "blob:")):
+            if font_value.startswith(("http:", "https:")):
+                content, mime = resource_loader.load(
+                    font_value,
+                    resource_kind="字体",
+                    label=str(item.get("fontFamily") or item.get("font_family") or "").strip(),
+                )
+            else:
+                resource = Path(font_value.removeprefix("file://"))
+                if not resource.is_absolute():
+                    resource = base_directory / resource
+                resource = resource.resolve()
+                content = resource.read_bytes()
+                mime = mimetypes.guess_type(resource.name)[0] or "application/octet-stream"
+            item["fontDataUrl"] = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
         if isinstance(item.get("objects"), list):
             embed_resources(
                 item["objects"],
                 base_directory,
                 resource_loader=resource_loader,
             )
+
+
+def collect_font_sources(document: Any, base_directory: Path) -> list[dict[str, str]]:
+    """Collect external font URLs before embed_resources mutates the JSON."""
+    sources: dict[tuple[str, str, str, str], dict[str, str]] = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        family = str(value.get("fontFamily") or value.get("font_family") or "").strip()
+        source = str(
+            value.get("fontExternalUrl")
+            or value.get("font_external_url")
+            or value.get("fontUrl")
+            or value.get("font_url")
+            or ""
+        ).strip()
+        if family and source and not source.startswith(("data:", "blob:")):
+            if source.startswith(("http://", "https://", "file://")):
+                url = source
+            else:
+                path = Path(source)
+                if not path.is_absolute():
+                    path = base_directory / path
+                url = path.resolve().as_uri()
+            weight = str(value.get("fontWeight") or value.get("font_weight") or "normal")
+            style = str(value.get("fontStyle") or value.get("font_style") or "normal")
+            sources[(family, url, weight, style)] = {
+                "family": family,
+                "url": url,
+                "weight": weight,
+                "style": style,
+            }
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                visit(child)
+
+    visit(document)
+    return list(sources.values())
 
 
 def write_data_url(output_path: Path, data_url: str) -> None:
@@ -359,6 +518,12 @@ def main() -> None:
     parser.add_argument("--jpg", type=Path)
     parser.add_argument("--png", type=Path)
     parser.add_argument("--svg", type=Path)
+    parser.add_argument("--text-to-svg", type=Path)
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Write JSON with fitted text fontSize values",
+    )
     parser.add_argument("--dpi", type=float, default=300)
     parser.add_argument("--quality", type=float, default=0.95)
     parser.add_argument("--background")
@@ -370,10 +535,19 @@ def main() -> None:
     jpg_path = args.jpg.resolve() if args.jpg else None
     png_path = args.png.resolve() if args.png else None
     svg_path = args.svg.resolve() if args.svg else None
-    if jpg_path is None and png_path is None and svg_path is None:
+    text_to_svg_path = args.text_to_svg.resolve() if args.text_to_svg else None
+    output_json_path = args.output_json.resolve() if args.output_json else None
+    if (
+        jpg_path is None
+        and png_path is None
+        and svg_path is None
+        and text_to_svg_path is None
+        and output_json_path is None
+    ):
         jpg_path = input_path.with_suffix(".jpg")
         png_path = input_path.with_suffix(".png")
         svg_path = input_path.with_suffix(".svg")
+        text_to_svg_path = input_path.with_suffix(".转曲.svg")
     elif jpg_path is not None and svg_path is None:
         svg_path = jpg_path.with_suffix(".svg")
     result = render_json(
@@ -387,8 +561,14 @@ def main() -> None:
         no_sandbox=args.no_sandbox,
         base_directory=args.base_dir,
         svg_path=svg_path,
+        text_to_svg_path=text_to_svg_path,
+        output_json_path=output_json_path,
     )
-    printable = {key: value for key, value in result.items() if key != "svg"}
+    printable = {
+        key: value
+        for key, value in result.items()
+        if key not in {"json", "resolvedJson", "svg", "textToSvg"}
+    }
     if result.get("svg"):
         printable["svgBytes"] = len(result["svg"].encode("utf-8"))
     print(json.dumps(printable, ensure_ascii=False, indent=2))

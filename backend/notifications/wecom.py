@@ -75,6 +75,56 @@ class WeComRobotNotifier:
             "responses": responses,
         }
 
+    def notify_automation_exception(
+        self,
+        title: str,
+        product_information: dict[str, Any],
+    ):
+        """Send an operator-facing automation exception as markdown."""
+        if not self.webhook_url:
+            return {"ok": False, "status": "disabled"}
+        title = str(title or "自动化异常需人工处理").strip()
+        information = product_information if isinstance(product_information, dict) else {}
+        lines = [
+            f"> **{str(key or '').strip()}**：{str(value or '').strip()}"
+            for key, value in information.items()
+            if str(key or "").strip()
+        ]
+        content = "\n".join(
+            [
+                f"### {title}",
+                "**商品信息**",
+                *(lines or ["> 无商品信息"]),
+            ]
+        )
+        # WeCom group robot markdown content is limited to 4096 bytes.
+        content = self._truncate_utf8(content, 4096)
+        response = self._post(
+            {"msgtype": "markdown", "markdown": {"content": content}},
+            message_type="自动化异常",
+        )
+        return {
+            "ok": True,
+            "status": "sent",
+            "message_type": "markdown",
+            "response": response,
+        }
+
+    def notify_order_summary(self, content: str):
+        """Send the plain-text order summary before template processing."""
+        if not self.webhook_url:
+            return {"ok": False, "status": "disabled"}
+        response = self._post(
+            {"msgtype": "text", "text": {"content": str(content or "")}},
+            message_type="新订单摘要",
+        )
+        return {
+            "ok": True,
+            "status": "sent",
+            "message_type": "text",
+            "response": response,
+        }
+
     def _post(self, payload: dict[str, Any], message_type: str):
         try:
             response = self.session.post(
@@ -104,6 +154,15 @@ class WeComRobotNotifier:
                 f"企业微信 {message_type} 消息发送失败：{result!r}"
             )
         return result
+
+    @staticmethod
+    def _truncate_utf8(value: str, max_bytes: int) -> str:
+        encoded = str(value or "").encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return encoded.decode("utf-8")
+        suffix = "\n> 内容过长，已截断".encode("utf-8")
+        available = max(0, max_bytes - len(suffix))
+        return encoded[:available].decode("utf-8", errors="ignore") + suffix.decode("utf-8")
 
     @staticmethod
     def _image_bytes(image_result: dict[str, Any], label: str):

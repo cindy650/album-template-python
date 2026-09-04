@@ -7,6 +7,10 @@ from typing import Any
 
 
 
+class FontLayoutNotConfiguredError(RuntimeError):
+    """The matched size template has no active font layout to render."""
+
+
 class OrderTemplateResolver:
     """Resolve one order into the canonical template used by every renderer.
 
@@ -20,10 +24,33 @@ class OrderTemplateResolver:
         self.deepseek_resolver = deepseek_resolver
 
     @staticmethod
-    def restore_order_snapshot(saved_order: dict[str, Any] | None):
+    def restore_order_snapshot(
+        saved_order: dict[str, Any] | None,
+        current_template: dict[str, Any] | None = None,
+    ):
         snapshot = (saved_order or {}).get("matched_template")
         layers = (saved_order or {}).get("resolved_layers")
         if not isinstance(snapshot, dict) or not isinstance(layers, dict):
+            return None
+        saved_template_id = snapshot.get("template_id")
+        current_template_id = (current_template or {}).get("id")
+        associated_template_id = (saved_order or {}).get("size_template_id")
+        if (
+            associated_template_id not in (None, "")
+            and str(saved_template_id) != str(associated_template_id)
+        ) or (
+            current_template_id not in (None, "")
+            and str(saved_template_id) != str(current_template_id)
+        ):
+            print("[模板解析] 订单快照的尺寸模板已变化，已作废并重新解析", flush=True)
+            return None
+        current_layout_id = (current_template or {}).get("selected_font_layout_id")
+        saved_layout_id = layers.get("layout_id", layers.get("id"))
+        if current_template is not None and (
+            current_layout_id in (None, "")
+            or str(saved_layout_id) != str(current_layout_id)
+        ):
+            print("[模板解析] 尺寸模板当前字体布局已变化，订单快照已作废", flush=True)
             return None
         elements = OrderTemplateResolver._layout_objects(layers)
         if not elements:
@@ -179,16 +206,15 @@ class OrderTemplateResolver:
             or []
         )
         selected_size = (resolved.get("size_spec") or {}).get("selected")
-        layout = self.match_font_layout(layouts, information)
-        requires_deepseek = (
-            self.layout_requires_deepseek(layout, selected_size)
-            if layout is not None
-            else any(
-                self.layout_requires_deepseek(item, selected_size)
-                for item in layouts
-                if isinstance(item, dict)
-            )
+        layout = next(
+            (item for item in layouts if isinstance(item, dict)),
+            None,
         )
+        if layout is None:
+            raise FontLayoutNotConfiguredError(
+                "命中的尺寸模板未配置字体布局，已跳过订单图片"
+            )
+        requires_deepseek = self.layout_requires_deepseek(layout, selected_size)
         resolver = self.deepseek_resolver
         if requires_deepseek and (resolver is None or not resolver.enabled):
             raise RuntimeError(
@@ -203,36 +229,52 @@ class OrderTemplateResolver:
                     selected_size=selected_size,
                     selected_layout=layout,
                 )
-                if layout is None:
-                    layout = self.match_font_layout(
-                        layouts,
-                        {"Font Style & Lettering color": deepseek_result.get("font_layout_name")},
-                    )
-                if layout is None:
-                    raise RuntimeError("DeepSeek 未返回可用的字体布局")
                 returned_values = deepseek_result.get("text_values") or {}
                 rule_layout = self.font_layout_for_size_option(layout, selected_size)
-                required_ids = self.natural_rule_element_ids(rule_layout)
+                rule_ids = self.natural_rule_element_ids(rule_layout)
                 missing_ids = [
-                    element_id for element_id in required_ids
-                    if not str(returned_values.get(element_id) or "").strip()
+                    element_id for element_id in rule_ids
+                    if element_id not in returned_values
                 ]
-                if missing_ids:
+                empty_ids = [
+                    element_id for element_id in rule_ids
+                    if element_id in returned_values
+                    and not str(returned_values.get(element_id) or "").strip()
+                ]
+                allowed_empty_ids = {
+                    element_id
+                    for element_id in empty_ids
+                    if self.rule_allows_empty(rule_layout, element_id)
+                }
+                invalid_empty_ids = [
+                    element_id for element_id in empty_ids
+                    if element_id not in allowed_empty_ids
+                ]
+                if missing_ids or invalid_empty_ids:
+                    error_ids = missing_ids + invalid_empty_ids
                     raise RuntimeError(
-                        "DeepSeek 未返回全部自然语言图层文字：" + ", ".join(missing_ids)
+                        "DeepSeek 未返回全部自然语言图层文字：" + ", ".join(error_ids)
                     )
                 values = {
                     element_id: returned_values[element_id]
-                    for element_id in required_ids
+                    for element_id in rule_ids
+                    if element_id not in allowed_empty_ids
                 }
                 resolved["_deepseek_text_values"] = values
+                resolved["_empty_rule_element_ids"] = list(allowed_empty_ids)
+                if allowed_empty_ids:
+                    print(
+                        "[模板解析] 自然语言图层文字为空，已删除图层："
+                        + ", ".join(sorted(allowed_empty_ids)),
+                        flush=True,
+                    )
                 print(
                     f"[模板解析] DeepSeek 规则完成：布局={layout.get('name') or layout.get('id')}",
                     flush=True,
                 )
                 rule_text_summary = {
                     element_id: str(values[element_id])
-                    for element_id in required_ids
+                    for element_id in values
                 }
                 if rule_text_summary:
                     print(
@@ -251,21 +293,18 @@ class OrderTemplateResolver:
                     f"[模板解析] DeepSeek 非必需规则失败，继续本地渲染：{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-        if layout is not None:
-            layout = self.font_layout_for_size_option(layout, selected_size)
-            layout = self._replace_text_values(layout, resolved.get("_deepseek_text_values") or {})
-            resolved["_selected_font_layout"] = layout
-            print(
-                f"[模板解析] 字体布局匹配成功：订单号={order.get('order_number') or order.get('订单号') or ''}，"
-                f"布局={layout.get('name') or layout.get('id')}，图层来源={layout.get('layers_source')}",
-                flush=True,
-            )
-        else:
-            resolved.pop("_selected_font_layout", None)
-            print(
-                f"[模板解析] 未匹配字体布局：订单号={order.get('order_number') or order.get('订单号') or ''}",
-                flush=True,
-            )
+        layout = self.font_layout_for_size_option(layout, selected_size)
+        layout = self._remove_layout_elements(
+            layout,
+            resolved.get("_empty_rule_element_ids") or [],
+        )
+        layout = self._replace_text_values(layout, resolved.get("_deepseek_text_values") or {})
+        resolved["_selected_font_layout"] = layout
+        print(
+            f"[模板解析] 使用尺寸模板配置的字体布局：订单号={order.get('order_number') or order.get('订单号') or ''}，"
+            f"布局={layout.get('name') or layout.get('id')}，图层来源={layout.get('layers_source')}",
+            flush=True,
+        )
         resolved["_template_resolution"] = {
             "size_option": selected_size,
             "font_layout_id": (layout or {}).get("id"),
@@ -346,6 +385,103 @@ class OrderTemplateResolver:
             f"背脊范围={resolution['min_spine_width']:.6g}-{resolution['max_spine_width']:.6g}",
             flush=True,
         )
+
+    @staticmethod
+    def _remove_layout_elements(
+        layout: dict[str, Any],
+        element_ids: list[str] | set[str],
+    ) -> dict[str, Any]:
+        """Remove rule layers whose resolved text is intentionally empty."""
+        if not isinstance(layout, dict) or not element_ids:
+            return layout
+        ids = {
+            str(element_id).strip()
+            for element_id in element_ids
+            if str(element_id).strip()
+        }
+        if not ids:
+            return layout
+
+        def remove_from(collection):
+            if not isinstance(collection, list):
+                return collection
+            return [
+                element for element in collection
+                if not (
+                    isinstance(element, dict)
+                    and str(element.get("id") or element.get("name") or "").strip() in ids
+                )
+            ]
+
+        if isinstance(layout.get("objects"), list):
+            layout["objects"] = remove_from(layout["objects"])
+        if isinstance(layout.get("elements"), list):
+            layout["elements"] = remove_from(layout["elements"])
+        layers = layout.get("layers")
+        if isinstance(layers, dict) and isinstance(layers.get("objects"), list):
+            layers["objects"] = remove_from(layers["objects"])
+        return layout
+
+    @classmethod
+    def rule_allows_empty(cls, layout: dict[str, Any], element_id: str) -> bool:
+        """Return whether a rule explicitly permits clearing an unmatched value."""
+        for element in cls._layout_objects(layout):
+            if not isinstance(element, dict):
+                continue
+            current_id = str(element.get("id") or element.get("name") or "").strip()
+            if current_id != str(element_id).strip():
+                continue
+            rule = (
+                element.get("rule")
+                or (element.get("content") or {}).get("rule")
+                or element.get("rules")
+                or ""
+            )
+            if isinstance(rule, dict):
+                for key in ("allow_empty", "optional", "nullable", "clear_when_unmatched"):
+                    if rule.get(key) is True:
+                        return True
+                description = str(rule.get("description") or "")
+            else:
+                description = str(rule or "")
+            normalized = re.sub(r"\s+", "", description).casefold()
+            has_no_match_condition = any(
+                token in normalized
+                for token in (
+                    "没有匹配",
+                    "未匹配",
+                    "匹配不到",
+                    "匹配不上",
+                    "没有找到",
+                    "未找到",
+                    "找不到",
+                    "无匹配",
+                    "nomatch",
+                    "notfound",
+                    "missing",
+                    "unavailable",
+                )
+            ) or bool(
+                re.search(r"(?:没有|未|无).{0,24}(?:时|的话|则|就)", normalized)
+            )
+            has_clear_instruction = any(
+                token in normalized
+                for token in (
+                    "置空",
+                    "清空",
+                    "留空",
+                    "为空",
+                    "空白",
+                    "不填",
+                    "blank",
+                    "empty",
+                    "clear",
+                    "omit",
+                    "remove",
+                )
+            )
+            return has_no_match_condition and has_clear_instruction
+        return False
 
     @staticmethod
     def _replace_text_values(layout: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
@@ -508,35 +644,6 @@ class OrderTemplateResolver:
         return pairs
 
     @classmethod
-    def match_font_layout(cls, layouts: Any, information: dict[str, Any]):
-        if not isinstance(layouts, list):
-            return None
-        value = ""
-        for key, candidate in information.items():
-            normalized = re.sub(r"[^a-z0-9]+", "", str(key or "").casefold())
-            if normalized == "fontstyleletteringcolor" or ("font" in normalized and "lettering" in normalized):
-                value = str(candidate or "").strip()
-                break
-        if not value:
-            return None
-        wanted = cls._layout_name(value)
-        candidates = []
-        for layout in layouts:
-            if not isinstance(layout, dict):
-                continue
-            name = cls._layout_name(layout.get("name"))
-            if name and (name == wanted or name in wanted):
-                candidates.append((len(name), layout))
-        if candidates:
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            return candidates[0][1]
-        return None
-
-    @staticmethod
-    def _layout_name(value: Any) -> str:
-        return re.sub(r"\s+", "", str(value or "").strip().casefold())
-
-    @classmethod
     def font_layout_for_size_option(cls, layout: dict[str, Any], size_option: Any) -> dict[str, Any]:
         resolved = deepcopy(layout)
         layouts = resolved.pop("_size_option_layouts", {})
@@ -571,7 +678,9 @@ class OrderTemplateResolver:
         if isinstance(layers, dict):
             resolved["layers"] = deepcopy(layers)
         resolved["size_option"] = option_id
-        resolved["layers_source"] = "size_variant"
+        resolved["layers_source"] = option_layout.get(
+            "layers_source", "size_variant"
+        )
         resolved["using_base_layers"] = False
         options = dict(resolved.get("options") or {})
         options.pop("responsive_version", None)

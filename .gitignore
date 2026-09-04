@@ -6,6 +6,8 @@ image-map-headless-renderer/test-output/
 *.pyc
 generated_template_imports/
 generated_font_layout_previews/
+generated_fonts/
+logs/
 generated_order_print_images/
 generated_orders/
 generated_template_exports/

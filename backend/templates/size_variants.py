@@ -122,6 +122,19 @@ def build_size_form(
     requested_unit = str(size_unit or spec.get("display_unit") or "").lower()
     if requested_unit and requested_unit not in SIZE_UNITS:
         raise ValueError("size_unit 只能是 in、mm 或 cm")
+    # Empty options are valid for a newly created editable template. Defer
+    # per-option unit validation until the frontend adds a real option.
+    if option is None:
+        return {
+            "size_option": None,
+            "size_options": deepcopy(spec["options"]),
+            "size_unit": requested_unit or None,
+            "size_unit_options": list(SIZE_UNITS),
+            **{key: selected_values.get(key, 0) for key in SIZE_VALUE_FIELDS},
+            "page_count": fields.get("page_count"),
+            "page_count_arr": _page_count_arr(fields.get("page_count_arr")),
+            "status": "needs_values",
+        }
     unit = required_size_unit(selected_values.get("size_unit"))
     ready = _has_required_values(selected_values)
     return {
@@ -368,6 +381,11 @@ def _flatten_option(
         option["select"] = _boolean(raw.get("select"))
     elif not partial:
         option["select"] = False
+    if "layers" in raw:
+        if raw.get("layers") is not None and not isinstance(raw.get("layers"), dict):
+            raise ValueError("layers 必须是完整图层文档对象")
+        if raw.get("layers") is not None:
+            option["layers"] = deepcopy(raw["layers"])
 
     unit = next(
         (

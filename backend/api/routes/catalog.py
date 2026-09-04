@@ -8,8 +8,10 @@ import tempfile
 try:
     import pymysql
     MYSQL_INTEGRITY_ERROR = pymysql.IntegrityError
+    MYSQL_OPERATIONAL_ERROR = pymysql.OperationalError
 except ImportError:  # pragma: no cover - dependency error is reported at startup
     MYSQL_INTEGRITY_ERROR = ()
+    MYSQL_OPERATIONAL_ERROR = ()
 
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile, status
 from pydantic import BaseModel
@@ -116,13 +118,32 @@ async def repo_call(func: Callable[..., Any], *args):
             status_code=status.HTTP_409_CONFLICT,
             detail=f"数据唯一性或关联约束冲突：{exc}",
         ) from exc
+    except MYSQL_OPERATIONAL_ERROR as exc:
+        detail = str(exc)
+        if "1290" in detail or "LOCK_WRITE" in detail:
+            detail = (
+                "数据库当前处于只读锁定状态，暂时无法保存数据；"
+                "请在 RDS 控制台解除 LOCK_WRITE 后重试"
+            )
+        else:
+            detail = f"数据库暂时不可写，请稍后重试：{detail}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        ) from exc
 
 
 @router.get("/shops", include_in_schema=False)
 @router.get(
     "/shops/",
     summary="查询店铺列表",
-    description="分页查询店铺，可按店铺 ID 精确查询或按店铺标识、店铺名搜索。",
+    description=(
+        "分页查询店铺，可按店铺 ID 精确查询或按店铺标识、店铺名搜索。"
+        "返回 product_count、order_count、size_template_count、font_template_count，"
+        "以及按订单状态统计的 new_order_count(0 新订单)、confirmation_count(1 确认中)、"
+        "pending_production_count(2 待生产)、in_production_count(3 生产中)、"
+        "pending_shipment_count(4 待发货)、completed_order_count(5 已完成)。"
+    ),
 )
 async def list_shops(
     shop_id: int | None = Query(default=None, description="按店铺 ID 精确查询"),
@@ -144,7 +165,10 @@ async def list_shops(
     "/shops",
     status_code=status.HTTP_201_CREATED,
     summary="创建店铺",
-    description="创建一个店铺，可通过 products 商品名数组同时建立商品关联。",
+    description=(
+        "创建一个店铺，可通过 products 商品名数组同时建立商品关联，"
+        "并通过 wecom_robot_webhook_url 配置该店铺的企业微信机器人。"
+    ),
 )
 async def create_shop(payload: ShopCreate):
     result = await repo_call(catalog_repository.create_shop, payload_dict(payload))
@@ -154,7 +178,11 @@ async def create_shop(payload: ShopCreate):
 @router.get(
     "/shops/{shop_id}",
     summary="查询店铺详情",
-    description="根据店铺 ID 查询单个店铺的详细信息。",
+    description=(
+        "根据店铺 ID 查询单个店铺的详细信息，包含各订单状态数量字段："
+        "new_order_count、confirmation_count、pending_production_count、"
+        "in_production_count、pending_shipment_count、completed_order_count。"
+    ),
 )
 async def get_shop(shop_id: int = Path(description="店铺 ID")):
     result = await repo_call(catalog_repository.get_shop, shop_id)
@@ -249,7 +277,10 @@ async def upload_font(
 @router.patch(
     "/shops/{shop_id}",
     summary="更新店铺",
-    description="根据店铺 ID 更新店铺信息；传入 products 时会替换店铺的全部商品关联。",
+    description=(
+        "根据店铺 ID 更新店铺信息；传入 products 时会替换店铺的全部商品关联；"
+        "传入 wecom_robot_webhook_url 可设置或清除该店铺的企业微信机器人。"
+    ),
 )
 async def update_shop(
     payload: ShopUpdate,
@@ -276,7 +307,7 @@ async def delete_shop(shop_id: int = Path(description="店铺 ID")):
 @router.get(
     "/products",
     summary="查询产品分类",
-    description="按产品分类查询关联店铺、product_names 商品名和尺寸模板。",
+    description="按产品分类查询关联店铺、product_names 商品名、常用规格值和尺寸模板。",
 )
 async def list_products(
     limit: int = Query(default=50, ge=1, le=500, description="每页返回的产品分类数量"),
@@ -288,19 +319,19 @@ async def list_products(
     return api_success(result, message="产品分类查询成功")
 
 
-@router.post("/products", status_code=status.HTTP_201_CREATED, summary="创建产品分类", description="创建产品分类并关联 product_names 商品名及多个店铺。")
+@router.post("/products", status_code=status.HTTP_201_CREATED, summary="创建产品分类", description="创建产品分类并关联 product_names 商品名、用于邮件自动匹配的 specifications、常用规格值及多个店铺；可同时提交 cover_safe_distance、spine_safe_distance、back_cover_safe_distance 三组产品安全距离。")
 async def create_product(payload: ProductCreate):
     result = await repo_call(catalog_repository.create_product, payload_dict(payload))
     return api_success(result, message="产品分类创建成功", status_code=201)
 
 
-@router.get("/products/{product_id}", summary="查询产品分类详情", description="查询产品分类、关联店铺、商品名和尺寸模板。")
+@router.get("/products/{product_id}", summary="查询产品分类详情", description="查询产品分类、关联店铺、商品名、常用规格值和尺寸模板。")
 async def get_product(product_id: int = Path(description="产品分类 ID")):
     result = await repo_call(catalog_repository.get_product, product_id)
     return api_success(result, message="产品分类查询成功")
 
 
-@router.patch("/products/{product_id}", summary="更新产品分类及其关联", description="更新产品分类名称、商品名和店铺关联。")
+@router.patch("/products/{product_id}", summary="更新产品分类及其关联", description="更新产品分类名称、商品名、specifications、常用规格值、产品安全距离和店铺关联；常用规格值传空数组可清空，安全距离对象不传则保持原值。")
 async def update_product(payload: ProductUpdate, product_id: int = Path(description="产品分类 ID")):
     result = await repo_call(catalog_repository.update_product, product_id, payload_dict(payload))
     return api_success(result, message="产品分类更新成功")
@@ -345,7 +376,7 @@ async def list_size_templates(
     summary="创建尺寸模板",
     description=(
         "创建尺寸模板主记录；传入 size_options 时保存明确提交的初始规格，不传则规格为空；"
-        "规格需在模板创建成功后单独维护。安全距离包含 top、right、bottom、left 四个值。"
+        "规格中的 layers 可作为规格自己的独立图层直接保存。安全距离包含 top、right、bottom、left 四个值。"
     ),
 )
 async def create_size_template(payload: SizeTemplateCreateV2):
@@ -376,6 +407,7 @@ async def get_size_template(template_id: int = Path(description="尺寸模板 ID
     summary="更新尺寸模板",
     description=(
         "根据尺寸模板 ID 更新模板及关联信息；背景色、背脊宽范围、背脊依据和三组安全距离使用顶层字段。"
+        "size_options[].layers 可直接编辑规格图层；不传 layers 时保留已有规格图层。"
     ),
 )
 async def update_size_template(
@@ -404,7 +436,7 @@ async def delete_size_template(template_id: int = Path(description="尺寸模板
 @router.get(
     "/fonts",
     summary="查询字体库列表",
-    description="分页查询字体库，可按启用状态及 font_preferred、font_en、font_all_name 不区分大小写模糊搜索。",
+    description="分页查询字体库，可按启用状态及 font_name、font_preferred、font_en、font_all_name 不区分大小写模糊搜索。",
 )
 async def list_fonts(
     limit: int = Query(default=100, ge=1, le=1000, description="每页返回的字体数量"),
@@ -412,7 +444,7 @@ async def list_fonts(
     enabled: bool | None = Query(default=None, description="按字体是否启用筛选"),
     search: str | None = Query(
         default=None,
-        description="按 font_preferred、font_en 或 font_all_name 不区分大小写模糊搜索",
+        description="按 font_name、font_preferred、font_en 或 font_all_name 不区分大小写模糊搜索",
     ),
 ):
     result = await repo_call(

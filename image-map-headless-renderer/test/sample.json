@@ -1,0 +1,48 @@
+{
+  "objects": [
+    {
+      "id": "workarea",
+      "type": "Image",
+      "originX": "center",
+      "originY": "center",
+      "left": 250,
+      "top": 150,
+      "width": 400,
+      "height": 200,
+      "scaleX": 1,
+      "scaleY": 1,
+      "workareaWidth": 400,
+      "workareaHeight": 200,
+      "backgroundColor": "#ffffff",
+      "src": ""
+    },
+    {
+      "id": "sample-box",
+      "type": "Rect",
+      "originX": "center",
+      "originY": "center",
+      "left": 250,
+      "top": 150,
+      "width": 120,
+      "height": 60,
+      "fill": "#1677ff"
+    },
+    {
+      "id": "sample-text",
+      "type": "Textbox",
+      "originX": "center",
+      "originY": "center",
+      "left": 250,
+      "top": 150,
+      "width": 100,
+      "fontFamily": "Arial",
+      "fontSize": 20,
+      "fill": "#ffffff",
+      "textAlign": "center",
+      "text": "预览"
+    }
+  ],
+  "animations": [],
+  "styles": [],
+  "dataSources": []
+}

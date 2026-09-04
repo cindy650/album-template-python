@@ -1,0 +1,56 @@
+{
+  "objects": [
+    {
+      "id": "workarea",
+      "type": "Image",
+      "originX": "center",
+      "originY": "center",
+      "left": 1019.04,
+      "top": 743.68,
+      "width": 2038.08,
+      "height": 727.68,
+      "scaleX": 1,
+      "scaleY": 1,
+      "workareaWidth": 2038.08,
+      "workareaHeight": 727.68,
+      "backgroundColor": "#ffffff",
+      "unit": "in",
+      "sideWidth": 9,
+      "sideHeight": 6,
+      "bleed": 0.79,
+      "spineWidth": 0.55,
+      "spineBleed": 0.55,
+      "canvasRows": 2,
+      "printGuides": [],
+      "src": ""
+    },
+    {
+      "id": "sample-box",
+      "type": "Rect",
+      "originX": "center",
+      "originY": "center",
+      "left": 1019.04,
+      "top": 363.84,
+      "width": 240,
+      "height": 120,
+      "fill": "#1677ff"
+    },
+    {
+      "id": "sample-text",
+      "type": "Textbox",
+      "originX": "center",
+      "originY": "center",
+      "left": 1019.04,
+      "top": 363.84,
+      "width": 180,
+      "fontFamily": "Arial",
+      "fontSize": 32,
+      "fill": "#ffffff",
+      "textAlign": "center",
+      "text": "双排画布"
+    }
+  ],
+  "animations": [],
+  "styles": [],
+  "dataSources": []
+}

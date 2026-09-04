@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from copy import deepcopy
+from datetime import datetime
 import importlib.util
 from pathlib import Path
 import sys
@@ -31,6 +32,7 @@ class ImageMapHeadlessRenderer:
         resource_cache_max_bytes: int = 64 * 1024 * 1024,
         max_pending: int = 4,
         max_output_pixels: int = 50_000_000,
+        font_error_log_path: Path | None = None,
     ):
         self.project_root = Path(project_root).resolve()
         self.renderer_dir = self.project_root / "image-map-headless-renderer"
@@ -50,12 +52,16 @@ class ImageMapHeadlessRenderer:
         self.resource_cache_max_bytes = max(0, int(resource_cache_max_bytes))
         self.max_pending = max(1, int(max_pending))
         self.max_output_pixels = max(1, int(max_output_pixels))
+        self.font_error_log_path = Path(
+            font_error_log_path or self.project_root / "logs" / "font_errors.log"
+        ).resolve()
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="image-map-renderer",
         )
         self._session = None
         self._close_lock = Lock()
+        self._font_error_log_lock = Lock()
         self._pending_slots = BoundedSemaphore(self.max_pending)
         self._closed = False
 
@@ -70,6 +76,9 @@ class ImageMapHeadlessRenderer:
         dpi: float | None = None,
         quality: float = 0.95,
         include_svg: bool = False,
+        include_text_to_svg: bool = False,
+        safe_distances: dict[str, Any] | None = None,
+        order_number: str = "",
         **_legacy_options: Any,
     ) -> dict[str, Any]:
         if not self.enabled:
@@ -109,6 +118,8 @@ class ImageMapHeadlessRenderer:
                 quality,
                 background_color,
                 bool(include_svg),
+                bool(include_text_to_svg),
+                deepcopy(safe_distances) if isinstance(safe_distances, dict) else None,
             )
 
         try:
@@ -129,6 +140,13 @@ class ImageMapHeadlessRenderer:
                     raise RuntimeError(
                         "Image Map 重启 Chromium 后仍生成全黑图，已拒绝保存异常产物"
                     )
+            svg = str(raw_result.get("svg") or "")
+            if include_svg and "data:font" in svg:
+                output_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "SVG 检测到嵌入字体二进制，已拒绝保存和上传；"
+                    "SVG 只允许使用外部字体 URL"
+                )
         except FutureTimeoutError as exc:
             future.cancel()
             raise RuntimeError(
@@ -138,7 +156,11 @@ class ImageMapHeadlessRenderer:
             raise RuntimeError(
                 "Image Map Python 运行时不可用；请安装 requirements.txt 中的 playwright"
             ) from exc
-        except RuntimeError:
+        except RuntimeError as exc:
+            if "字体加载失败" in str(exc):
+                output_path.unlink(missing_ok=True)
+                message = self.record_font_failure(order_number, str(exc))
+                raise RuntimeError(message) from exc
             raise
         except Exception as exc:
             raise RuntimeError(f"Image Map 无头渲染失败：{exc}") from exc
@@ -168,8 +190,28 @@ class ImageMapHeadlessRenderer:
             "warnings": raw_result.get("warnings") or [],
             "font_status": raw_result.get("fontStatus") or [],
             "fabric_version": raw_result.get("fabricVersion"),
+            "resolved_json": raw_result.get("resolvedJson"),
             "svg": raw_result.get("svg"),
+            "text_to_svg": raw_result.get("textToSvg"),
         }
+
+    def record_font_failure(self, order_number: str, detail: str) -> str:
+        order_label = str(order_number or "未提供").strip() or "未提供"
+        message = f"订单字体加载失败：订单号={order_label}，{detail}"
+        print(f"[IMAGE MAP][FONT][ERROR] {message}", flush=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            with self._font_error_log_lock:
+                self.font_error_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.font_error_log_path.open("a", encoding="utf-8") as log_file:
+                    log_file.write(f"{timestamp} [IMAGE MAP][FONT][ERROR] {message}\n")
+        except OSError as exc:
+            print(
+                f"[IMAGE MAP][FONT][ERROR] 字体错误日志写入失败："
+                f"路径={self.font_error_log_path}，错误={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        return message
 
     @staticmethod
     def _is_unexpected_solid_black(
@@ -237,6 +279,8 @@ class ImageMapHeadlessRenderer:
         quality: float,
         background_color: str | None,
         include_svg: bool,
+        include_text_to_svg: bool,
+        safe_distances: dict[str, Any] | None,
     ) -> dict[str, Any]:
         if self._session is None:
             runtime = _load_runtime(self.runtime_path)
@@ -260,6 +304,8 @@ class ImageMapHeadlessRenderer:
             quality=quality,
             background_color=background_color,
             include_svg=include_svg,
+            include_text_to_svg=include_text_to_svg,
+            safe_distances=safe_distances,
             base_directory=self.project_root,
         )
 
@@ -296,7 +342,23 @@ class ImageMapHeadlessRenderer:
             family = str(value.get("fontFamily") or value.get("font_family") or "").strip()
             source = fonts.get(family.casefold())
             if source:
-                value["fontUrl"] = source
+                external_source = next(
+                    (
+                        str(font.get("url") or "").strip()
+                        for font in font_files
+                        if isinstance(font, dict)
+                        and str(font.get("family") or "").strip().casefold()
+                        == family.casefold()
+                        and str(font.get("url") or "").strip()
+                    ),
+                    "",
+                )
+                if external_source:
+                    value["fontExternalUrl"] = external_source
+                    value["fontUrl"] = external_source
+                else:
+                    value["fontUrl"] = str(value.get("fontUrl") or value.get("font_url") or source)
+                value["fontDataUrl"] = source
             for child in value.values():
                 if isinstance(child, (dict, list)):
                     visit(child)
@@ -347,13 +409,42 @@ class ImageMapHeadlessRenderer:
         if workarea is None:
             return
         try:
+            raw_width = float(workarea.get("width") or workarea["workareaWidth"])
+            raw_height = float(workarea.get("height") or workarea["workareaHeight"])
+            if workarea.get("canvasRows") == 2:
+                def nonnegative(field: str) -> float | None:
+                    try:
+                        value = float(workarea.get(field))
+                    except (TypeError, ValueError):
+                        return None
+                    return value if value >= 0 else None
+
+                unit_factor = {
+                    "in": 96.0,
+                    "cm": 96.0 / 2.54,
+                    "mm": 96.0 / 25.4,
+                }.get(str(workarea.get("unit") or "").strip().lower())
+                side_height = nonnegative("sideHeight")
+                bleed = nonnegative("bleed")
+                if unit_factor is not None and side_height is not None and bleed is not None:
+                    raw_height = (side_height + bleed * 2) * unit_factor * 2 + 32
+                    width_values = (
+                        nonnegative("sideWidth"),
+                        nonnegative("spineBleed"),
+                        nonnegative("spineWidth"),
+                    )
+                    if all(value is not None for value in width_values):
+                        raw_width = (
+                            width_values[0] * 2
+                            + bleed * 2
+                            + width_values[1] * 2
+                            + width_values[2]
+                        ) * unit_factor
             width = abs(
-                float(workarea.get("width") or workarea["workareaWidth"])
-                * float(workarea.get("scaleX", 1) or 1)
+                raw_width * float(workarea.get("scaleX", 1) or 1)
             )
             height = abs(
-                float(workarea.get("height") or workarea["workareaHeight"])
-                * float(workarea.get("scaleY", 1) or 1)
+                raw_height * float(workarea.get("scaleY", 1) or 1)
             )
         except (KeyError, TypeError, ValueError):
             return

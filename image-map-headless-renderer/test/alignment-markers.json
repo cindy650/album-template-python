@@ -1,0 +1,48 @@
+{
+  "objects": [
+    {
+      "id": "workarea",
+      "type": "Image",
+      "originX": "center",
+      "originY": "center",
+      "left": 1019.04,
+      "top": 727.68,
+      "width": 2038.08,
+      "height": 727.68,
+      "scaleX": 1,
+      "scaleY": 1,
+      "workareaWidth": 2038.08,
+      "workareaHeight": 727.68,
+      "backgroundColor": "#ffffff",
+      "unit": "in",
+      "sideWidth": 9,
+      "sideHeight": 6,
+      "bleed": 0.79,
+      "spineWidth": 0.55,
+      "spineBleed": 0.55,
+      "canvasRows": 2,
+      "canvasRowGap": 0,
+      "printGuides": [],
+      "src": ""
+    },
+    {
+      "id": "centered-text",
+      "type": "Textbox",
+      "originX": "center",
+      "originY": "center",
+      "left": 300,
+      "top": 1100,
+      "width": 240,
+      "fontFamily": "Arial",
+      "fontSize": 32,
+      "fill": "#222222",
+      "textAlign": "center",
+      "text": "区域居中",
+      "horizontalCentered": true,
+      "verticalCentered": true
+    }
+  ],
+  "animations": [],
+  "styles": [],
+  "dataSources": []
+}

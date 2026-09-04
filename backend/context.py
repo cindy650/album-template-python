@@ -1,8 +1,11 @@
 from backend.config import settings
 import qq_idleCopy as core
-from backend.catalog import CatalogRepository
+from backend.catalog import (
+    CatalogRepository,
+    DeepSeekProductCategoryMatcher,
+    MailProductResolver,
+)
 from backend.mail import MailListenerManager
-from backend.notifications import WeComRobotNotifier
 from backend.orders import OrderRepository, OrderService
 from backend.orders.print_image import (
     DeepSeekProductInformationTranslator,
@@ -20,6 +23,15 @@ from backend.templates import (
 )
 catalog_repository = CatalogRepository(settings.mysql_url)
 order_repository = OrderRepository(settings.mysql_url)
+mail_product_resolver = MailProductResolver(
+    catalog_repository,
+    DeepSeekProductCategoryMatcher(
+        api_url=core.DEEPSEEK_API_URL,
+        api_key=core.DEEPSEEK_API_KEY,
+        model=core.DEEPSEEK_MODEL,
+        timeout_seconds=core.DEEPSEEK_TIMEOUT,
+    ),
+)
 file_storage_service = FileStorageService(
     project_root=settings.project_root,
     access_key_id=settings.oss_access_key_id,
@@ -103,22 +115,15 @@ template_import_service = TemplateImportService(
     tesseract_command=settings.tesseract_command,
     ocr_languages=settings.template_ocr_languages,
 )
-wecom_notifier = (
-    WeComRobotNotifier(
-        settings.wecom_robot_webhook_url,
-        timeout_seconds=settings.wecom_robot_timeout_seconds,
-    )
-    if settings.wecom_robot_webhook_url
-    else None
-)
 order_service = OrderService(
     order_repository,
     template_image_generator,
     template_image_retry_attempts=settings.template_image_retry_attempts,
     template_image_retry_delay_seconds=settings.template_image_retry_delay_seconds,
-    wecom_notifier=wecom_notifier,
+    wecom_robot_timeout_seconds=settings.wecom_robot_timeout_seconds,
     order_print_image_generator=wecom_order_info_image_generator,
     production_artifact_service=template_export_service,
+    catalog_repository=catalog_repository,
 )
 
 
@@ -129,11 +134,17 @@ def find_mail_shop(original_shop: str, resolved_shop: str):
     )
 
 
-def find_mail_product(shop: str, shop_name: str, product_name: str):
-    return catalog_repository.ensure_shop_product(
-        product_name,
+def find_mail_product(
+    shop: str,
+    shop_name: str,
+    product_name: str,
+    product_information: dict,
+):
+    return mail_product_resolver.resolve(
         shop,
         shop_name,
+        product_name,
+        product_information,
     )
 
 
