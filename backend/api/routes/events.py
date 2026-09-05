@@ -28,8 +28,20 @@ async def stream_events():
 @router.post(
     "/events/send",
     summary="发送 SSE 消息",
-    description="接收 msg 字符串并立即向当前所有 SSE 订阅者广播 message 事件。",
+    description=(
+        "接收 type/event_type、msg、data、status、status_text、order_id 等字段，"
+        "并立即向当前所有 SSE 订阅者广播对应类型的事件。"
+    ),
 )
 async def send_sse_message(payload: SSEMessageRequest):
-    event = event_bus.publish("message", msg=payload.msg)
+    event_data = dict(payload.data)
+    for key in ("status", "status_text", "order_id"):
+        value = getattr(payload, key)
+        if value is not None:
+            event_data[key] = value
+    event = event_bus.publish(
+        payload.event_type,
+        data=event_data,
+        msg=payload.msg,
+    )
     return api_success(event, message="SSE 消息发送成功")

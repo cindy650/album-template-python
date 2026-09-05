@@ -167,6 +167,46 @@ def resolve_spine_width(fields: dict[str, Any]) -> float:
     return max(0, width)
 
 
+def resolve_product_spine_width_formula(
+    formula: dict[str, Any],
+    page_count: Any,
+    target_unit: str,
+) -> tuple[float, dict[str, Any]] | None:
+    """Resolve a product formula and convert its result to target_unit."""
+    if not isinstance(formula, dict) or not formula:
+        return None
+    try:
+        source_unit = required_size_unit(formula.get("unit"))
+        target_unit = required_size_unit(target_unit)
+        pages = float(page_count)
+        coefficient = float(formula.get("page_count_coefficient", 0.2))
+        thickness = float(formula.get("page_count_thickness", 0.3))
+        base = float(formula.get("base_width", 1))
+        additional = float(formula.get("additional_width", 0.9))
+        spine_bleed = float(formula.get("spine_bleed", 0))
+    except (TypeError, ValueError):
+        return None
+    if pages < 0 or coefficient < 0 or thickness < 0 or base < 0 or additional < 0 or spine_bleed < 0:
+        return None
+    width = pages * coefficient * thickness + base + additional
+    source_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}[source_unit]
+    target_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}[target_unit]
+    converted_width = width / source_factor * target_factor
+    converted_bleed = spine_bleed / source_factor * target_factor
+    return max(0, converted_width), {
+        "method": "product_formula",
+        "formula_unit": source_unit,
+        "target_unit": target_unit,
+        "page_count": pages,
+        "page_count_coefficient": coefficient,
+        "page_count_thickness": thickness,
+        "base_width": base,
+        "additional_width": additional,
+        "spine_width": max(0, converted_width),
+        "spine_bleed": max(0, converted_bleed),
+    }
+
+
 def resolve_spine_width_for_page_count(
     fields: dict[str, Any],
     page_count: Any,

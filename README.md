@@ -70,23 +70,44 @@ If BACKEND_API_TOKEN is empty, local API endpoints are open.
 
 ### SSE 消息推送
 
-`POST /api/v1/events/send` 请求体：
+`POST /api/v1/events/send` 请求体支持普通消息和结构化字段：
 
 ```json
 {
-  "msg": "订单处理完成"
+  "type": "order.saved",
+  "msg": "新订单已入库",
+  "data": {
+    "source": "frontend",
+    "order": {
+      "id": 632,
+      "order_number": "4162641089",
+      "shop": "LuxeJoy",
+      "shop_name": "3号店",
+      "product": "Personalized Wedding Guest Book",
+      "shop_id": 1,
+      "size_template_id": 12,
+      "status": 0,
+      "status_text": "新订单",
+      "status_button_text": "发送示意图"
+    }
+  },
+  "order_id": 78,
+  "status": 3,
+  "status_text": "生产中"
 }
 ```
 
 成功响应中的 `data` 是已广播的事件对象。所有当前在线的
-`GET /api/v1/events` 订阅者都会收到 `event: message`：
+`GET /api/v1/events` 订阅者都会收到对应类型的事件；上例会收到 `event: order.saved`：
 
 ```text
 event: message
-data: {"type":"message","msg":"订单处理完成", "data":{}}
+data: {"type":"order.saved","msg":"新订单已入库", "data":{"source":"frontend", "order":{"id":632,"status":0,"status_text":"新订单"}, "order_id":632,"status":0,"status_text":"新订单"}}
 ```
 
-`msg` 不能为空或只包含空格。接口遵循全局 `X-API-Key` 鉴权配置。
+`type` 可以省略，默认是 `message`；模拟真实订单入库时传 `type: "order.saved"`。
+`msg` 也可以省略，此时至少传入 `data`、`status`、`status_text` 或 `order_id` 之一。
+`msg` 不能为空或只包含空格，接口遵循全局 `X-API-Key` 鉴权配置。
 
 ### 订单状态
 
@@ -229,6 +250,10 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
 `product_shops` 关联多个店铺，通过 `product_names` 保存用于区分具体订单商品的商品名。
 产品保留用于邮件订单自动匹配的 `specifications` 字符串数组；同时支持可选的
 `common_spec_values`（常用规格值）对象数组，数据库按 JSON 原样保存前端提供的对象。
+产品还可选配置 `spine_width_formula`，用于尺寸模板选择“按页数”时计算背脊宽。
+公式计算为：`页数 * page_count_coefficient * page_count_thickness + base_width + additional_width`。
+公式单位由 `unit` 指定，结果会临时换算为当前尺寸规格单位；`spine_bleed` 通常设为 `0`。
+未配置产品公式时，继续使用尺寸模板原有的最小/最大背脊宽按页数线性计算。
 字段不传时默认为空数组；PATCH 传入空数组可以清空。也可以使用中文请求键名 `常用规格值`。
 例如：
 
@@ -254,6 +279,22 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
   ]
 }
 ```
+
+产品公式示例（照片留言册）：
+
+```json
+{
+  "spine_width_formula": {
+    "unit": "cm",
+    "page_count_coefficient": 0.2,
+    "page_count_thickness": 0.3,
+    "base_width": 1,
+    "additional_width": 0.9,
+    "spine_bleed": 0
+  }
+}
+```
+创建或编辑产品时传入该字段即可；编辑时传 `null` 可清除产品公式。
 `/api/v1/size-templates` 是尺寸模板列表和整体编辑接口。主接口使用 `product_id` 关联产品分类，
 返回扁平的 `size_options[]` 和 `size_template_info[]`，不再内嵌产品对象、商品名数组或字体布局。
 尺寸模板响应包含可选的 `preview_image` OSS 地址。前端通过

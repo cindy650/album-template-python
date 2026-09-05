@@ -76,6 +76,7 @@ def public_size_template_payload(value: Any):
         "min_spine_width",
         "max_spine_width",
         "spine_width_basis",
+        "product_spine_width_formula",
         "cover_safe_distance",
         "spine_safe_distance",
         "back_cover_safe_distance",

@@ -54,6 +54,78 @@ class SSEMessageTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             SSEMessageRequest(msg="   ")
 
+    def test_send_endpoint_broadcasts_structured_status_fields(self):
+        route_module = load_events_route_module()
+        bus = EventBus()
+        subscriber_id, queue = bus.subscribe()
+        try:
+            with patch.object(route_module, "event_bus", bus):
+                response = asyncio.run(
+                    route_module.send_sse_message(
+                        SSEMessageRequest(
+                            data={"source": "frontend"},
+                            order_id=78,
+                            status=3,
+                            status_text="生产中",
+                        )
+                    )
+                )
+
+            event = queue.get_nowait()
+            body = json.loads(response.body)
+            self.assertNotIn("msg", event)
+            self.assertEqual(
+                event["data"],
+                {
+                    "source": "frontend",
+                    "order_id": 78,
+                    "status": 3,
+                    "status_text": "生产中",
+                },
+            )
+            self.assertEqual(body["data"], event)
+        finally:
+            bus.unsubscribe(subscriber_id)
+
+    def test_send_endpoint_supports_order_saved_event_type(self):
+        route_module = load_events_route_module()
+        bus = EventBus()
+        subscriber_id, queue = bus.subscribe()
+        try:
+            with patch.object(route_module, "event_bus", bus):
+                response = asyncio.run(
+                    route_module.send_sse_message(
+                        SSEMessageRequest(
+                            type="order.saved",
+                            msg="新订单已入库",
+                            data={
+                                "order": {
+                                    "id": 632,
+                                    "status": 0,
+                                    "status_text": "新订单",
+                                }
+                            },
+                            order_id=632,
+                            status=0,
+                            status_text="新订单",
+                        )
+                    )
+                )
+
+            event = queue.get_nowait()
+            body = json.loads(response.body)
+            self.assertEqual(event["type"], "order.saved")
+            self.assertEqual(event["msg"], "新订单已入库")
+            self.assertEqual(event["data"]["order"]["id"], 632)
+            self.assertEqual(event["data"]["status"], 0)
+            self.assertEqual(body["data"], event)
+        finally:
+            bus.unsubscribe(subscriber_id)
+
+    def test_empty_structured_payload_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            SSEMessageRequest()
+
     def test_sse_format_contains_message_event_and_msg(self):
         bus = EventBus()
         event = bus.publish("message", msg="测试消息")

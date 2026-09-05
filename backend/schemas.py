@@ -1,20 +1,73 @@
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class SSEMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    msg: str = Field(min_length=1, description="需要立即推送给所有 SSE 订阅者的消息")
+    msg: str | None = Field(
+        default=None,
+        description="可选的人类可读消息；可以只发送结构化 data",
+    )
+    event_type: str = Field(
+        default="message",
+        validation_alias=AliasChoices("event_type", "type"),
+        description="SSE 事件类型，例如 message 或 order.saved",
+    )
+    data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="需要放入 SSE 事件 data 的自定义字段",
+    )
+    status: int | str | None = Field(
+        default=None,
+        description="可选的订单状态值，例如 0 或 3",
+    )
+    status_text: str | None = Field(
+        default=None,
+        description="可选的订单状态文本，例如生产中",
+    )
+    order_id: int | str | None = Field(
+        default=None,
+        description="可选的订单 ID",
+    )
 
     @field_validator("msg")
     @classmethod
-    def validate_msg(cls, value: str):
+    def validate_msg(cls, value: str | None):
+        if value is None:
+            return None
         value = value.strip()
         if not value:
             raise ValueError("msg 不能为空")
         return value
+
+    @field_validator("event_type")
+    @classmethod
+    def validate_event_type(cls, value: str):
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("event_type 不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (
+            self.msg is None
+            and not self.data
+            and self.status is None
+            and self.status_text is None
+            and self.order_id is None
+        ):
+            raise ValueError("msg、data、status、status_text、order_id 至少传一个")
+        return self
 
 class ParseOrderRequest(BaseModel):
     subject: str = Field(description="邮件标题")
@@ -201,6 +254,40 @@ class SafeDistanceValues(BaseModel):
     left: float = Field(default=0, ge=0, description="左安全距离")
 
 
+class ProductSpineWidthFormula(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit: Literal["in", "mm", "cm"] = Field(
+        default="cm",
+        description="公式数值单位；公式计算结果会换算为规格使用单位",
+    )
+    page_count_coefficient: float = Field(
+        default=0.2,
+        ge=0,
+        description="页数系数；计算项为 page_count * page_count_coefficient",
+    )
+    page_count_thickness: float = Field(
+        default=0.3,
+        ge=0,
+        description="每页厚度；照片留言册为 0.3cm",
+    )
+    base_width: float = Field(
+        default=1,
+        ge=0,
+        description="公式基础背脊宽",
+    )
+    additional_width: float = Field(
+        default=0.9,
+        ge=0,
+        description="公式附加背脊宽",
+    )
+    spine_bleed: float = Field(
+        default=0,
+        ge=0,
+        description="使用产品公式时的背脊出血；照片留言册为 0",
+    )
+
+
 class ProductCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -228,6 +315,10 @@ class ProductCreate(BaseModel):
             "常用规格值",
         ),
         description="常用规格值对象数组；由前端填写并按原值保存，可为空",
+    )
+    spine_width_formula: ProductSpineWidthFormula | None = Field(
+        default=None,
+        description="产品级按页数背脊宽公式；不传表示使用尺寸模板原有范围算法",
     )
     cover_safe_distance: SafeDistanceValues = Field(
         default_factory=SafeDistanceValues,
@@ -297,6 +388,10 @@ class ProductUpdate(BaseModel):
             "常用规格值",
         ),
         description="常用规格值对象数组；传入时替换全部值，可传空数组清空",
+    )
+    spine_width_formula: ProductSpineWidthFormula | None = Field(
+        default=None,
+        description="产品级按页数背脊宽公式；传 null 可清除并恢复原有范围算法",
     )
     cover_safe_distance: SafeDistanceValues | None = Field(
         default=None,
@@ -551,14 +646,26 @@ class SizeTemplateCreateV2(BaseModel):
     )
     cover_safe_distance: SafeDistanceValues = Field(
         default_factory=lambda: SafeDistanceValues(),
+        validation_alias=AliasChoices(
+            "cover_safe_distance",
+            "cover_safe_distance_json",
+        ),
         description="封面安全距离，包含 top、right、bottom、left",
     )
     spine_safe_distance: SafeDistanceValues = Field(
         default_factory=lambda: SafeDistanceValues(),
+        validation_alias=AliasChoices(
+            "spine_safe_distance",
+            "spine_safe_distance_json",
+        ),
         description="背脊安全距离，包含 top、right、bottom、left",
     )
     back_cover_safe_distance: SafeDistanceValues = Field(
         default_factory=lambda: SafeDistanceValues(),
+        validation_alias=AliasChoices(
+            "back_cover_safe_distance",
+            "back_cover_safe_distance_json",
+        ),
         description="封底安全距离，包含 top、right、bottom、left",
     )
     display_unit: Literal["in", "mm", "cm"] = Field(
@@ -607,14 +714,26 @@ class SizeTemplateUpdateV2(BaseModel):
     )
     cover_safe_distance: SafeDistanceValues | None = Field(
         default=None,
+        validation_alias=AliasChoices(
+            "cover_safe_distance",
+            "cover_safe_distance_json",
+        ),
         description="封面安全距离，包含 top、right、bottom、left",
     )
     spine_safe_distance: SafeDistanceValues | None = Field(
         default=None,
+        validation_alias=AliasChoices(
+            "spine_safe_distance",
+            "spine_safe_distance_json",
+        ),
         description="背脊安全距离，包含 top、right、bottom、left",
     )
     back_cover_safe_distance: SafeDistanceValues | None = Field(
         default=None,
+        validation_alias=AliasChoices(
+            "back_cover_safe_distance",
+            "back_cover_safe_distance_json",
+        ),
         description="封底安全距离，包含 top、right、bottom、left",
     )
     selected_size_option_id: str | None = Field(

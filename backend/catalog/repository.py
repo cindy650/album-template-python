@@ -92,6 +92,39 @@ def normalize_common_spec_values(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def normalize_product_spine_width_formula(value: Any) -> dict[str, Any]:
+    """Validate the optional product-level page-count spine formula."""
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("spine_width_formula 必须是对象")
+    unit = compact_string(value.get("unit") or "cm").lower()
+    if unit not in {"in", "mm", "cm"}:
+        raise ValueError("spine_width_formula.unit 只能是 in、mm 或 cm")
+
+    def number(key: str, default: float, *, positive: bool = False) -> float:
+        raw = value.get(key, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"spine_width_formula.{key} 必须是数字")
+        try:
+            result = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"spine_width_formula.{key} 必须是数字") from exc
+        if (positive and result <= 0) or (not positive and result < 0):
+            comparator = "大于" if positive else "大于或等于"
+            raise ValueError(f"spine_width_formula.{key} 必须{comparator} 0")
+        return result
+
+    return {
+        "unit": unit,
+        "page_count_coefficient": number("page_count_coefficient", 0.2),
+        "page_count_thickness": number("page_count_thickness", 0.3),
+        "base_width": number("base_width", 1),
+        "additional_width": number("additional_width", 0.9),
+        "spine_bleed": number("spine_bleed", 0),
+    }
+
+
 def placeholders(values: list[Any]):
     return ", ".join("?" for _ in values)
 
@@ -622,6 +655,7 @@ class CatalogRepository:
                 specification_field VARCHAR(255) NOT NULL
                     DEFAULT 'Book Size | Page Count',
                 cover_safe_distance_json LONGTEXT NULL,
+                spine_width_formula_json LONGTEXT NULL,
                 spine_safe_distance_json LONGTEXT NULL,
                 back_cover_safe_distance_json LONGTEXT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -639,6 +673,7 @@ class CatalogRepository:
                     "VARCHAR(255) NOT NULL DEFAULT 'Book Size | Page Count'"
                 ),
                 "common_spec_values_json": "TEXT NOT NULL DEFAULT '[]'",
+                "spine_width_formula_json": "LONGTEXT NULL",
                 # MySQL does not consistently allow literal defaults on
                 # TEXT/LONGTEXT columns. Nulls are normalized below instead.
                 "cover_safe_distance_json": "LONGTEXT NULL",
@@ -665,6 +700,13 @@ class CatalogRepository:
             UPDATE products
             SET common_spec_values_json = '[]'
             WHERE common_spec_values_json IS NULL OR common_spec_values_json = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE products
+            SET spine_width_formula_json = '{}'
+            WHERE spine_width_formula_json IS NULL OR spine_width_formula_json = ''
             """
         )
         for column in (
@@ -1481,6 +1523,9 @@ class CatalogRepository:
         common_spec_values = normalize_common_spec_values(
             payload.get("common_spec_values")
         )
+        spine_width_formula = normalize_product_spine_width_formula(
+            payload.get("spine_width_formula")
+        )
         safe_distances = self._product_safe_distance_values(payload)
         shop_ids = self._payload_int_list(payload.get("shop_ids") or payload.get("shops"))
         now = utc_now()
@@ -1490,10 +1535,11 @@ class CatalogRepository:
                 INSERT INTO products (
                     name, description, specifications_json, specification_field,
                     common_spec_values_json,
+                    spine_width_formula_json,
                     cover_safe_distance_json, spine_safe_distance_json,
                     back_cover_safe_distance_json,
                     enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -1501,6 +1547,7 @@ class CatalogRepository:
                     json_dump(specifications),
                     specification_field,
                     json_dump(common_spec_values),
+                    json_dump(spine_width_formula),
                     json_dump(safe_distances["cover_safe_distance"]),
                     json_dump(safe_distances["spine_safe_distance"]),
                     json_dump(safe_distances["back_cover_safe_distance"]),
@@ -1572,6 +1619,11 @@ class CatalogRepository:
                 common_spec_values = normalize_common_spec_values(
                     payload.get("common_spec_values")
                 )
+            spine_width_formula = None
+            if "spine_width_formula" in payload:
+                spine_width_formula = normalize_product_spine_width_formula(
+                    payload.get("spine_width_formula")
+                )
             safe_distances = self._product_safe_distance_values(payload, existing)
             updates = {
                 "name": name,
@@ -1586,6 +1638,11 @@ class CatalogRepository:
                     json_dump(common_spec_values)
                     if common_spec_values is not None
                     else existing.get("common_spec_values_json", "[]")
+                ),
+                "spine_width_formula_json": (
+                    json_dump(spine_width_formula)
+                    if spine_width_formula is not None
+                    else existing.get("spine_width_formula_json", "{}")
                 ),
                 "cover_safe_distance_json": json_dump(
                     safe_distances["cover_safe_distance"]
@@ -1607,6 +1664,7 @@ class CatalogRepository:
                     specifications_json = :specifications_json,
                     specification_field = :specification_field,
                     common_spec_values_json = :common_spec_values_json,
+                    spine_width_formula_json = :spine_width_formula_json,
                     cover_safe_distance_json = :cover_safe_distance_json,
                     spine_safe_distance_json = :spine_safe_distance_json,
                     back_cover_safe_distance_json = :back_cover_safe_distance_json,
@@ -1723,6 +1781,9 @@ class CatalogRepository:
         data["common_spec_values"] = normalize_common_spec_values(
             json_load(data.pop("common_spec_values_json", "[]"), [])
         )
+        data["spine_width_formula"] = normalize_product_spine_width_formula(
+            json_load(data.pop("spine_width_formula_json", "{}"), {})
+        ) or None
         for key in (
             "cover_safe_distance",
             "spine_safe_distance",
@@ -1989,6 +2050,9 @@ class CatalogRepository:
         data["common_spec_values"] = normalize_common_spec_values(
             json_load(data.pop("common_spec_values_json", "[]"), [])
         )
+        data["spine_width_formula"] = normalize_product_spine_width_formula(
+            json_load(data.pop("spine_width_formula_json", "{}"), {})
+        ) or None
         for key in (
             "cover_safe_distance",
             "spine_safe_distance",
@@ -2216,7 +2280,8 @@ class CatalogRepository:
             ).fetchone()["count"]
             rows = connection.execute(
                 f"""
-                SELECT st.*, s.shop, s.shop_name, p.name AS product_category_name
+                SELECT st.*, s.shop, s.shop_name, p.name AS product_category_name,
+                       p.spine_width_formula_json AS product_spine_width_formula_json
                 FROM size_templates st
                 JOIN shops s ON s.id = st.shop_id
                 LEFT JOIN products p ON p.id = st.product_id
@@ -2237,7 +2302,8 @@ class CatalogRepository:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT st.*, s.shop, s.shop_name, p.name AS product_category_name
+                SELECT st.*, s.shop, s.shop_name, p.name AS product_category_name,
+                       p.spine_width_formula_json AS product_spine_width_formula_json
                 FROM size_templates st
                 JOIN shops s ON s.id = st.shop_id
                 LEFT JOIN products p ON p.id = st.product_id
@@ -2261,9 +2327,11 @@ class CatalogRepository:
             select_columns = ", ".join(f"st.{column}" for column in columns)
             row = connection.execute(
                 f"""
-                SELECT {select_columns}, s.shop, s.shop_name
+                SELECT {select_columns}, s.shop, s.shop_name,
+                       p.spine_width_formula_json AS product_spine_width_formula_json
                 FROM size_templates st
                 JOIN shops s ON s.id = st.shop_id
+                LEFT JOIN products p ON p.id = st.product_id
                 WHERE st.id = ?
                 """,
                 (template_id,),
@@ -4850,6 +4918,13 @@ class CatalogRepository:
             "spine_width_basis": int(row.get("spine_width_basis") or 0),
             "paper_thickness_mm": float(row.get("paper_thickness_mm") or 0),
         }
+        product_formula = row.get("product_spine_width_formula")
+        if not isinstance(product_formula, dict):
+            product_formula = normalize_product_spine_width_formula(
+                json_load(row.get("product_spine_width_formula_json"), {})
+            )
+        if product_formula:
+            fields["product_spine_width_formula"] = product_formula
         fields["page_count_arr"] = list(fields["page_count_options"])
         template = {"fields": fields}
         apply_selected_size_variant(template)
@@ -5785,6 +5860,9 @@ class CatalogRepository:
         data["preview_image"] = compact_string(
             data.pop("preview_image_path", data.get("preview_image", ""))
         )
+        data["product_spine_width_formula"] = normalize_product_spine_width_formula(
+            json_load(data.pop("product_spine_width_formula_json", "{}"), {})
+        ) or None
         if include_related:
             data["applicable_products"] = list(product_names)
             data["product_category_name"] = compact_string(

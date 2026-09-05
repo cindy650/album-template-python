@@ -346,7 +346,10 @@ class OrderTemplateResolver:
     ) -> None:
         if not isinstance(option, dict) or page_count is None:
             return
-        from backend.templates.size_variants import resolve_spine_width_for_page_count
+        from backend.templates.size_variants import (
+            resolve_product_spine_width_formula,
+            resolve_spine_width_for_page_count,
+        )
 
         template["resolved_page_count"] = page_count
         fields = {
@@ -359,6 +362,7 @@ class OrderTemplateResolver:
                 "page_count",
                 "page_count_options",
                 "page_count_arr",
+                "product_spine_width_formula",
             )
             if key in template
         }
@@ -366,6 +370,30 @@ class OrderTemplateResolver:
         if isinstance(template_fields, dict):
             fields.update(template_fields)
         fields.update(option)
+        product_formula = fields.get("product_spine_width_formula")
+        page_mode_enabled = (
+            fields.get("spine_width_basis") == 1
+            or option.get("spine_width_mode") == "by_page_count"
+        )
+        if page_mode_enabled and isinstance(product_formula, dict) and product_formula:
+            result = resolve_product_spine_width_formula(
+                product_formula,
+                page_count,
+                option.get("size_unit") or fields.get("size_unit") or "in",
+            )
+            if result is not None:
+                width, resolution = result
+                option["spine_width"] = width
+                option["spine_bleed"] = resolution["spine_bleed"]
+                option["spine_width_mode"] = "fixed"
+                template["spine_width_resolution"] = resolution
+                print(
+                    "[模板解析] 使用产品级页数背脊公式："
+                    f"页数={page_count:g}，背脊宽={width:.6g}，"
+                    f"单位={resolution['target_unit']}，背脊出血={option['spine_bleed']:.6g}",
+                    flush=True,
+                )
+                return
         result = resolve_spine_width_for_page_count(fields, page_count)
         if result is None:
             print(
