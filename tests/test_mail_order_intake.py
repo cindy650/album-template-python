@@ -32,6 +32,99 @@ class FakeMailClient:
 
 
 class MailOrderIntakeTests(unittest.TestCase):
+    def test_listing_thumbnail_is_saved_in_product_information(self):
+        html = (
+            '<div><img src="https://cdn.example/item-a.jpg" alt="thumbnail">'
+            '<a href="https://www.etsy.com/transaction/5201101150">'
+            "Personalized Wedding Guest Book"
+            "</a><span>Book Size | Page Count: 10*8 | 100 sheets</span></div>"
+        )
+
+        body = qq_idleCopy.html_to_text(html)
+        self.assertEqual(body.product_images, ["https://cdn.example/item-a.jpg"])
+        result = qq_idleCopy.parse_order_fields(
+            "You made a sale on Etsy - Order #4160334885",
+            body,
+            "",
+        )
+
+        self.assertEqual(
+            result["商品信息"][qq_idleCopy.PRODUCT_IMAGE_FIELD],
+            "https://cdn.example/item-a.jpg",
+        )
+
+    def test_listing_thumbnail_prefers_lazy_loaded_source_over_data_uri(self):
+        body = qq_idleCopy.html_to_text(
+            '<img src="data:image/gif;base64,placeholder" '
+            'data-src="https://cdn.example/item-lazy.jpg">'
+            '<a href="https://www.etsy.com/listing/123">Product</a>'
+        )
+        self.assertEqual(body.product_images, ["https://cdn.example/item-lazy.jpg"])
+
+    def test_listing_thumbnail_ignores_spacer_and_backfills_real_image(self):
+        body = qq_idleCopy.html_to_text(
+            '<img src="https://www.etsy.com/images/email/spacer-trans.gif">'
+            '<a href="https://www.etsy.com/listing/123">Product</a>'
+            '<img src="https://i.etsystatic.com/54769833/r/il/dc212e/6879998294/'
+            'il_75x75.6879998294_4jzc.jpg">'
+        )
+        self.assertEqual(
+            body.product_images,
+            ["https://i.etsystatic.com/54769833/r/il/dc212e/6879998294/il_75x75.6879998294_4jzc.jpg"],
+        )
+
+    def test_image_only_transaction_anchor_is_reused_by_title_anchor(self):
+        product_image = (
+            "https://i.etsystatic.com/54769833/r/il/1828a8/7461340003/"
+            "il_75x75.7461340003_mrrk.jpg"
+        )
+        body = qq_idleCopy.html_to_text(
+            '<a href="https://www.etsy.com/transaction/5211296760">'
+            f'<img src="{product_image}">'
+            "</a>"
+            '<a href="https://www.etsy.com/transaction/5211296760">'
+            "Luxury Leather Wedding Guest Book | Personalized Gold Foil Memory Book"
+            "</a>"
+            '<img src="https://i.etsystatic.com/site-assets/'
+            'issue_resolution/purchase_protection/pp_2x_mail_icon.png">'
+        )
+
+        self.assertEqual(
+            body.product_titles,
+            ["Luxury Leather Wedding Guest Book | Personalized Gold Foil Memory Book"],
+        )
+        self.assertEqual(body.product_images, [product_image])
+
+    def test_multi_item_listing_thumbnails_follow_each_transaction(self):
+        html = (
+            '<div><img src="https://cdn.example/item-a.jpg">'
+            '<a href="https://www.etsy.com/transaction/111">Product A</a>'
+            '<span>Cover Colour: Olive Green</span>'
+            '<span>Transaction ID: 111</span><span>Quantity: 1</span>'
+            '<span>Price: CA$10.00</span></div>'
+            '<div><img data-src="https://cdn.example/item-b.jpg">'
+            '<a href="https://www.etsy.com/transaction/222">Product B</a>'
+            '<span>Cover Colour: Rose Red</span>'
+            '<span>Transaction ID: 222</span><span>Quantity: 2</span>'
+            '<span>Price: CA$20.00</span></div>'
+            '<div>Shop: LuxeJoy</div>'
+        )
+
+        body = qq_idleCopy.html_to_text(html)
+        parsed = qq_idleCopy.parse_mail_order_items(
+            "You made a sale on Etsy - Order #4160334885",
+            body,
+        )
+
+        self.assertEqual(body.product_images, [
+            "https://cdn.example/item-a.jpg",
+            "https://cdn.example/item-b.jpg",
+        ])
+        self.assertEqual(
+            [item["商品信息"][qq_idleCopy.PRODUCT_IMAGE_FIELD] for item in parsed["items"]],
+            ["https://cdn.example/item-a.jpg", "https://cdn.example/item-b.jpg"],
+        )
+
     def test_html_listing_link_stays_separate_from_following_options(self):
         html = (
             '<div><a href="https://www.etsy.com/transaction/5201101150">'

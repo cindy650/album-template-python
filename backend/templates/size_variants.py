@@ -207,6 +207,87 @@ def resolve_product_spine_width_formula(
     }
 
 
+def resolve_product_spine_width_page_table(
+    rules: dict[str, Any],
+    page_count: Any,
+    target_unit: str,
+) -> tuple[float, dict[str, Any]] | None:
+    """Resolve a product page-count spine table and convert its units."""
+    if not isinstance(rules, dict) or not rules:
+        return None
+    try:
+        source_unit = required_size_unit(rules.get("unit"))
+        target_unit = required_size_unit(target_unit)
+        requested = float(page_count)
+    except (TypeError, ValueError):
+        return None
+    raw_items = rules.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+    items: list[tuple[float, float, float]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page = float(item.get("page_count"))
+            width = float(item.get("spine_width"))
+            bleed = float(item.get("spine_bleed", 0))
+        except (TypeError, ValueError):
+            continue
+        if page < 0 or width < 0 or bleed < 0:
+            continue
+        items.append((page, width, bleed))
+    if not items:
+        return None
+    items.sort(key=lambda item: item[0])
+    strategy = str(rules.get("match_strategy") or "ceil").strip().lower()
+    selected: tuple[float, float, float] | None = None
+    lower: tuple[float, float, float] | None = None
+    upper: tuple[float, float, float] | None = None
+    for item in items:
+        if item[0] == requested:
+            selected = item
+            lower = upper = item
+            break
+        if item[0] < requested:
+            lower = item
+        elif upper is None:
+            upper = item
+    if selected is None:
+        if strategy == "exact":
+            return None
+        if strategy == "linear" and lower is not None and upper is not None:
+            span = upper[0] - lower[0]
+            ratio = (requested - lower[0]) / span if span > 0 else 0
+            selected = (
+                requested,
+                lower[1] + (upper[1] - lower[1]) * ratio,
+                lower[2] + (upper[2] - lower[2]) * ratio,
+            )
+        elif strategy == "ceil" and upper is not None:
+            selected = upper
+        else:
+            # Below the first node or above the last node: clamp to the
+            # nearest configured endpoint for both ceil and linear modes.
+            selected = upper or lower
+    if selected is None:
+        return None
+    source_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}[source_unit]
+    target_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}[target_unit]
+    width = selected[1] / source_factor * target_factor
+    bleed = selected[2] / source_factor * target_factor
+    return max(0, width), {
+        "method": "product_page_count_table",
+        "match_strategy": strategy,
+        "requested_page_count": requested,
+        "matched_page_count": selected[0],
+        "formula_unit": source_unit,
+        "target_unit": target_unit,
+        "spine_width": max(0, width),
+        "spine_bleed": max(0, bleed),
+    }
+
+
 def resolve_spine_width_for_page_count(
     fields: dict[str, Any],
     page_count: Any,

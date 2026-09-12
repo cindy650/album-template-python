@@ -74,7 +74,8 @@ ORDER_PATTERN = re.compile(
 )
 
 PRODUCT_BLOCK_BOUNDARY_PATTERN = re.compile(
-    r"^(?:Purchase Shipping Label|Shipping internationally|"
+    r"^(?:Purchase Shipping Label|Purchase Postage Label|"
+    r"Shipping internationally|Dispatching internationally|"
     r"Sell with confidence|Learn about|Ship with DDP|"
     r"With Delivered Duties Paid|Order details|Payment method|"
     r"Shipping address|Paid via Etsy Payments|Payments made via)",
@@ -84,6 +85,10 @@ PRODUCT_BLOCK_BOUNDARY_PATTERN = re.compile(
 PRODUCT_OPTION_LINE_PATTERN = re.compile(
     r"^(?P<label>[^:：]{1,100}?)\s*[:：]\s*(?P<value>.*)$"
 )
+
+# Reserved key persisted inside each order item's 商品信息 JSON.  The value
+# is the image URL shown next to that item's Etsy listing title.
+PRODUCT_IMAGE_FIELD = "product_image"
 
 # Etsy listing titles may contain a colon. These labels are the stable option
 # anchors used by the order email layout; dynamic labels remain supported once
@@ -225,6 +230,12 @@ class HTMLTextExtractor(HTMLParser):
         self.listing_link_depth = 0
         self.product_title_parts = []
         self.product_titles = []
+        self.product_images = []
+        self.pending_product_image = ""
+        self.current_product_image = ""
+        self.current_embedded_product_image = ""
+        self.current_listing_key = ""
+        self.listing_images_by_key = {}
 
     def add_newline(self):
         if not self.parts or self.parts[-1] != "\n":
@@ -234,6 +245,62 @@ class HTMLTextExtractor(HTMLParser):
         if self.parts and not self.parts[-1].endswith((" ", "\n", "\t")):
             self.parts.append(" ")
 
+    @staticmethod
+    def _image_url(attributes):
+        """Return the best source URL from an Etsy thumbnail <img> tag."""
+        for key in (
+            "data-src",
+            "data-original",
+            "data-lazy-src",
+            "data-image-url",
+            "src",
+        ):
+            value = str(attributes.get(key, "") or "").strip()
+            # Never persist an inline base64 image in product_information;
+            # it can make an otherwise small order JSON several megabytes.
+            if value and not value.casefold().startswith("data:"):
+                return value
+        srcset = str(attributes.get("srcset", "") or "").strip()
+        if srcset:
+            # Use the first candidate; retaining the URL exactly as supplied
+            # keeps signed CDN query parameters intact.
+            candidate = srcset.split(",", 1)[0].strip().split()[0]
+            if candidate and not candidate.casefold().startswith("data:"):
+                return candidate
+        return ""
+
+    @staticmethod
+    def _is_placeholder_image(image_url):
+        normalized = str(image_url or "").casefold()
+        return "spacer-trans.gif" in normalized or normalized.endswith("spacer.gif")
+
+    @staticmethod
+    def _listing_key(href):
+        """Return the stable Etsy transaction/listing id contained in a link."""
+        match = re.search(
+            r"/(?:transaction|listing)/([^/?#]+)",
+            str(href or ""),
+            re.IGNORECASE,
+        )
+        return match.group(1).casefold() if match else ""
+
+    def _capture_image(self, attributes):
+        image_url = self._image_url(attributes)
+        if not image_url or self._is_placeholder_image(image_url):
+            return
+        if self.listing_link_depth:
+            self.current_product_image = image_url
+            self.current_embedded_product_image = image_url
+        elif self.product_images and not self.product_images[-1]:
+            # Some Etsy email layouts put the real image after the title
+            # anchor. Backfill the just-finished item before waiting for the
+            # next listing anchor.
+            self.product_images[-1] = image_url
+        else:
+            # Etsy commonly renders the thumbnail immediately before the
+            # listing anchor. Keep it pending until that anchor starts.
+            self.pending_product_image = image_url
+
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         attributes = {str(key).lower(): str(value or "") for key, value in attrs}
@@ -241,6 +308,9 @@ class HTMLTextExtractor(HTMLParser):
             self.skip_depth += 1
             return
         if self.skip_depth:
+            return
+        if tag == "img":
+            self._capture_image(attributes)
             return
         href = attributes.get("href", "").casefold()
         if tag == "a" and (
@@ -251,13 +321,24 @@ class HTMLTextExtractor(HTMLParser):
             self.add_newline()
             self.listing_link_depth += 1
             self.product_title_parts = []
+            self.current_listing_key = self._listing_key(attributes.get("href", ""))
+            self.current_embedded_product_image = ""
+            self.current_product_image = (
+                self.listing_images_by_key.get(self.current_listing_key, "")
+                or self.pending_product_image
+            )
+            self.pending_product_image = ""
         if tag in {"br", "hr"} or tag in self.BLOCK_TAGS:
             self.add_newline()
         elif tag in {"td", "th"}:
             self.add_space()
 
     def handle_startendtag(self, tag, attrs):
-        if tag.lower() in {"br", "hr"}:
+        tag = tag.lower()
+        if tag == "img" and not self.skip_depth:
+            attributes = {str(key).lower(): str(value or "") for key, value in attrs}
+            self._capture_image(attributes)
+        elif tag in {"br", "hr"}:
             self.add_newline()
 
     def handle_endtag(self, tag):
@@ -271,8 +352,23 @@ class HTMLTextExtractor(HTMLParser):
         if tag == "a" and self.listing_link_depth:
             self.add_newline()
             title = " ".join("".join(self.product_title_parts).split()).strip()
+            if (
+                not title
+                and self.current_listing_key
+                and self.current_embedded_product_image
+            ):
+                # Etsy may render the thumbnail and title as two adjacent
+                # anchors pointing at the same transaction. Remember the
+                # image-only anchor so the following title anchor can reuse it.
+                self.listing_images_by_key[self.current_listing_key] = (
+                    self.current_embedded_product_image
+                )
             if title:
                 self.product_titles.append(title)
+                self.product_images.append(self.current_product_image)
+            self.current_product_image = ""
+            self.current_embedded_product_image = ""
+            self.current_listing_key = ""
             self.listing_link_depth -= 1
         if tag == "tr" or tag in self.BLOCK_TAGS:
             self.add_newline()
@@ -306,10 +402,11 @@ class HTMLTextExtractor(HTMLParser):
 class ExtractedMailBody(str):
     """Plain email text carrying fields captured before HTML flattening."""
 
-    def __new__(cls, value, product_title="", product_titles=None):
+    def __new__(cls, value, product_title="", product_titles=None, product_images=None):
         instance = super().__new__(cls, value)
         instance.product_title = str(product_title or "").strip()
         instance.product_titles = list(product_titles or ([] if not product_title else [product_title]))
+        instance.product_images = list(product_images or [])
         return instance
 
 
@@ -321,6 +418,7 @@ def html_to_text(html_content):
         parser.get_text(),
         product_title=parser.get_product_title(),
         product_titles=parser.product_titles,
+        product_images=parser.product_images,
     )
 
 
@@ -1190,7 +1288,7 @@ def _to_vancouver_time(value):
 def extract_customer_and_country(shipping_address):
     """Read the buyer name and country from the normalized address block."""
     lines = [line.strip() for line in str(shipping_address or "").splitlines() if line.strip()]
-    if lines and re.fullmatch(r"Shipping address\s*:?", lines[0], re.IGNORECASE):
+    if lines and re.fullmatch(r"(?:Shipping|Delivery) address\s*:?", lines[0], re.IGNORECASE):
         lines = lines[1:]
     if not lines:
         return "", ""
@@ -1351,9 +1449,11 @@ def extract_payment_method_section(lines):
             start,
             [
                 r"^Payments made via",
-                r"^Shipping address\s*:?$",
+                r"^(?:Shipping|Delivery) address\s*:?$",
                 r"^Purchase Shipping Label",
+                r"^Purchase Postage Label",
                 r"^Shipping internationally",
+                r"^Dispatching internationally",
                 r"^Sell with confidence",
                 r"^Ship with DDP",
             ],
@@ -1372,7 +1472,7 @@ def extract_payment_method_section(lines):
 
 
 def extract_shipping_address_section(lines):
-    start = find_line_index(lines, r"^Shipping address\s*:?$")
+    start = find_line_index(lines, r"^(?:Shipping|Delivery) address\s*:?$")
     if start < 0:
         return ""
     section = collect_section(
@@ -1380,7 +1480,9 @@ def extract_shipping_address_section(lines):
         start,
         [
             r"^Purchase Shipping Label",
+            r"^Purchase Postage Label",
             r"^Shipping internationally",
+            r"^Dispatching internationally",
             r"^Sell with confidence",
             r"^Learn about Etsy Seller Protection",
             r"^Ship with DDP",
@@ -1517,7 +1619,10 @@ def extract_order_details(body):
 
 def remove_section_heading(section, heading):
     lines = section.splitlines()
-    if lines and re.fullmatch(rf"{re.escape(heading)}\s*:?", lines[0], re.IGNORECASE):
+    heading_pattern = re.escape(heading)
+    if str(heading).casefold() == "shipping address":
+        heading_pattern = r"(?:Shipping|Delivery) address"
+    if lines and re.fullmatch(rf"{heading_pattern}\s*:?", lines[0], re.IGNORECASE):
         lines = lines[1:]
     return "\n".join(lines).strip()
 
@@ -1586,6 +1691,7 @@ def extract_order_totals(lines):
         "discount": "discount",
         "subtotal": "subtotal",
         "shipping": "shipping",
+        "delivery": "shipping",
         "sales tax": "sales_tax",
         "tax total": "tax_total",
         "tax": "tax_total",
@@ -1595,7 +1701,7 @@ def extract_order_totals(lines):
     }
     label_pattern = re.compile(
         r"^(Item total|Discount|Subtotal|Shipping|Sales tax|Tax total|Tax|"
-        r"QC GST|GST/HST|Order total)\s*:?\s*(.*)$",
+        r"QC GST|GST/HST|Delivery|Order total)\s*:?\s*(.*)$",
         re.IGNORECASE,
     )
     stop_pattern = re.compile(
@@ -1678,6 +1784,9 @@ def parse_order_fields(
     if not product_name:
         product_name = extract_product_name(body)
     product_information = extract_product_options_from_lines(lines, product_name)
+    product_images = list(getattr(body, "product_images", ()) or ())
+    if product_images and product_images[0]:
+        product_information[PRODUCT_IMAGE_FIELD] = product_images[0]
     payment_method = remove_section_heading(
         extract_payment_method_section(lines),
         "Payment method",
@@ -1753,6 +1862,7 @@ def parse_mail_order_items(subject, body, email_date="", metadata=None, uid=None
         }
 
     titles = list(getattr(body, "product_titles", ()) or ())
+    images = list(getattr(body, "product_images", ()) or ())
     items = []
     # A transaction terminates at its own item price (or before the next
     # transaction). Start each block after the previous transaction's price.
@@ -1798,6 +1908,8 @@ def parse_mail_order_items(subject, body, email_date="", metadata=None, uid=None
             elif current_field and line.strip():
                 info_values[current_field].append(line.strip())
         info = {field: " ".join(values).strip() for field, values in info_values.items()}
+        if item_index < len(images) and images[item_index]:
+            info[PRODUCT_IMAGE_FIELD] = images[item_index]
         item = {
             "订单号": extract_order_number(subject, body),
             "店铺": extract_shop(body),

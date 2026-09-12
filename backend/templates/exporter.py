@@ -17,6 +17,7 @@ from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 from PIL import Image, ImageColor, ImageFont
 
 from backend.orders.statuses import PRODUCTION_ORDER_STATUS
+from backend.orders.print_image import product_information_entries
 from backend.storage import (
     order_resource_dir,
     order_resource_filename,
@@ -88,7 +89,7 @@ class TemplateExportService:
         if file_format:
             print(
                 f"[EXPORT] [COMPAT] 已忽略源文件格式参数：{file_format}；"
-                "订单目录固定生成五个生产文件",
+                "订单目录固定生成六个生产文件",
                 flush=True,
             )
         return self.generate_order_artifacts(
@@ -108,7 +109,7 @@ class TemplateExportService:
         update_status: bool = False,
         upload_to_oss: bool = True,
     ):
-        """Generate the five fixed order artifacts, then upload them together."""
+        """Generate the six fixed order artifacts, then upload them together."""
         if source_format:
             print(
                 f"[EXPORT] [COMPAT] 已忽略源文件格式参数：{source_format}",
@@ -217,6 +218,13 @@ class TemplateExportService:
         if not a4_path.is_file():
             raise RuntimeError("A4 订单打印图生成失败")
         persist("production_sheet", "jpg", a4_path.name, a4_path.read_bytes())
+        product_information_text = self._product_information_text(order, a4_result)
+        persist(
+            "product_information",
+            "txt",
+            order_resource_filename(order, "txt", artifact="要求"),
+            product_information_text.encode("utf-8-sig"),
+        )
 
         # The WeCom auxiliary image is generated before this coordinator is
         # called. Register it with the same order folder, then upload the
@@ -238,7 +246,14 @@ class TemplateExportService:
             raise RuntimeError("企业微信辅助图生成失败")
         persist("wecom", "jpg", wecom_path.name, wecom_path.read_bytes())
 
-        required_types = {"preview", "svg", "converted_svg", "wecom", "production_sheet"}
+        required_types = {
+            "preview",
+            "svg",
+            "converted_svg",
+            "wecom",
+            "production_sheet",
+            "product_information",
+        }
         artifact_types = [item["artifact_type"] for item in artifacts]
         missing_types = sorted(required_types.difference(artifact_types))
         duplicate_types = sorted(
@@ -251,22 +266,22 @@ class TemplateExportService:
             for item in artifacts
             if not Path(item["local_path"]).is_file()
         ]
-        if missing_types or duplicate_types or missing_files or len(artifacts) != 5:
+        if missing_types or duplicate_types or missing_files or len(artifacts) != 6:
             raise RuntimeError(
-                "订单五个生产文件未完整生成："
+                "订单六个生产文件未完整生成："
                 f"缺少类型={missing_types or '无'}，"
                 f"重复类型={duplicate_types or '无'}，"
                 f"缺少文件={missing_files or '无'}，实际数量={len(artifacts)}"
             )
         if upload_to_oss:
             print(
-                "[EXPORT] [FILE] 五个订单文件已全部生成，开始统一上传 OSS："
+                "[EXPORT] [FILE] 六个订单文件已全部生成，开始统一上传 OSS："
                 + "、".join(item["filename"] for item in artifacts),
                 flush=True,
             )
         else:
             print(
-                "[EXPORT] [FILE] 五个订单文件已全部生成，仅保存在本地："
+                "[EXPORT] [FILE] 六个订单文件已全部生成，仅保存在本地："
                 + "、".join(item["filename"] for item in artifacts),
                 flush=True,
             )
@@ -300,7 +315,7 @@ class TemplateExportService:
                 artifact["oss_url"] = None
 
         print(
-            "[EXPORT] [OSS] 五个订单文件上传阶段完成，开始写入产物记录"
+            "[EXPORT] [OSS] 六个订单文件上传阶段完成，开始写入产物记录"
             if upload_to_oss
             else "[EXPORT] [OSS] 已跳过上传，开始写入本地产物记录",
             flush=True,
@@ -333,7 +348,7 @@ class TemplateExportService:
         order_id: int,
         order_number: str,
     ) -> dict[str, Any]:
-        """Regenerate all five local artifacts, then replace their OSS objects."""
+        """Regenerate all six local artifacts, then replace their OSS objects."""
         order = self.order_repository.get_by_id_and_order_number(
             order_id,
             order_number,
@@ -352,7 +367,7 @@ class TemplateExportService:
         template = snapshot if snapshot is not None else database_template
         template_resolved = snapshot is not None
         print(
-            f"[客户确认] 开始重新生成五个订单文件：订单号={order_number}，"
+            f"[客户确认] 开始重新生成六个订单文件：订单号={order_number}，"
             f"模板来源={'订单快照' if template_resolved else '数据库模板'}",
             flush=True,
         )
@@ -366,7 +381,7 @@ class TemplateExportService:
         output_dir = order_resource_dir(self.output_dir, order)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save all five fresh artifacts locally first. OSS is touched only
+        # Save all six fresh artifacts locally first. OSS is touched only
         # after every local file exists and has a non-zero size.
         preview_path = output_dir / order_resource_filename(order, "jpg", artifact="预览图")
         preview_buffer = BytesIO()
@@ -427,18 +442,29 @@ class TemplateExportService:
             raise RuntimeError("客户确认后 A4 生产单重新生成失败")
         print(f"[客户确认] 生产单已覆盖本地文件：文件={a4_path.name}", flush=True)
 
+        product_information_path = self._save_file(
+            output_dir,
+            order_resource_filename(order, "txt", artifact="要求"),
+            self._product_information_text(order, a4_result).encode("utf-8-sig"),
+        )
+        print(
+            f"[客户确认] 商品信息文本已覆盖本地文件：文件={product_information_path.name}",
+            flush=True,
+        )
+
         artifacts = [
             self._confirmation_artifact(order_id, "preview", "jpg", preview_path),
             self._confirmation_artifact(order_id, "wecom", "jpg", wecom_path),
             self._confirmation_artifact(order_id, "svg", "svg", svg_path),
             self._confirmation_artifact(order_id, "converted_svg", "svg", converted_svg_path),
             self._confirmation_artifact(order_id, "production_sheet", "jpg", a4_path),
+            self._confirmation_artifact(order_id, "product_information", "txt", product_information_path),
         ]
         missing = [item["filename"] for item in artifacts if not Path(item["local_path"]).is_file() or Path(item["local_path"]).stat().st_size <= 0]
         if missing:
             raise RuntimeError(f"客户确认后订单文件未完整生成：缺少文件={missing}")
         print(
-            "[客户确认] 五个订单文件已全部生成，开始统一上传 OSS："
+            "[客户确认] 六个订单文件已全部生成，开始统一上传 OSS："
             + "、".join(item["filename"] for item in artifacts),
             flush=True,
         )
@@ -502,6 +528,36 @@ class TemplateExportService:
             "oss": {"status": "pending", "url": None, "object_key": None},
             "file_size": path.stat().st_size,
         }
+
+    def _product_information_text(
+        self,
+        order: dict[str, Any],
+        a4_result: dict[str, Any] | None = None,
+    ) -> str:
+        """Return the grouped source/translation text accompanying the A4 sheet."""
+        existing = str((a4_result or {}).get("product_information_text") or "")
+        if existing.strip():
+            return existing if existing.endswith("\n") else existing + "\n"
+
+        product_information = order.get("product_information") or {}
+        entries = product_information_entries(product_information)
+        source_lines = [
+            f"{index}. {label}: {value}"
+            for index, (label, value, _is_user_message) in enumerate(entries, start=1)
+        ]
+        translations: list[str] = []
+        translator = getattr(self.order_print_image_generator, "translator", None)
+        analyze = getattr(translator, "analyze", None)
+        if callable(analyze):
+            analyzed = analyze(product_information)
+            translations = list(analyzed[0] if isinstance(analyzed, tuple) else analyzed)
+        sections = ["商品信息", *source_lines, "", "翻译"]
+        sections.extend(
+            f"{index}. {str(value).strip()}"
+            for index, value in enumerate(translations, start=1)
+            if str(value).strip()
+        )
+        return "\n".join(sections).rstrip() + "\n"
 
     def _remove_obsolete_source_artifacts(self, output_dir: Path, order_id: int) -> None:
         for path in output_dir.glob("*-源文件.*"):

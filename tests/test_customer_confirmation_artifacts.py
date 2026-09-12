@@ -109,7 +109,12 @@ class _A4Generator:
             artifact="生产单",
         )
         path.write_bytes(b"new-production-sheet")
-        return {"path": str(path)}
+        return {
+            "path": str(path),
+            "product_information_text": (
+                "商品信息\n1. Book Size: 9*6\n\n翻译\n1. 书籍尺寸：9*6\n"
+            ),
+        }
 
     def assertions(self, upload_to_oss, preview_path):
         if upload_to_oss is not False:
@@ -180,7 +185,7 @@ class CustomerConfirmationStatusTests(unittest.TestCase):
 
 
 class CustomerConfirmationArtifactTests(unittest.TestCase):
-    def test_all_five_artifacts_are_replaced_and_uploaded(self):
+    def test_all_six_artifacts_are_replaced_and_uploaded(self):
         order = {
             "id": 78,
             "order_number": "4156669962",
@@ -218,19 +223,30 @@ class CustomerConfirmationArtifactTests(unittest.TestCase):
                 "4156669962",
             )
 
-            self.assertEqual(len(result["artifacts"]), 5)
+            self.assertEqual(len(result["artifacts"]), 6)
             self.assertEqual(
                 {item["artifact_type"] for item in result["artifacts"]},
-                {"preview", "wecom", "svg", "converted_svg", "production_sheet"},
+                {
+                    "preview",
+                    "wecom",
+                    "svg",
+                    "converted_svg",
+                    "production_sheet",
+                    "product_information",
+                },
             )
-            self.assertEqual(len(storage.uploaded), 5)
-            self.assertEqual(len(repository.saved_artifacts), 5)
+            self.assertEqual(len(storage.uploaded), 6)
+            self.assertEqual(len(repository.saved_artifacts), 6)
             self.assertNotEqual(preview.read_bytes(), b"old-preview")
             self.assertNotEqual(wecom.read_bytes(), b"old-wecom")
             svg_path = next(path for path in storage.uploaded if path.name.endswith(".svg"))
             a4_path = next(path for path in storage.uploaded if path.name.endswith("生产单.jpg"))
+            text_path = next(path for path in storage.uploaded if path.name.endswith("要求.txt"))
             self.assertIn("font-family", svg_path.read_text(encoding="utf-8"))
             self.assertEqual(a4_path.read_bytes(), b"new-production-sheet")
+            text = text_path.read_text(encoding="utf-8-sig")
+            self.assertIn("1. Book Size: 9*6", text)
+            self.assertIn("1. 书籍尺寸：9*6", text)
 
 
 if __name__ == "__main__":

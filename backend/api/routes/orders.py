@@ -19,6 +19,7 @@ from backend.schemas import (
     OrderPrintImageRequest,
     OrderStatusAdvanceRequest,
     OrderStatusUpdate,
+    OrderTemplateAssociationRequest,
     OrderTemplateJsonUpdate,
     ParseOrderRequest,
 )
@@ -206,6 +207,41 @@ async def save_order_template_json(
             detail=str(exc),
         ) from exc
     return api_success(result, message="订单模板 JSON 保存成功")
+
+
+@router.put(
+    "/{order_id}/template-association",
+    summary="手动关联订单产品和规格模板",
+    description=(
+        "订单处于新订单状态时，按订单当前店铺校验产品、尺寸模板和规格，"
+        "读取该规格已保存的图层并原子写入订单。不会推进订单状态；"
+        "关联成功后继续调用 /preview-images/send 发送示意图。"
+    ),
+)
+async def associate_order_template(
+    payload: OrderTemplateAssociationRequest,
+    order_id: int = Path(gt=0, description="订单商品行 ID"),
+):
+    try:
+        result = await run_in_threadpool(
+            order_repository.associate_template_selection,
+            order_id,
+            payload.order_number,
+            payload.product_id,
+            payload.size_template_id,
+            payload.size_option_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return api_success(result, message="订单产品和规格模板关联成功")
 
 
 @router.post(

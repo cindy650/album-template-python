@@ -29,6 +29,14 @@
 
     const bounds = resolveWorkareaBounds(workarea);
     syncSpineEndBlocks(rawObjects, workarea, bounds);
+    // Product safe distances are supplied by the backend adapter.  Keep the
+    // renderer compatible with the frontend's camelCase/snake_case payloads,
+    // while preserving the backend-only product switch and defaults.
+    const renderWorkarea = {
+      ...workarea,
+      ...resolveSafeDistances(options, source, workarea),
+    };
+    applyAlignmentMarkers(rawObjects, workarea);
     const cropWidth = Math.ceil(bounds.width);
     const cropHeight = Math.ceil(bounds.height);
     const dpi = positive(options?.dpi ?? 300, 'dpi');
@@ -54,26 +62,18 @@
     objectsToRender.push(...rawObjects.filter(item => String(item?.id || '').toLowerCase() !== 'workarea'));
 
     for (const serialized of objectsToRender) {
-      // Alignment markers define the position used for the first safety check.
-      // Objects without a marker keep their authored position throughout.
-      applyAlignmentMarkers([serialized], workarea);
       const local = toWorkareaScene(serialized, bounds);
       const object = await createObject(local, warnings);
       if (!object) continue;
       const fitResult = fitTextObjectToSafeRegion(
         object,
         serialized,
-        workarea,
+        renderWorkarea,
         bounds,
         options,
       );
       warnings.push(...fitResult.warnings);
       textOverflowBlocked = textOverflowBlocked || fitResult.blocked;
-      // Reapply markers after font fitting so a reduced text box is centered
-      // using its final geometry. Unmarked axes remain untouched.
-      applyAlignmentMarkers([serialized], workarea);
-      const alignedLocal = toWorkareaScene(serialized, bounds);
-      object.set({ left: alignedLocal.left, top: alignedLocal.top });
       canvas.add(object);
       object.setCoords?.();
     }
@@ -352,6 +352,32 @@
     return [boundaries[nearestIndex] ?? 0, boundaries[nearestIndex + 1] ?? size];
   }
 
+  // Fabric's measured dimensions are authoritative after a font-size change.
+  // Centering from serialized width/height can use stale editor dimensions and
+  // leave a fitted text layer visibly off-center.
+  function centerFabricObjectInPrintRegion(object, serialized, regions) {
+    if (!object || !serialized || typeof object.getCenterPoint !== 'function') return;
+    const current = object.getCenterPoint();
+    let nextX = current.x;
+    let nextY = current.y;
+    if (serialized.horizontalCentered === true) {
+      const face = nearestRegion(current.x, regions.faces);
+      nextX = (face.start + face.end) / 2;
+    }
+    if (serialized.verticalCentered === true) {
+      const row = nearestRegion(current.y, regions.rows);
+      nextY = (row.start + row.end) / 2;
+    }
+    if (nextX === current.x && nextY === current.y) return;
+    if (typeof object.setPositionByOrigin === 'function') {
+      object.setPositionByOrigin(new fabric.Point(nextX, nextY), 'center', 'center');
+    } else {
+      object.left = numberOr(object.left, 0) + nextX - current.x;
+      object.top = numberOr(object.top, 0) + nextY - current.y;
+    }
+    object.setCoords?.();
+  }
+
   function getSerializedObjectCenter(object) {
     const rawWidth = finiteOrNull(object.width ?? object.workareaWidth) ?? 0;
     const rawHeight = finiteOrNull(object.height ?? object.workareaHeight) ?? 0;
@@ -372,6 +398,11 @@
 
   function fitTextObjectToSafeRegion(object, serialized, workarea, bounds, options) {
     if (!object || String(serialized?.id || '').toLowerCase() === 'workarea') return { warnings: [], blocked: false };
+    // Product configuration controls whether text safety monitoring is
+    // enabled for this render. An explicit false must bypass both the
+    // margin calculation and automatic font-size reduction; otherwise the
+    // renderer's compatibility defaults would still apply.
+    if (options?.useSafeDistance === false) return { warnings: [], blocked: false };
     if (typeof object.getObjects === 'function' && object.getObjects().length) {
       const children = object.getObjects();
       const serializedChildren = Array.isArray(serialized?.objects) ? serialized.objects : [];
@@ -395,6 +426,9 @@
 
     const regions = buildTextSafeRegions(workarea, bounds, options);
     if (!regions) return { warnings: [], blocked: false };
+    // A marked layer is centered before the first safety measurement. An
+    // unmarked layer remains at its authored position.
+    centerFabricObjectInPrintRegion(object, serialized, regions);
     const center = object.getCenterPoint();
     // `object` has already been translated to workarea-local coordinates by
     // toWorkareaScene. Subtracting the workarea origin again misclassifies
@@ -444,6 +478,14 @@
       object.setCoords?.();
       rect = object.getBoundingRect();
     }
+    // Font fitting changes Fabric's measured width/height. Run the marker
+    // centering one final time against that actual geometry before exporting.
+    centerFabricObjectInPrintRegion(object, serialized, regions);
+    if (serialized) {
+      serialized.left = numberOr(object.left, 0) + bounds.left;
+      serialized.top = numberOr(object.top, 0) + bounds.top;
+    }
+    rect = object.getBoundingRect();
     const finalSize = numberOr(object.fontSize, originalSize);
     if (serialized && finalSize < originalSize - 0.01) serialized.fontSize = finalSize;
     const label = String(serialized?.name || serialized?.id || '未命名图层');
@@ -476,12 +518,21 @@
     // Single-row layouts keep the existing cover/spine margins. For a
     // double-row layout, the 6mm safe distance applies to each page edge;
     // there is no spine region in this layout.
-    const configured = options.safeDistances
-      || workarea.safeDistances
-      || workarea.safe_distance
-      || {};
-    const readMargins = (key, fallback) => {
-      const value = configured[key] || {};
+    const configured = options
+      && options.safeDistances !== null
+      && typeof options.safeDistances === 'object'
+      ? options.safeDistances
+      : {};
+    const readMargins = (camelKey, snakeKey, snakeJsonKey, fallback) => {
+      // Backend product records use snake_case; direct renderer callers and
+      // the frontend use camelCase. Product options win over document fields.
+      const value = configured[camelKey]
+        ?? configured[snakeKey]
+        ?? configured[snakeJsonKey]
+        ?? workarea[camelKey]
+        ?? workarea[snakeKey]
+        ?? workarea[snakeJsonKey]
+        ?? {};
       const configuredFactor = PIXELS_PER_UNIT.mm;
       const resolveMargin = (side) => (
         value[side] == null
@@ -497,15 +548,21 @@
     };
     const doubleRowSafeMargin = 6 / 25.4;
     const coverMargin = readMargins(
+      'coverSafeDistance',
       'cover_safe_distance',
+      'cover_safe_distance_json',
       rows === 2 ? doubleRowSafeMargin : 0.4,
     );
     const backCoverMargin = readMargins(
+      'backCoverSafeDistance',
       'back_cover_safe_distance',
+      'back_cover_safe_distance_json',
       rows === 2 ? doubleRowSafeMargin : 0.4,
     );
     const spineMargin = readMargins(
+      'spineSafeDistance',
       'spine_safe_distance',
+      'spine_safe_distance_json',
       rows === 2 ? 0 : 0.05,
     );
     const makeRegion = (name, start, end) => {
@@ -561,6 +618,55 @@
       const nearestDistance = value < nearest.start ? nearest.start - value : value - nearest.end;
       return distance < nearestDistance ? region : nearest;
     });
+  }
+
+  function normalizeSafeDistance(value) {
+    let raw = value;
+    if (typeof raw === 'string' && raw.trim()) {
+      try { raw = JSON.parse(raw); } catch { raw = {}; }
+    }
+    const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    return {
+      top: nonnegativeOrNull(source.top) ?? 0,
+      right: nonnegativeOrNull(source.right) ?? 0,
+      bottom: nonnegativeOrNull(source.bottom) ?? 0,
+      left: nonnegativeOrNull(source.left) ?? 0,
+    };
+  }
+
+  function resolveSafeDistances(options, source, workarea) {
+    const sourceSafe = source
+      && source.safeDistances !== null
+      && typeof source.safeDistances === 'object'
+      ? source.safeDistances
+      : {};
+    const optionSafe = options
+      && options.safeDistances !== null
+      && typeof options.safeDistances === 'object'
+      ? options.safeDistances
+      : {};
+    const read = (camel, snake, snakeJson) => {
+      const raw = optionSafe[camel]
+        ?? optionSafe[snake]
+        ?? optionSafe[snakeJson]
+        ?? sourceSafe[camel]
+        ?? sourceSafe[snake]
+        ?? sourceSafe[snakeJson]
+        ?? source?.[camel]
+        ?? source?.[snake]
+        ?? source?.[snakeJson]
+        ?? workarea?.[camel]
+        ?? workarea?.[snake]
+        ?? workarea?.[snakeJson];
+      // Leave an absent configuration absent so the backend's compatibility
+      // defaults (rather than an injected all-zero object) still apply.
+      return raw == null ? undefined : normalizeSafeDistance(raw);
+    };
+    return {
+      coverSafeDistance: read('coverSafeDistance', 'cover_safe_distance', 'cover_safe_distance_json'),
+      spineSafeDistance: read('spineSafeDistance', 'spine_safe_distance', 'spine_safe_distance_json'),
+      backCoverSafeDistance: read('backCoverSafeDistance', 'back_cover_safe_distance', 'back_cover_safe_distance_json'),
+    };
   }
 
   function buildPrintGuides(width, height, values, fallbackGuides) {

@@ -52,6 +52,10 @@ class FakeStorageService:
                 "relative_name": "production/order.svg",
                 "content": b"<svg/>",
             },
+            {
+                "relative_name": "3号店-4141461118-20260827-要求.txt",
+                "content": "商品信息\n1. Book Size: 9*6\n\n翻译\n1. 书籍尺寸：9*6\n".encode("utf-8-sig"),
+            },
         ]
 
 
@@ -85,6 +89,7 @@ class TemplateExportDownloadTests(unittest.TestCase):
             self.assertEqual(
                 sorted(zipped.namelist()),
                 [
+                    "3号店-4141461118-20260827/3号店-4141461118-20260827-要求.txt",
                     "3号店-4141461118-20260827/preview.jpg",
                     "3号店-4141461118-20260827/production/order.svg",
                 ],
@@ -92,6 +97,12 @@ class TemplateExportDownloadTests(unittest.TestCase):
             self.assertEqual(
                 zipped.read("3号店-4141461118-20260827/preview.jpg"),
                 b"preview-content",
+            )
+            self.assertIn(
+                "1. 书籍尺寸：9*6",
+                zipped.read(
+                    "3号店-4141461118-20260827/3号店-4141461118-20260827-要求.txt"
+                ).decode("utf-8-sig"),
             )
 
 

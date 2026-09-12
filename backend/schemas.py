@@ -90,7 +90,7 @@ class OrderData(BaseModel):
     product_information: dict[str, str] = Field(
         default_factory=dict,
         alias="商品信息",
-        description="订单商品的规格、定制文字等信息",
+        description="订单商品的规格、定制文字等信息；HTML 邮件商品缩略图地址使用 product_image 字段",
     )
     payment_method: str = Field(default="", alias="付款方式", description="付款方式")
     shipping_address: str = Field(default="", alias="邮寄地址", description="收货地址")
@@ -147,6 +147,18 @@ class OrderTemplateJsonUpdate(BaseModel):
     order_number: str = Field(min_length=1, description="订单号")
     template_json: dict[str, Any] = Field(
         description="前端编辑后的完整订单模板 JSON，按原值保存",
+    )
+
+
+class OrderTemplateAssociationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    order_number: str = Field(min_length=1, description="订单号")
+    product_id: int = Field(gt=0, description="前端选择的产品分类 ID")
+    size_template_id: int = Field(gt=0, description="前端选择的尺寸模板 ID")
+    size_option_id: str = Field(
+        min_length=1,
+        description="尺寸模板中的规格业务 ID，例如 10x8",
     )
 
 
@@ -210,6 +222,7 @@ class ImageMapRenderRequest(BaseModel):
 class ShopCreate(BaseModel):
     shop: str = Field(description="店铺唯一标识")
     shop_name: str = Field(default="", description="店铺名")
+    settlement_currency: str = Field(default="CAD", description="店铺结算币种（CAD/USD 等）")
     wecom_robot_webhook_url: str = Field(
         default="",
         validation_alias=AliasChoices(
@@ -229,6 +242,7 @@ class ShopCreate(BaseModel):
 class ShopUpdate(BaseModel):
     shop: str | None = Field(default=None, description="店铺唯一标识")
     shop_name: str | None = Field(default=None, description="店铺名")
+    settlement_currency: str | None = Field(default=None, description="店铺结算币种；传空表示不修改")
     wecom_robot_webhook_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -288,10 +302,39 @@ class ProductSpineWidthFormula(BaseModel):
     )
 
 
+class ProductSpineWidthPageRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page_count: int = Field(ge=0, description="页数节点")
+    spine_width: float = Field(ge=0, description="该页数对应的背脊宽度")
+    spine_bleed: float = Field(default=0, ge=0, description="该页数对应的背脊出血")
+
+
+class ProductSpineWidthPageRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit: Literal["in", "mm", "cm"] = Field(
+        default="cm",
+        description="分段背脊宽度和出血的单位；结果会换算为规格使用单位",
+    )
+    match_strategy: Literal["ceil", "exact", "linear"] = Field(
+        default="ceil",
+        description="页数不完全匹配时的策略；默认向上取最近页数节点",
+    )
+    items: list[ProductSpineWidthPageRule] = Field(
+        default_factory=list,
+        description="按页数升序配置的背脊宽度节点",
+    )
+
+
 class ProductCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, description="产品分类名称，例如婚礼签到册")
+    sku: str = Field(default="", description="产品 SKU，可选")
+    product_identifiers: list[str] = Field(default_factory=list, description="产品标识标签数组")
+    template_marker: str = Field(default="", description="模板匹配标识")
+    inner_page_field: str = Field(default="", description="内页字段")
     description: str = Field(default="", description="产品说明")
     product_names: list[str] = Field(
         min_length=1,
@@ -302,10 +345,9 @@ class ProductCreate(BaseModel):
         validation_alias=AliasChoices("specifications", "specifications_json"),
         description="邮件订单规格字段中允许匹配的规格片段数组；为空时按关联模板规格匹配",
     )
-    specification_field: str = Field(
-        default="Book Size | Page Count",
-        min_length=1,
-        description="从订单商品信息中读取规格值的字段名",
+    specification_field: str | None = Field(
+        default=None,
+        description="从订单商品信息中读取规格值的字段名；为空时使用 template_marker",
     )
     common_spec_values: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -318,7 +360,15 @@ class ProductCreate(BaseModel):
     )
     spine_width_formula: ProductSpineWidthFormula | None = Field(
         default=None,
-        description="产品级按页数背脊宽公式；不传表示使用尺寸模板原有范围算法",
+        description="产品级按页数背脊宽公式；spine_width_mode=formula 时使用",
+    )
+    spine_width_mode: Literal["range", "formula", "page_count_table"] | None = Field(
+        default=None,
+        description="产品背脊模式：range 固定范围、formula 产品公式、page_count_table 按页数分段",
+    )
+    spine_width_page_rules: ProductSpineWidthPageRules | None = Field(
+        default=None,
+        description="按页数分段的背脊配置；spine_width_mode=page_count_table 时必填",
     )
     cover_safe_distance: SafeDistanceValues = Field(
         default_factory=SafeDistanceValues,
@@ -345,6 +395,7 @@ class ProductCreate(BaseModel):
         description="封底安全距离，包含 top、right、bottom、left，单位固定为毫米",
     )
     shop_ids: list[int] = Field(default_factory=list, description="关联店铺 ID，可关联多个店铺")
+    use_safe_distance: bool = Field(default=True, description="是否使用安全距离")
     enabled: bool = Field(default=True, description="是否启用")
 
     @field_validator("product_names", mode="before")
@@ -365,6 +416,10 @@ class ProductUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(default=None, min_length=1, description="产品分类名称")
+    sku: str | None = Field(default=None, description="产品 SKU，可选")
+    product_identifiers: list[str] | None = Field(default=None, description="产品标识标签数组")
+    template_marker: str | None = Field(default=None, description="模板匹配标识")
+    inner_page_field: str | None = Field(default=None, description="内页字段")
     description: str | None = Field(default=None, description="产品说明")
     product_names: list[str] | None = Field(
         default=None,
@@ -377,8 +432,7 @@ class ProductUpdate(BaseModel):
     )
     specification_field: str | None = Field(
         default=None,
-        min_length=1,
-        description="从订单商品信息中读取规格值的字段名",
+        description="从订单商品信息中读取规格值的字段名；传空字符串时使用默认字段",
     )
     common_spec_values: list[dict[str, Any]] | None = Field(
         default=None,
@@ -391,7 +445,15 @@ class ProductUpdate(BaseModel):
     )
     spine_width_formula: ProductSpineWidthFormula | None = Field(
         default=None,
-        description="产品级按页数背脊宽公式；传 null 可清除并恢复原有范围算法",
+        description="产品级按页数背脊宽公式；spine_width_mode=formula 时使用，传 range 可恢复范围算法",
+    )
+    spine_width_mode: Literal["range", "formula", "page_count_table"] | None = Field(
+        default=None,
+        description="产品背脊模式：range 固定范围、formula 产品公式、page_count_table 按页数分段",
+    )
+    spine_width_page_rules: ProductSpineWidthPageRules | None = Field(
+        default=None,
+        description="按页数分段的背脊配置；spine_width_mode=page_count_table 时必填",
     )
     cover_safe_distance: SafeDistanceValues | None = Field(
         default=None,
@@ -418,6 +480,7 @@ class ProductUpdate(BaseModel):
         description="封底安全距离，包含 top、right、bottom、left，单位固定为毫米；不传则保持原值",
     )
     shop_ids: list[int] | None = Field(default=None, description="关联店铺 ID 数组")
+    use_safe_distance: bool | None = Field(default=None, description="是否使用安全距离")
     enabled: bool | None = Field(default=None, description="是否启用")
 
     @field_validator("product_names", mode="before")
@@ -640,9 +703,9 @@ class SizeTemplateCreateV2(BaseModel):
         ge=0,
         description="最大背脊宽，单位跟随 display_unit",
     )
-    spine_width_basis: Literal[0, 1] = Field(
-        default=0,
-        description="背脊依据：0 固定，1 按页数",
+    spine_width_basis: Literal["range", "formula", "page_count_table"] = Field(
+        default="range",
+        description="背脊模式：range 固定范围、formula 产品公式、page_count_table 按页数分段",
     )
     cover_safe_distance: SafeDistanceValues = Field(
         default_factory=lambda: SafeDistanceValues(),
@@ -708,9 +771,9 @@ class SizeTemplateUpdateV2(BaseModel):
         ge=0,
         description="最大背脊宽，单位跟随 display_unit",
     )
-    spine_width_basis: Literal[0, 1] | None = Field(
+    spine_width_basis: Literal["range", "formula", "page_count_table"] | None = Field(
         default=None,
-        description="背脊依据：0 固定，1 按页数",
+        description="背脊模式：range 固定范围、formula 产品公式、page_count_table 按页数分段",
     )
     cover_safe_distance: SafeDistanceValues | None = Field(
         default=None,
@@ -788,6 +851,10 @@ class FontLayoutLibraryUpdate(BaseModel):
     layers: dict[str, Any] | None = Field(
         default=None,
         description="完整图层文档",
+    )
+    preview_image: str | None = Field(
+        default=None,
+        description="预览图 OSS 访问链接；传空字符串可清除",
     )
 
 

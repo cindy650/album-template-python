@@ -106,12 +106,8 @@ class OrderService:
         saved_order = result.get("local_order") or {}
         # Dispatch the order-level summary independently. Notification latency
         # must not delay product classification, template matching, or rendering.
-        Thread(
-            target=self._send_new_order_summary,
-            args=(order, saved_order, metadata or {}),
-            daemon=True,
-        ).start()
         if not saved_order.get("size_template_id"):
+            Thread(target=self._send_new_order_summary, args=(order, saved_order, metadata or {}), daemon=True).start()
             result["template_image"] = {
                 "ok": False,
                 "status": "skipped",
@@ -193,6 +189,7 @@ class OrderService:
                     )
             else:
                 result["template_image"] = image_result
+                Thread(target=self._send_new_order_summary, args=(order, saved_order, metadata or {}), daemon=True).start()
         return result
 
     def _send_new_order_summary(self, order, saved_order, metadata):
@@ -217,9 +214,11 @@ class OrderService:
                 return None
             daily = stats.get("daily") or {}
             monthly = stats.get("monthly") or {}
+            currency = stats.get("settlement_currency") or stats.get("currency_code") or "CAD"
+            mismatch = bool(stats.get("currency_mismatch"))
             def money(value):
                 amount = float(value or 0)
-                return f"{amount:.0f}" if amount.is_integer() else f"{amount:.2f}"
+                return str(int(amount))
             sent_at = str(stats.get("email_sent_at") or "")
             try:
                 parsed_time = datetime.fromisoformat(sent_at)
@@ -227,14 +226,15 @@ class OrderService:
             except (ValueError, AttributeError):
                 display_time = sent_at
             content = "\n".join([
-                f"金额 : {money(stats.get('subtotal_amount'))} / {money(daily.get('total_amount'))} / {money(monthly.get('total_amount'))} CAD（订单 / 日 / 月）",
-                f"运费 : {money(stats.get('shipping_amount'))} / {money(daily.get('total_shipping'))} / {money(monthly.get('total_shipping'))} CAD（订单 / 日 / 月）",
+                f"金额 : {money(stats.get('subtotal_amount'))} / {money(daily.get('total_amount'))} / {money(monthly.get('total_amount'))} {currency}（订单 / 日 / 月）",
+                f"运费 : {money(stats.get('shipping_amount'))} / {money(daily.get('total_shipping'))} / {money(monthly.get('total_shipping'))} {currency}（订单 / 日 / 月）",
                 f"订单数量 : {daily.get('order_count', 0)} / {monthly.get('order_count', 0)}（日 / 月）",
                 f"产品数量 : {daily.get('product_count', 0)} / {monthly.get('product_count', 0)}（日 / 月）",
                 f"订单编号 : {stats.get('order_number') or ''}",
                 f"客户姓名 : {stats.get('customer_name') or ''}",
                 f"国家 : {stats.get('country') or ''}",
                 f"下单时间 : {display_time}",
+                *( ["币种状态 : 订单币种与店铺结算币种不一致，未换算"] if mismatch else [] ),
             ])
             notification = notifier.notify_order_summary(content)
             print(f"[企业微信] 新订单摘要已发送：订单号={stats.get('order_number')}", flush=True)
@@ -250,10 +250,16 @@ class OrderService:
         )
         if current_order.get("status") != 0:
             raise ValueError("只有新订单状态可以发送示意图")
-        saved_order = self.repository.associate_current_template(
-            order_id,
-            order_number,
+        # Sending is a render-only operation. The automation/manual flow has
+        # already copied the canonical layer JSON onto the order; never run
+        # product or template matching here.
+        manual_association = bool(
+            isinstance(current_order.get("matched_template"), dict)
+            and current_order["matched_template"].get("manual_selection")
         )
+        saved_order = current_order
+        if not saved_order.get("size_template_id"):
+            raise ValueError("订单尚未关联尺寸模板，无法发送示意图")
         if self.template_image_generator is None:
             raise RuntimeError("未配置订单预览图生成器")
         notifier = self._notifier_for_order(saved_order)
@@ -265,7 +271,7 @@ class OrderService:
             preview_result = self.template_image_generator.generate_for_order(
                 order,
                 saved_order=saved_order,
-                reuse_snapshot=False,
+                reuse_snapshot=True,
                 upload_to_oss=False,
             )
         except Exception as exc:
@@ -280,11 +286,6 @@ class OrderService:
             saved_order,
             preview_result,
         )
-        if self.production_artifact_service is not None:
-            preview_result["production_files"] = self.production_artifact_service.generate_order_artifacts(
-                saved_order["id"], saved_order["order_number"],
-                preview_result=preview_result,
-            )
         notification = notifier.notify_order_image(
             order,
             preview_result,

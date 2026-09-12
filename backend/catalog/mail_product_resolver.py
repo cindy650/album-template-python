@@ -110,11 +110,7 @@ class MailProductResolver:
         product_name: str,
         product_information: dict[str, Any],
     ):
-        exact = self.repository.find_product_name_for_shop(
-            product_name,
-            shop,
-            shop_name,
-        )
+        exact = self.repository.find_product_name_for_shop(product_name, shop, shop_name)
         if exact is not None:
             print(
                 "[邮件分类] 已命中 product_names："
@@ -122,7 +118,7 @@ class MailProductResolver:
                 f"产品ID={exact.get('product_id') or '未知'}",
                 flush=True,
             )
-            return exact
+            return self._match_template_for_product(exact, product_information)
         print(
             "[邮件分类] 未命中已有 product_names："
             f"商品={product_name or '空'}",
@@ -158,6 +154,27 @@ class MailProductResolver:
                 flush=True,
             )
             return unresolved
+        identifier_matches = []
+        info_keys = {normalize_match_text(key) for key in (product_information or {})}
+        for item in candidates:
+            identifiers = item.get("product_identifiers") or []
+            if any(normalize_match_text(identifier) in info_keys for identifier in identifiers):
+                identifier_matches.append(item)
+        if len(identifier_matches) == 1:
+            identified = self._match_template_for_product(
+                identifier_matches[0], product_information
+            )
+            print(
+                "[邮件分类] product_identifiers 命中产品："
+                f"产品ID={identified.get('product_id') or '未知'}",
+                flush=True,
+            )
+            return identified
+        print(
+            "[邮件分类] product_identifiers 匹配结果："
+            f"命中产品数={len(identifier_matches)}，继续 DeepSeek",
+            flush=True,
+        )
         print(
             "[邮件分类] 开始 DeepSeek 翻译与产品分类："
             f"商品={product_name or '空'}，候选产品数={len(candidates)}",
@@ -204,13 +221,10 @@ class MailProductResolver:
             f"产品ID={candidate.get('product_id') or '未知'}",
             flush=True,
         )
-        specification_field = str(
-            candidate.get("specification_field") or "Book Size | Page Count"
-        ).strip()
-        specification_value = self._field_value(
-            product_information,
-            specification_field,
-        )
+        specification_field = str(candidate.get("specification_field") or "").strip()
+        marker_field = str(candidate.get("template_marker") or "").strip()
+        lookup_field = specification_field or marker_field
+        specification_value = self._field_value(product_information, lookup_field)
         print(
             "[邮件分类] 读取订单规格字段："
             f"字段={specification_field or '空'}，"
@@ -218,8 +232,31 @@ class MailProductResolver:
             flush=True,
         )
         normalized_value = normalize_match_text(specification_value)
+        if not specification_field:
+            template_marker_matcher = getattr(
+                self.repository, "find_product_template_marker", None
+            )
+            template_match = (
+                template_marker_matcher(
+                    candidate["product_id"], candidate["shop_id"], specification_value
+                )
+                if template_marker_matcher is not None
+                else None
+            )
+            matched_specification = (
+                template_match.get("matched_marker") if template_match else None
+            )
+            print(
+                "[邮件分类] 使用 template_marker 匹配模板："
+                f"字段={marker_field or '空'}，字段值={specification_value or '空'}，"
+                f"结果={'唯一命中' if template_match else '未唯一命中'}",
+                flush=True,
+            )
+            configured_specifications = []
+        else:
+            template_match = None
         configured_specifications = candidate.get("specifications") or []
-        if configured_specifications:
+        if specification_field and configured_specifications:
             matched_specification = next(
                 (
                     value
@@ -234,7 +271,7 @@ class MailProductResolver:
                 None,
             )
             template_match = None
-        else:
+        elif specification_field:
             print(
                 "[邮件分类] 当前产品未配置 specifications，改用关联模板规格列表判断："
                 f"产品={candidate.get('name') or '空'}",
@@ -305,3 +342,46 @@ class MailProductResolver:
             if normalize_match_text(key) == expected:
                 return " ".join(str(value or "").split())
         return ""
+
+    def _match_template_for_product(self, product: dict[str, Any], product_information):
+        # The repository may include the first template as a legacy fallback;
+        # automatic matching must replace it only after a unique rule match.
+        product = {**product, "size_template_id": None}
+        if not product.get("template_marker") and not product.get("specification_field"):
+            try:
+                with self.repository.connect() as connection:
+                    row = connection.execute(
+                        "SELECT template_marker FROM products WHERE id = ?",
+                        (product["product_id"],),
+                    ).fetchone()
+                if row:
+                    product["template_marker"] = row["template_marker"]
+            except Exception:
+                pass
+        specification_field = str(product.get("specification_field") or "").strip()
+        marker_field = str(product.get("template_marker") or "").strip()
+        field = specification_field or marker_field
+        value = self._field_value(product_information, field)
+        if not value:
+            return product
+        if marker_field:
+            marker_matcher = getattr(self.repository, "find_product_template_marker", None)
+            marker_match = marker_matcher(product["product_id"], product["shop_id"], value) if marker_matcher else None
+            if not marker_match:
+                return product
+            product = {**product, "size_template_id": marker_match["size_template_id"]}
+            if specification_field:
+                spec_value = self._field_value(product_information, specification_field)
+                spec_matcher = getattr(self.repository, "find_template_specification", None)
+                if spec_matcher and not spec_matcher(product["size_template_id"], spec_value):
+                    return {**product, "size_template_id": None}
+            return product
+        if specification_field:
+            matcher = getattr(self.repository, "find_product_template_specification", None)
+            match = matcher(product["product_id"], product["shop_id"], value) if matcher else None
+        else:
+            matcher = getattr(self.repository, "find_product_template_marker", None)
+            match = matcher(product["product_id"], product["shop_id"], value) if matcher else None
+        if match:
+            product = {**product, "size_template_id": match.get("size_template_id")}
+        return product

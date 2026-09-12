@@ -29,7 +29,11 @@ class OrderTemplateResolver:
         current_template: dict[str, Any] | None = None,
     ):
         snapshot = (saved_order or {}).get("matched_template")
-        layers = (saved_order or {}).get("resolved_layers")
+        # API rows expose the editable document as ``template_json``. Keep a
+        # fallback for in-memory rows produced by older internal callers.
+        layers = (saved_order or {}).get("template_json")
+        if not isinstance(layers, dict):
+            layers = (saved_order or {}).get("resolved_layers")
         if not isinstance(snapshot, dict) or not isinstance(layers, dict):
             return None
         saved_template_id = snapshot.get("template_id")
@@ -46,7 +50,7 @@ class OrderTemplateResolver:
             return None
         current_layout_id = (current_template or {}).get("selected_font_layout_id")
         saved_layout_id = layers.get("layout_id", layers.get("id"))
-        if current_template is not None and (
+        if current_template is not None and not snapshot.get("manual_selection") and (
             current_layout_id in (None, "")
             or str(saved_layout_id) != str(current_layout_id)
         ):
@@ -63,7 +67,14 @@ class OrderTemplateResolver:
             "spine_width",
             "spine_bleed",
         )
-        if any(snapshot.get(key) in (None, "") for key in required_size_fields):
+        bleed_details = snapshot.get("bleed_details") or {}
+        snapshot_bleed = snapshot.get("bleed")
+        if snapshot_bleed in (None, ""):
+            snapshot_bleed = bleed_details.get("left", bleed_details.get("top"))
+        if any(
+            (snapshot_bleed if key == "bleed" else snapshot.get(key)) in (None, "")
+            for key in required_size_fields
+        ):
             print(
                 "[模板解析] 订单快照缺少命中规格字段，已作废并重新读取尺寸模板",
                 flush=True,
@@ -99,7 +110,7 @@ class OrderTemplateResolver:
                 "size_unit": snapshot.get("size_unit"),
                 "single_side_width": snapshot.get("single_side_width"),
                 "single_side_height": snapshot.get("single_side_height"),
-                "bleed": snapshot.get("bleed"),
+                "bleed": snapshot_bleed,
                 "spine_width": snapshot.get("spine_width"),
                 "spine_bleed": snapshot.get("spine_bleed"),
                 "background_color": snapshot.get("background_color") or "#ffffff",
@@ -111,7 +122,7 @@ class OrderTemplateResolver:
                         "size_unit": snapshot.get("size_unit"),
                         "single_side_width": snapshot.get("single_side_width"),
                         "single_side_height": snapshot.get("single_side_height"),
-                        "bleed": snapshot.get("bleed"),
+                        "bleed": snapshot_bleed,
                         "spine_width": snapshot.get("spine_width"),
                         "spine_bleed": snapshot.get("spine_bleed"),
                     })],
@@ -198,13 +209,22 @@ class OrderTemplateResolver:
                 resolved["matched_size_option"] = deepcopy(selected_option)
                 resolved["size_template_option"] = deepcopy(selected_option)
 
-        layouts = (
-            resolved.get("font_layout_templates")
-            or resolved.get("font_layouts")
-            or resolved.get("fontLayouts")
-            or resolved.get("font_templates")
-            or []
-        )
+        # The selected size option is the single source of truth for rendering.
+        # Its layers document may contain natural-language rules directly;
+        # never resolve rules from a separate font-layout JSON.
+        selected_layers = None
+        if isinstance(option, dict):
+            selected_layers = option.get("layers")
+        if not isinstance(selected_layers, dict):
+            selected_id = (resolved.get("size_spec") or {}).get("selected")
+            selected_option = next(
+                (item for item in (resolved.get("size_spec") or {}).get("options") or []
+                 if isinstance(item, dict) and str(item.get("id")) == str(selected_id)),
+                None,
+            )
+            if isinstance(selected_option, dict):
+                selected_layers = selected_option.get("layers")
+        layouts = [selected_layers] if isinstance(selected_layers, dict) else []
         selected_size = (resolved.get("size_spec") or {}).get("selected")
         layout = next(
             (item for item in layouts if isinstance(item, dict)),
@@ -348,6 +368,7 @@ class OrderTemplateResolver:
             return
         from backend.templates.size_variants import (
             resolve_product_spine_width_formula,
+            resolve_product_spine_width_page_table,
             resolve_spine_width_for_page_count,
         )
 
@@ -362,7 +383,9 @@ class OrderTemplateResolver:
                 "page_count",
                 "page_count_options",
                 "page_count_arr",
+                "product_spine_width_mode",
                 "product_spine_width_formula",
+                "product_spine_width_page_rules",
             )
             if key in template
         }
@@ -371,11 +394,61 @@ class OrderTemplateResolver:
             fields.update(template_fields)
         fields.update(option)
         product_formula = fields.get("product_spine_width_formula")
+        product_page_rules = fields.get("product_spine_width_page_rules")
+        has_product_mode = bool(
+            str(fields.get("product_spine_width_mode") or "").strip()
+        )
+        product_mode = str(fields.get("product_spine_width_mode") or "").strip().lower()
+        if not product_mode:
+            if isinstance(product_page_rules, dict) and product_page_rules:
+                product_mode = "page_count_table"
+            elif isinstance(product_formula, dict) and product_formula:
+                product_mode = "formula"
+            else:
+                product_mode = "range"
         page_mode_enabled = (
-            fields.get("spine_width_basis") == 1
+            (has_product_mode and product_mode in {
+                "range",
+                "formula",
+                "page_count_table",
+            })
+            or (
+                not has_product_mode
+                and str(fields.get("spine_width_basis") or "").strip().lower()
+                in {"range", "1"}
+            )
             or option.get("spine_width_mode") == "by_page_count"
         )
-        if page_mode_enabled and isinstance(product_formula, dict) and product_formula:
+        if (
+            page_mode_enabled
+            and product_mode == "page_count_table"
+            and isinstance(product_page_rules, dict)
+        ):
+            result = resolve_product_spine_width_page_table(
+                product_page_rules,
+                page_count,
+                option.get("size_unit") or fields.get("size_unit") or "in",
+            )
+            if result is not None:
+                width, resolution = result
+                option["spine_width"] = width
+                option["spine_bleed"] = resolution["spine_bleed"]
+                option["spine_width_mode"] = "fixed"
+                template["spine_width_resolution"] = resolution
+                print(
+                    "[模板解析] 使用产品级页数分段背脊配置："
+                    f"页数={page_count:g}，匹配页数={resolution['matched_page_count']:g}，"
+                    f"背脊宽={width:.6g}，单位={resolution['target_unit']}，"
+                    f"背脊出血={option['spine_bleed']:.6g}",
+                    flush=True,
+                )
+                return
+        if (
+            page_mode_enabled
+            and product_mode == "formula"
+            and isinstance(product_formula, dict)
+            and product_formula
+        ):
             result = resolve_product_spine_width_formula(
                 product_formula,
                 page_count,

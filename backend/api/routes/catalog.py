@@ -77,6 +77,7 @@ def public_size_template_payload(value: Any):
         "max_spine_width",
         "spine_width_basis",
         "product_spine_width_formula",
+        "product_spine_width_page_rules",
         "cover_safe_distance",
         "spine_safe_distance",
         "back_cover_safe_distance",
@@ -308,7 +309,7 @@ async def delete_shop(shop_id: int = Path(description="店铺 ID")):
 @router.get(
     "/products",
     summary="查询产品分类",
-    description="按产品分类查询关联店铺、product_names 商品名、常用规格值和尺寸模板。",
+    description="按产品分类查询关联店铺、product_names 商品名、常用规格值、背脊模式和尺寸模板。",
 )
 async def list_products(
     limit: int = Query(default=50, ge=1, le=500, description="每页返回的产品分类数量"),
@@ -320,19 +321,19 @@ async def list_products(
     return api_success(result, message="产品分类查询成功")
 
 
-@router.post("/products", status_code=status.HTTP_201_CREATED, summary="创建产品分类", description="创建产品分类并关联 product_names 商品名、用于邮件自动匹配的 specifications、常用规格值及多个店铺；可同时提交 cover_safe_distance、spine_safe_distance、back_cover_safe_distance 三组产品安全距离。")
+@router.post("/products", status_code=status.HTTP_201_CREATED, summary="创建产品分类", description="创建产品分类并关联 product_names 商品名、用于邮件自动匹配的 specifications、常用规格值及多个店铺；背脊模式通过 spine_width_mode 选择 range、formula 或 page_count_table；可同时提交三组产品安全距离。")
 async def create_product(payload: ProductCreate):
     result = await repo_call(catalog_repository.create_product, payload_dict(payload))
     return api_success(result, message="产品分类创建成功", status_code=201)
 
 
-@router.get("/products/{product_id}", summary="查询产品分类详情", description="查询产品分类、关联店铺、商品名、常用规格值和尺寸模板。")
+@router.get("/products/{product_id}", summary="查询产品分类详情", description="查询产品分类、关联店铺、商品名、常用规格值、背脊模式和尺寸模板。")
 async def get_product(product_id: int = Path(description="产品分类 ID")):
     result = await repo_call(catalog_repository.get_product, product_id)
     return api_success(result, message="产品分类查询成功")
 
 
-@router.patch("/products/{product_id}", summary="更新产品分类及其关联", description="更新产品分类名称、商品名、specifications、常用规格值、产品安全距离和店铺关联；常用规格值传空数组可清空，安全距离对象不传则保持原值。")
+@router.patch("/products/{product_id}", summary="更新产品分类及其关联", description="更新产品分类名称、商品名、specifications、常用规格值、背脊模式、背脊公式或按页数分段规则、产品安全距离和店铺关联；常用规格值传空数组可清空，安全距离对象不传则保持原值。")
 async def update_product(payload: ProductUpdate, product_id: int = Path(description="产品分类 ID")):
     result = await repo_call(catalog_repository.update_product, product_id, payload_dict(payload))
     return api_success(result, message="产品分类更新成功")

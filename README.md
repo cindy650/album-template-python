@@ -50,6 +50,8 @@ If BACKEND_API_TOKEN is empty, local API endpoints are open.
   并将订单推进到下一状态。
 - PUT /api/v1/orders/{order_id}/template-json - 使用订单号校验订单，
   将前端编辑后的 `template_json` 保存回订单；后续预览和生产导出直接复用。
+- PUT /api/v1/orders/{order_id}/template-association - 新订单由前端选择产品、尺寸模板和规格，
+  后端校验当前店铺归属并读取规格图层，一次性关联 `size_template_id` 和保存订单模板 JSON。
 - POST /api/v1/orders/preview-images/send - 生成订单预览图和企业微信订单辅助图，
   两张图发送成功后将订单状态从 0 更新为 1；未关联模板时返回提示且状态不变。
 - GET /api/v1/config - 查询已脱敏的运行配置和各项服务配置状态。
@@ -67,6 +69,9 @@ If BACKEND_API_TOKEN is empty, local API endpoints are open.
 - POST /api/v1/orders/template-export - 从 OSS 读取订单文件夹，临时打包 ZIP 并直接下载。
   请求体只传 `order_id`、`order_number`。接口不会产图、上传文件或修改订单状态；
   ZIP 返回完成或客户端中断后会释放内存缓冲区。
+
+订单邮件处理、商品分类、规格判断、`size_template_id` 的实际匹配规则以及模板产图流程，
+统一记录在 [docs/ORDER_PROCESS.md](docs/ORDER_PROCESS.md)。代码修改后请同步更新该文档。
 
 ### SSE 消息推送
 
@@ -250,10 +255,33 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
 `product_shops` 关联多个店铺，通过 `product_names` 保存用于区分具体订单商品的商品名。
 产品保留用于邮件订单自动匹配的 `specifications` 字符串数组；同时支持可选的
 `common_spec_values`（常用规格值）对象数组，数据库按 JSON 原样保存前端提供的对象。
-产品还可选配置 `spine_width_formula`，用于尺寸模板选择“按页数”时计算背脊宽。
-公式计算为：`页数 * page_count_coefficient * page_count_thickness + base_width + additional_width`。
-公式单位由 `unit` 指定，结果会临时换算为当前尺寸规格单位；`spine_bleed` 通常设为 `0`。
-未配置产品公式时，继续使用尺寸模板原有的最小/最大背脊宽按页数线性计算。
+产品通过 `spine_width_mode` 明确选择背脊模式：`range`（固定范围）、`formula`（产品公式）
+或 `page_count_table`（按页数分段）。`range` 模式继续使用尺寸模板的
+`min_spine_width`、`max_spine_width` 和页数选项做线性计算；产品接口不需要保存这两个范围值。
+`formula` 模式使用 `spine_width_formula`，公式计算为：
+`页数 * page_count_coefficient * page_count_thickness + base_width + additional_width`。
+`page_count_table` 模式使用 `spine_width_page_rules`，例如：
+
+```json
+{
+  "spine_width_mode": "page_count_table",
+  "spine_width_page_rules": {
+    "unit": "cm",
+    "match_strategy": "ceil",
+    "items": [
+      {"page_count": 10, "spine_width": 1.5, "spine_bleed": 0},
+      {"page_count": 20, "spine_width": 1.8, "spine_bleed": 0}
+    ]
+  }
+}
+```
+
+`ceil` 会选择不小于当前页数的下一个节点，超出最大节点时使用最大节点。
+公式或分段表的单位由 `unit` 指定，结果会临时换算为当前尺寸规格单位。
+旧产品未保存 `spine_width_mode` 时，服务端会根据已有公式或分段表推断模式，没有配置时按
+`range` 处理。切换模式时只提交对应配置，服务端会清空不生效的另一种配置。
+`common_spec_values` 中的字段由前端决定，后端不按产品类型强制校验规格结构；例如特殊出血可以使用
+四边对象，普通规格也可以继续使用单个数字。后端会原样保存并返回，是否使用特殊出血由前端自行切换后提交。
 字段不传时默认为空数组；PATCH 传入空数组可以清空。也可以使用中文请求键名 `常用规格值`。
 例如：
 
@@ -280,10 +308,37 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
 }
 ```
 
+特殊四边出血示例：
+
+```json
+{
+  "id": "default",
+  "label": "默认规格",
+  "unit": "mm",
+  "pageCount": null,
+  "pageCountOptions": [],
+  "sideWidth": 102.02,
+  "sideHeight": 140.04,
+  "bleed": {
+    "top": 0,
+    "right": 45.97,
+    "bottom": 0,
+    "left": 58.0
+  },
+  "spineWidthMode": "none",
+  "spineWidth": null,
+  "minSpineWidth": null,
+  "maxSpineWidth": null,
+  "spineBleed": null,
+  "paperThickness": 0
+}
+```
+
 产品公式示例（照片留言册）：
 
 ```json
 {
+  "spine_width_mode": "formula",
   "spine_width_formula": {
     "unit": "cm",
     "page_count_coefficient": 0.2,
@@ -294,15 +349,19 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
   }
 }
 ```
-创建或编辑产品时传入该字段即可；编辑时传 `null` 可清除产品公式。
+创建或编辑产品时传入 `spine_width_mode: "formula"` 和该字段即可；编辑时传
+`spine_width_mode: "range"` 可恢复尺寸模板范围计算。
 `/api/v1/size-templates` 是尺寸模板列表和整体编辑接口。主接口使用 `product_id` 关联产品分类，
 返回扁平的 `size_options[]` 和 `size_template_info[]`，不再内嵌产品对象、商品名数组或字体布局。
 尺寸模板响应包含可选的 `preview_image` OSS 地址。前端通过
 `PUT /api/v1/size-templates/{id}/preview` 上传预览图，文件保存到 OSS 的
 `font_layout_image/` 目录，数据库仅保存上传成功后返回的访问链接。
 
-尺寸模板顶层还包含 `background_color`、`min_spine_width`、`max_spine_width` 和
-`spine_width_basis`（`0` 固定、`1` 按页数）。`cover_safe_distance`、
+尺寸模板顶层还包含 `background_color`、`min_spine_width`、`max_spine_width`。
+`spine_width_basis` 现在使用 `range`、`formula` 或 `page_count_table` 字符串枚举值，
+不再返回或接受旧的 `0/1`；产品接口单独返回产品级 `spine_width_mode`。
+`use_safe_distance` 控制产图时是否启用文字安全距离监测；为 `false` 时跳过安全区判断、字号自动缩小和越界阻止。
+`cover_safe_distance`、
 `spine_safe_distance`、`back_cover_safe_distance` 分别保存封面、背脊、封底安全距离，
 每项结构均为 `{top, right, bottom, left}`，数值单位跟随 `display_unit`。
 
@@ -596,7 +655,7 @@ POST /api/v1/font-layout-templates/{font_layout_id}/sync-size-options
 收到邮箱 `EXISTS` 事件后，服务会搜索 UID 大于上次记录值的邮件，并按以下顺序处理：
 
 1. 检查邮件主题是否符合 Etsy 成交通知格式。不符合的邮件直接跳过并推进 UID。
-2. 读取邮件正文，解析订单号、店铺、商品名、商品信息、数量、价格和收货地址；邮件底部的 `Order total`、折扣、运费和税费明细作为订单组总计保存。同一封邮件按 `Transaction ID` 拆分为多个独立商品项；共享的订单号、付款、收货和总计信息归入 `order_groups`，每个商品项单独写入 `orders`。
+2. 读取邮件正文，解析订单号、店铺、商品名、商品信息、数量、价格和收货地址；邮件底部的 `Order total`、折扣、运费和税费明细作为订单组总计保存。同一封邮件按 `Transaction ID` 拆分为多个独立商品项；共享的订单号、付款、收货和总计信息归入 `order_groups`，每个商品项单独写入 `orders`。商品标题左侧的缩略图 URL 会以 `product_image` 写入对应商品项的 `商品信息` JSON；图片链接与标题链接分离时按相同 `Transaction ID` 绑定，多商品不会串图，Etsy 的透明占位图会过滤掉。
 3. 匹配 `shops` 店铺。店铺不存在时跳过订单并推进 UID。
 4. 在当前店铺的商品名中查找商品：
    - 先查产品分类的标准化 `product_names`；
@@ -672,6 +731,7 @@ data URLs so the SVG does not depend on fonts installed on the viewing machine.
 `size_template_id` 找到 `product_id`，再从产品接口对应的产品记录读取
 `cover_safe_distance`、`spine_safe_distance` 和 `back_cover_safe_distance` 三组
 四边值；后端将这份产品配置作为本次渲染的只读 `safe_distances` 参数传入无头渲染器。
+当 `use_safe_distance` 为 `false` 时，渲染器跳过安全区检测、自动缩小字号和越界阻止；为 `true`（默认）时执行完整监测。
 渲染器不根据前端 JSON 猜测产品，也不把安全距离写回订单模板快照。
 
 文字安全区监测顺序固定如下：
@@ -707,20 +767,23 @@ Important files:
 - backend/main.py - FastAPI app and HTTP endpoints.
 - backend/task_manager.py - listener and async task management.
 
-Order preview images, A4 print images, SVG production files, and WeCom
-auxiliary images are saved under `generated_orders/` by default. Set
+Order preview images, A4 print images, SVG production files, WeCom auxiliary
+images, and grouped product-information text are saved under `generated_orders/` by default. Set
 `ORDER_FILES_DIR` to change the root directory. Each order gets a directory
 named `店铺名-订单号-YYYYMMDD`; generated files use the same stem. A completed order directory
 contains:
 
 - `店铺名-订单号-YYYYMMDD-预览图.jpg`
 - `店铺名-订单号-YYYYMMDD.svg`
+- `店铺名-订单号-YYYYMMDD-转曲.svg`
 - `店铺名-订单号-YYYYMMDD-企业微信.jpg`
 - `店铺名-订单号-YYYYMMDD-生产单.jpg`
+- `店铺名-订单号-YYYYMMDD-要求.txt`
 
 After all required files are complete, each file is uploaded under the same OSS
 order prefix (OSS has no physical folders). The database records each artifact
-and its OSS URL. ZIP is created only by the download endpoint and is not
+and its OSS URL. The text file lists all numbered source product-information
+lines first, followed by all numbered Chinese translations. ZIP is created only by the download endpoint and is not
 persisted or uploaded during production.
 
 When a new order preview is generated, the renderer first uses the order's

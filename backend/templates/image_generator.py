@@ -293,6 +293,32 @@ class TemplateImageGenerator:
             or fields.get("page_count_options_json")
             or []
         )
+        # Preserve the product/format-specific bleed details in the compact
+        # snapshot as well. The full Fabric document remains in
+        # resolved_layers_json, but consumers should not need to parse it just
+        # to display top/right/bottom/left bleed values.
+        layout = template.get("_selected_font_layout") or {}
+        layout_objects = layout.get("objects") if isinstance(layout, dict) else None
+        if not isinstance(layout_objects, list) and isinstance(layout, dict):
+            nested = layout.get("layers")
+            layout_objects = nested.get("objects") if isinstance(nested, dict) else None
+        workarea = next(
+            (item for item in (layout_objects or [])
+             if isinstance(item, dict)
+             and str(item.get("id") or "").strip().casefold() == "workarea"),
+            {},
+        )
+        bleed_details = {
+            "top": workarea.get("verticalBleed", workarea.get("bleed", option.get("bleed"))),
+            "right": workarea.get("horizontalBleed", workarea.get("bleed", option.get("bleed"))),
+            "bottom": workarea.get("verticalBleed", workarea.get("bleed", option.get("bleed"))),
+            "left": workarea.get("horizontalBleed", workarea.get("bleed", option.get("bleed"))),
+        }
+        bleed_details = {key: value for key, value in bleed_details.items() if value is not None}
+        # Keep one representation only: uniform product bleed uses the legacy
+        # scalar, while products with directional bleed use the detailed map.
+        bleed_values = list(bleed_details.values())
+        uniform_bleed = bool(bleed_values) and all(value == bleed_values[0] for value in bleed_values)
         return {
             "template_id": template.get("id"),
             "shop": template.get("shop"),
@@ -302,7 +328,7 @@ class TemplateImageGenerator:
             "selected_size": selected_size,
             "single_side_width": option.get("single_side_width", template.get("single_side_width")),
             "single_side_height": option.get("single_side_height", template.get("single_side_height")),
-            "bleed": option.get("bleed", template.get("bleed")),
+            **({"bleed": bleed_values[0]} if uniform_bleed else {"bleed_details": bleed_details}),
             "spine_width": option.get("spine_width", template.get("spine_width")),
             "spine_bleed": option.get("spine_bleed", template.get("spine_bleed")),
             "background_color": template.get("background_color") or "#ffffff",
@@ -2098,13 +2124,36 @@ class TemplateImageGenerator:
             except (LookupError, TypeError, ValueError):
                 product = None
         safe_distances = None
+        use_safe_distance = None
         if isinstance(product, dict):
+            # Product-level switch controls whether the renderer performs
+            # safety checks and automatic font shrinking. Pass the explicit
+            # false value through even when distance values are present;
+            # otherwise the browser renderer would apply compatibility
+            # defaults when safeDistances is omitted.
+            raw_use_safe_distance = product.get(
+                "use_safe_distance",
+                product.get("useSafeDistance"),
+            )
+            if raw_use_safe_distance is not None:
+                if isinstance(raw_use_safe_distance, str):
+                    use_safe_distance = raw_use_safe_distance.strip().casefold() not in {
+                        "",
+                        "0",
+                        "false",
+                        "off",
+                        "no",
+                    }
+                else:
+                    use_safe_distance = bool(raw_use_safe_distance)
             safe_distances = {
-                key: deepcopy(product.get(key) or {})
-                for key in (
-                    "cover_safe_distance",
-                    "spine_safe_distance",
-                    "back_cover_safe_distance",
+                snake_key: deepcopy(
+                    product.get(snake_key, product.get(camel_key)) or {}
+                )
+                for snake_key, camel_key in (
+                    ("cover_safe_distance", "coverSafeDistance"),
+                    ("spine_safe_distance", "spineSafeDistance"),
+                    ("back_cover_safe_distance", "backCoverSafeDistance"),
                 )
             }
         # Preserve the exact editor object order and include workarea so the
@@ -2155,6 +2204,7 @@ class TemplateImageGenerator:
                 include_text_to_svg=True,
                 print_spec=print_spec,
                 safe_distances=safe_distances,
+                use_safe_distance=use_safe_distance,
                 order_number=order_number,
             )
             resolved_json = result.get("resolved_json")

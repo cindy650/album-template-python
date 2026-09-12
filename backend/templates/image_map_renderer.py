@@ -78,6 +78,7 @@ class ImageMapHeadlessRenderer:
         include_svg: bool = False,
         include_text_to_svg: bool = False,
         safe_distances: dict[str, Any] | None = None,
+        use_safe_distance: bool | None = None,
         order_number: str = "",
         **_legacy_options: Any,
     ) -> dict[str, Any]:
@@ -120,6 +121,7 @@ class ImageMapHeadlessRenderer:
                 bool(include_svg),
                 bool(include_text_to_svg),
                 deepcopy(safe_distances) if isinstance(safe_distances, dict) else None,
+                use_safe_distance,
             )
 
         try:
@@ -281,6 +283,7 @@ class ImageMapHeadlessRenderer:
         include_svg: bool,
         include_text_to_svg: bool,
         safe_distances: dict[str, Any] | None,
+        use_safe_distance: bool | None,
     ) -> dict[str, Any]:
         if self._session is None:
             runtime = _load_runtime(self.runtime_path)
@@ -306,6 +309,7 @@ class ImageMapHeadlessRenderer:
             include_svg=include_svg,
             include_text_to_svg=include_text_to_svg,
             safe_distances=safe_distances,
+            use_safe_distance=use_safe_distance,
             base_directory=self.project_root,
         )
 

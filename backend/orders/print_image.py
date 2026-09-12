@@ -66,6 +66,10 @@ _NATURAL_MESSAGE_CHINESE = re.compile(
     r"请把|请用|保留|去掉|排除|添加|修改|放在|改成|留下)",
 )
 
+# Persisted Etsy thumbnail metadata; it is not a customer option and should
+# therefore be excluded from translation and production-sheet text.
+PRODUCT_IMAGE_FIELD = "product_image"
+
 
 def is_natural_language_user_message(value: Any) -> bool:
     """Return whether a value looks like a buyer's free-form request.
@@ -96,6 +100,8 @@ def product_information_entries(
     for label, value in (product_information or {}).items():
         label_text = str(label).strip()
         value_text = str(value).strip()
+        if label_text.casefold() == PRODUCT_IMAGE_FIELD:
+            continue
         if label_text and value_text:
             index = len(entries) + 1
             entries.append((
@@ -243,7 +249,9 @@ class DeepSeekProductInformationTranslator:
         return [
             f"{str(label).strip()}: {str(value).strip()}"
             for label, value in (product_information or {}).items()
-            if str(label).strip() and str(value).strip()
+            if str(label).strip()
+            and str(value).strip()
+            and str(label).strip().casefold() != PRODUCT_IMAGE_FIELD
         ]
 
 
@@ -313,6 +321,10 @@ class OrderPrintImageGenerator:
         )
         image_bytes = output.getvalue()
         filename = self._filename(order)
+        product_information_text = self.build_product_information_text(
+            order.get("product_information") or {},
+            translated_lines,
+        )
         result = {
             "order_id": order["id"],
             "order_number": order["order_number"],
@@ -323,6 +335,7 @@ class OrderPrintImageGenerator:
             "dpi": self.dpi,
             "pixel_width": image.width,
             "pixel_height": image.height,
+            "product_information_text": product_information_text,
         }
         if self.output_dir is not None:
             if self.storage_service is not None and upload_to_oss:
@@ -344,6 +357,32 @@ class OrderPrintImageGenerator:
                     flush=True,
                 )
         return result
+
+    @classmethod
+    def build_product_information_text(
+        cls,
+        product_information: dict[str, Any],
+        translated_lines: list[str],
+    ) -> str:
+        """Return the production-sheet companion text in grouped order.
+
+        The text file intentionally lists every source line first and every
+        translation afterwards, matching the revised production-sheet layout.
+        Source labels and values remain untouched; translations are emitted in
+        the same order returned by DeepSeek.
+        """
+        entries = product_information_entries(product_information)
+        source_lines = [
+            f"{index}. {label}: {value}"
+            for index, (label, value, _is_user_message) in enumerate(entries, start=1)
+        ]
+        translation_section = [
+            f"{index}. {str(translated_lines[index - 1]).strip()}"
+            for index in range(1, len(translated_lines) + 1)
+            if str(translated_lines[index - 1]).strip()
+        ]
+        sections = ["商品信息", *source_lines, "", "翻译", *translation_section]
+        return "\n".join(sections).rstrip() + "\n"
 
     def _analyze_product_information(
         self,

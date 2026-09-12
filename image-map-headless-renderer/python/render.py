@@ -123,6 +123,7 @@ class ImageMapRendererSession:
         quality: float = 0.95,
         background_color: str | None = None,
         safe_distances: dict[str, Any] | None = None,
+        use_safe_distance: bool | None = None,
         base_directory: Path | None = None,
     ) -> dict[str, Any]:
         if not jpg_path and not png_path and not svg_path and not text_to_svg_path and not include_svg and not include_text_to_svg:
@@ -155,6 +156,7 @@ class ImageMapRendererSession:
             "quality": quality,
             "backgroundColor": background_color,
             "safeDistances": safe_distances,
+            "useSafeDistance": use_safe_distance,
             "formats": formats,
             "fontSources": font_sources,
         }
@@ -170,6 +172,11 @@ class ImageMapRendererSession:
                 )
                 break
             except PlaywrightError as exc:
+                if not is_retryable_browser_error(exc):
+                    # JavaScript validation failures (for example text that
+                    # remains outside the product safe area at 1px) are
+                    # deterministic business errors, not Chromium failures.
+                    raise
                 error = exc
                 self._close_browser()
                 if attempt >= self.render_retry_attempts:
@@ -254,6 +261,22 @@ class ImageMapRendererSession:
         except Exception:
             self._close_browser()
             raise
+
+
+def is_retryable_browser_error(error: Exception) -> bool:
+    """Retry only transport/process failures, not deterministic JS errors."""
+    message = str(error).casefold()
+    retry_markers = (
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "browser disconnected",
+        "connection closed",
+        "connection reset",
+        "protocol error",
+        "page crashed",
+        "target closed",
+    )
+    return any(marker in message for marker in retry_markers)
 
 
 def render_json(

@@ -35,6 +35,10 @@ def json_load(value: str | None, fallback: Any):
         return fallback
 
 
+def normalize_match_text(value: Any):
+    return " ".join(str(value or "").split()).casefold()
+
+
 def compact_string(value: Any):
     return str(value or "").strip()
 
@@ -125,6 +129,108 @@ def normalize_product_spine_width_formula(value: Any) -> dict[str, Any]:
     }
 
 
+PRODUCT_SPINE_WIDTH_MODES = {"range", "formula", "page_count_table"}
+
+
+def normalize_product_spine_width_page_rules(value: Any) -> dict[str, Any]:
+    """Validate the optional product-level page-count spine table."""
+    if value in (None, "", {}):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("spine_width_page_rules 必须是对象")
+    unit = compact_string(value.get("unit") or "cm").lower()
+    if unit not in {"in", "mm", "cm"}:
+        raise ValueError("spine_width_page_rules.unit 只能是 in、mm 或 cm")
+    strategy = compact_string(value.get("match_strategy") or "ceil").lower()
+    if strategy not in {"ceil", "exact", "linear"}:
+        raise ValueError(
+            "spine_width_page_rules.match_strategy 只能是 ceil、exact 或 linear"
+        )
+    raw_items = value.get("items")
+    if raw_items in (None, []) and set(value).issubset(
+        {"unit", "match_strategy", "items"}
+    ):
+        return {}
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError("spine_width_page_rules.items 至少需要一项")
+    items: list[dict[str, Any]] = []
+    seen_pages: set[int] = set()
+
+    def number(key: str, raw: Any, *, default: float = 0) -> float:
+        if raw in (None, ""):
+            raw = default
+        if isinstance(raw, bool):
+            raise ValueError(f"spine_width_page_rules.items[].{key} 必须是数字")
+        try:
+            result = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"spine_width_page_rules.items[].{key} 必须是数字"
+            ) from exc
+        if result < 0:
+            raise ValueError(
+                f"spine_width_page_rules.items[].{key} 必须大于或等于 0"
+            )
+        return result
+
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            raise ValueError(f"spine_width_page_rules.items[{index}] 必须是对象")
+        raw_page = item.get("page_count")
+        if isinstance(raw_page, bool):
+            raise ValueError(
+                f"spine_width_page_rules.items[{index}].page_count 必须是整数"
+            )
+        try:
+            page_count = int(raw_page)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"spine_width_page_rules.items[{index}].page_count 必须是整数"
+            ) from exc
+        if page_count < 0:
+            raise ValueError(
+                f"spine_width_page_rules.items[{index}].page_count 必须大于或等于 0"
+            )
+        if page_count in seen_pages:
+            raise ValueError(
+                f"spine_width_page_rules.items 中不能重复配置页数: {page_count}"
+            )
+        seen_pages.add(page_count)
+        items.append(
+            {
+                "page_count": page_count,
+                "spine_width": number("spine_width", item.get("spine_width")),
+                "spine_bleed": number(
+                    "spine_bleed", item.get("spine_bleed"), default=0
+                ),
+            }
+        )
+    return {"unit": unit, "match_strategy": strategy, "items": items}
+
+
+def normalize_product_spine_width_mode(
+    value: Any,
+    *,
+    formula: Any = None,
+    page_rules: Any = None,
+    fallback: str | None = None,
+) -> str:
+    """Normalize the explicit product spine mode while supporting old rows."""
+    mode = compact_string(value).lower()
+    if not mode:
+        if page_rules:
+            mode = "page_count_table"
+        elif formula:
+            mode = "formula"
+        else:
+            mode = compact_string(fallback).lower() or "range"
+    if mode not in PRODUCT_SPINE_WIDTH_MODES:
+        raise ValueError(
+            "spine_width_mode 只能是 range、formula 或 page_count_table"
+        )
+    return mode
+
+
 def placeholders(values: list[Any]):
     return ", ".join("?" for _ in values)
 
@@ -207,76 +313,26 @@ class CatalogRepository:
             yield connection
 
     def initialize(self):
-        with self._lock, self.connect() as connection:
+        with self.connect() as connection:
             existing_tables = set(table_names(connection))
-            required_tables = {
-                "shops",
-                "size_templates",
-                "fonts",
+            required_tables = {"shops", "products", "product_names", "size_templates", "size_template_options", "fonts"}
+            missing_tables = sorted(required_tables - existing_tables)
+            if missing_tables:
+                raise RuntimeError(
+                    "数据库结构不完整，请先执行独立迁移：缺少表 "
+                    + ", ".join(missing_tables)
+                )
+            required_columns = {
+                "products": {"specification_field", "template_marker", "product_identifiers_json"},
+                "size_templates": {"template_name", "selected_size_option_id"},
             }
-            if not required_tables.issubset(existing_tables):
-                self._create_schema(connection)
-            self._ensure_columns(
-                connection,
-                "shops",
-                {
-                    "shop_name": "TEXT NOT NULL DEFAULT ''",
-                    "product_names_json": "TEXT NOT NULL DEFAULT '[]'",
-                    "wecom_robot_webhook_url": "TEXT NOT NULL DEFAULT ''",
-                    "product_count": "INTEGER NOT NULL DEFAULT 0",
-                    "order_count": "INTEGER NOT NULL DEFAULT 0",
-                    "new_order_count": "INTEGER NOT NULL DEFAULT 0",
-                    "confirmation_count": "INTEGER NOT NULL DEFAULT 0",
-                    "pending_production_count": "INTEGER NOT NULL DEFAULT 0",
-                    "in_production_count": "INTEGER NOT NULL DEFAULT 0",
-                    "pending_shipment_count": "INTEGER NOT NULL DEFAULT 0",
-                    "completed_order_count": "INTEGER NOT NULL DEFAULT 0",
-                    "size_template_count": "INTEGER NOT NULL DEFAULT 0",
-                    "font_template_count": "INTEGER NOT NULL DEFAULT 0",
-                    "created_at": "TEXT NOT NULL DEFAULT ''",
-                    "updated_at": "TEXT NOT NULL DEFAULT ''",
-                },
-            )
-            self._ensure_columns(
-                connection,
-                "size_templates",
-                {
-                    "template_name": "TEXT NOT NULL DEFAULT ''",
-                    "background_color": "TEXT NOT NULL DEFAULT ''",
-                    "paper_thickness_mm": "REAL NOT NULL DEFAULT 0",
-                    "min_spine_width": "REAL NOT NULL DEFAULT 0",
-                    "max_spine_width": "REAL NOT NULL DEFAULT 0",
-                    "spine_width_basis": "INTEGER NOT NULL DEFAULT 0",
-                    "cover_safe_distance_json": "TEXT NOT NULL DEFAULT '{}'",
-                    "spine_safe_distance_json": "TEXT NOT NULL DEFAULT '{}'",
-                    "back_cover_safe_distance_json": "TEXT NOT NULL DEFAULT '{}'",
-                    "max_spine_bleed": "REAL NOT NULL DEFAULT 0",
-                    "min_spine_bleed": "REAL NOT NULL DEFAULT 0",
-                    "size_template_info_json": "TEXT NOT NULL DEFAULT '[]'",
-                    "preview_image_path": "TEXT NOT NULL DEFAULT ''",
-                    "selected_size_option_id": "VARCHAR(255) NOT NULL DEFAULT ''",
-                    "display_unit": "VARCHAR(10) NOT NULL DEFAULT 'in'",
-                    "page_count": "INTEGER",
-                    "page_count_options_json": "TEXT NOT NULL DEFAULT '[]'",
-                    "selected_font_layout_id": "INTEGER",
-                },
-            )
-            self._create_size_template_option_schema(connection)
-            self._migrate_size_template_fields(connection)
-            self._create_font_layout_library_schema(connection)
-            self._create_product_schema(connection)
-            self._create_inner_page_template_schema(connection)
-            self._create_text_generation_rule_schema(connection)
-            self._seed_text_generation_rules(connection)
-            self._create_font_layout_size_variant_schema(connection)
-            self._remove_size_template_font_layout_schema(connection)
-            connection.execute("DROP TABLE IF EXISTS font_templates")
-            # Product categories and their product_names are user-managed.
-            # Do not repopulate them from legacy shop/template JSON on startup.
-            self._link_existing_products_to_size_templates(connection)
-            self._migrate_product_safe_distances(connection)
-            self._refresh_all_shop_counts(connection)
-            connection.commit()
+            for table, columns in required_columns.items():
+                actual = {row["name"] for row in table_columns(connection, table)}
+                missing = sorted(columns - actual)
+                if missing:
+                    raise RuntimeError(
+                        f"数据库结构不完整，请先执行独立迁移：{table} 缺少字段 {', '.join(missing)}"
+                    )
 
     def _create_schema(self, connection):
         connection.execute(
@@ -285,6 +341,7 @@ class CatalogRepository:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 shop TEXT NOT NULL UNIQUE,
                 shop_name TEXT NOT NULL,
+                settlement_currency VARCHAR(10) NOT NULL DEFAULT 'CAD',
                 product_names_json TEXT NOT NULL DEFAULT '[]',
                 wecom_robot_webhook_url TEXT NOT NULL DEFAULT '',
                 product_count INTEGER NOT NULL DEFAULT 0,
@@ -338,6 +395,7 @@ class CatalogRepository:
                 post_script_name TEXT NOT NULL DEFAULT '',
                 file_path TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
+                use_safe_distance INTEGER NOT NULL DEFAULT 1 CHECK (use_safe_distance IN (0, 1)),
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
@@ -373,7 +431,7 @@ class CatalogRepository:
                 paper_thickness_mm REAL NOT NULL DEFAULT 0,
                 min_spine_width REAL NOT NULL DEFAULT 0,
                 max_spine_width REAL NOT NULL DEFAULT 0,
-                spine_width_basis INTEGER NOT NULL DEFAULT 0,
+                spine_width_basis VARCHAR(32) NOT NULL DEFAULT 'range',
                 cover_safe_distance_json TEXT NOT NULL DEFAULT '{}',
                 spine_safe_distance_json TEXT NOT NULL DEFAULT '{}',
                 back_cover_safe_distance_json TEXT NOT NULL DEFAULT '{}',
@@ -650,12 +708,17 @@ class CatalogRepository:
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
+                sku TEXT NOT NULL DEFAULT '',
+                product_identifiers_json TEXT NOT NULL DEFAULT '[]',
+                template_marker TEXT NOT NULL DEFAULT '',
+                inner_page_field TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
                 specifications_json TEXT NOT NULL DEFAULT '[]',
-                specification_field VARCHAR(255) NOT NULL
-                    DEFAULT 'Book Size | Page Count',
+                specification_field VARCHAR(255) NULL DEFAULT NULL,
                 cover_safe_distance_json LONGTEXT NULL,
+                spine_width_mode VARCHAR(32) NOT NULL DEFAULT 'range',
                 spine_width_formula_json LONGTEXT NULL,
+                spine_width_page_rules_json LONGTEXT NULL,
                 spine_safe_distance_json LONGTEXT NULL,
                 back_cover_safe_distance_json LONGTEXT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -668,12 +731,17 @@ class CatalogRepository:
             connection,
             "products",
             {
+                "sku": "TEXT NOT NULL DEFAULT ''",
+                "product_identifiers_json": "TEXT NOT NULL DEFAULT '[]'",
+                "template_marker": "TEXT NOT NULL DEFAULT ''",
+                "inner_page_field": "TEXT NOT NULL DEFAULT ''",
+                "use_safe_distance": "INTEGER NOT NULL DEFAULT 1",
                 "specifications_json": "TEXT NOT NULL DEFAULT '[]'",
-                "specification_field": (
-                    "VARCHAR(255) NOT NULL DEFAULT 'Book Size | Page Count'"
-                ),
+                "specification_field": "VARCHAR(255) NULL DEFAULT NULL",
                 "common_spec_values_json": "TEXT NOT NULL DEFAULT '[]'",
+                "spine_width_mode": "VARCHAR(32) NOT NULL DEFAULT 'range'",
                 "spine_width_formula_json": "LONGTEXT NULL",
+                "spine_width_page_rules_json": "LONGTEXT NULL",
                 # MySQL does not consistently allow literal defaults on
                 # TEXT/LONGTEXT columns. Nulls are normalized below instead.
                 "cover_safe_distance_json": "LONGTEXT NULL",
@@ -691,13 +759,6 @@ class CatalogRepository:
         connection.execute(
             """
             UPDATE products
-            SET specification_field = 'Book Size | Page Count'
-            WHERE specification_field IS NULL OR TRIM(specification_field) = ''
-            """
-        )
-        connection.execute(
-            """
-            UPDATE products
             SET common_spec_values_json = '[]'
             WHERE common_spec_values_json IS NULL OR common_spec_values_json = ''
             """
@@ -707,6 +768,52 @@ class CatalogRepository:
             UPDATE products
             SET spine_width_formula_json = '{}'
             WHERE spine_width_formula_json IS NULL OR spine_width_formula_json = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE products
+            SET spine_width_page_rules_json = '{}'
+            WHERE spine_width_page_rules_json IS NULL OR spine_width_page_rules_json = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE products
+            SET spine_width_mode = CASE
+                WHEN spine_width_page_rules_json IS NOT NULL
+                     AND spine_width_page_rules_json NOT IN ('', '{}', '[]')
+                    THEN 'page_count_table'
+                WHEN spine_width_formula_json IS NOT NULL
+                     AND spine_width_formula_json NOT IN ('', '{}', '[]')
+                    THEN 'formula'
+                ELSE 'range'
+            END
+            WHERE spine_width_mode IS NULL OR TRIM(spine_width_mode) = ''
+            """
+        )
+        # Rows created before spine_width_mode existed received the new
+        # default value "range". Infer their historical mode from the stored
+        # payloads so existing formula products keep their behavior.
+        connection.execute(
+            """
+            UPDATE products
+            SET spine_width_mode = CASE
+                WHEN spine_width_page_rules_json IS NOT NULL
+                     AND spine_width_page_rules_json NOT IN ('', '{}', '[]')
+                    THEN 'page_count_table'
+                WHEN spine_width_formula_json IS NOT NULL
+                     AND spine_width_formula_json NOT IN ('', '{}', '[]')
+                    THEN 'formula'
+                ELSE 'range'
+            END
+            WHERE spine_width_mode = 'range'
+              AND (
+                    (spine_width_page_rules_json IS NOT NULL
+                     AND spine_width_page_rules_json NOT IN ('', '{}', '[]'))
+                 OR (spine_width_formula_json IS NOT NULL
+                     AND spine_width_formula_json NOT IN ('', '{}', '[]'))
+              )
             """
         )
         for column in (
@@ -1110,13 +1217,14 @@ class CatalogRepository:
             cursor = connection.execute(
                 """
                 INSERT INTO shops (
-                    shop, shop_name, product_names_json, wecom_robot_webhook_url,
+                    shop, shop_name, settlement_currency, product_names_json, wecom_robot_webhook_url,
                     product_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     shop,
                     shop_name,
+                    compact_string(payload.get("settlement_currency") or payload.get("结算币种") or "CAD").upper(),
                     json_dump(products),
                     compact_string(
                         payload.get("wecom_robot_webhook_url")
@@ -1350,6 +1458,10 @@ class CatalogRepository:
             if not shop_name:
                 raise ValueError("店铺名不能为空")
             updates["shop_name"] = shop_name
+        if "settlement_currency" in payload or "结算币种" in payload:
+            currency = compact_string(payload.get("settlement_currency") or payload.get("结算币种")).upper()
+            if currency:
+                updates["settlement_currency"] = currency
         if any(
             key in payload
             for key in ("wecom_robot_webhook_url", "wecom_robot", "企业微信机器人")
@@ -1516,16 +1628,32 @@ class CatalogRepository:
             normalize_string_list(payload.get("specifications"))
         )
         specification_field = compact_string(
-            payload.get("specification_field") or "Book Size | Page Count"
+            payload.get("specification_field")
         )
-        if not specification_field:
-            raise ValueError("specification_field 不能为空")
         common_spec_values = normalize_common_spec_values(
             payload.get("common_spec_values")
         )
         spine_width_formula = normalize_product_spine_width_formula(
             payload.get("spine_width_formula")
         )
+        spine_width_page_rules = normalize_product_spine_width_page_rules(
+            payload.get("spine_width_page_rules")
+        )
+        spine_width_mode = normalize_product_spine_width_mode(
+            payload.get("spine_width_mode"),
+            formula=spine_width_formula,
+            page_rules=spine_width_page_rules,
+        )
+        if spine_width_mode == "formula" and not spine_width_formula:
+            raise ValueError("spine_width_mode=formula 时必须传 spine_width_formula")
+        if spine_width_mode == "page_count_table" and not spine_width_page_rules:
+            raise ValueError(
+                "spine_width_mode=page_count_table 时必须传 spine_width_page_rules"
+            )
+        if spine_width_mode != "formula":
+            spine_width_formula = {}
+        if spine_width_mode != "page_count_table":
+            spine_width_page_rules = {}
         safe_distances = self._product_safe_distance_values(payload)
         shop_ids = self._payload_int_list(payload.get("shop_ids") or payload.get("shops"))
         now = utc_now()
@@ -1533,24 +1661,33 @@ class CatalogRepository:
             cursor = connection.execute(
                 """
                 INSERT INTO products (
-                    name, description, specifications_json, specification_field,
+                    name, sku, product_identifiers_json, template_marker, inner_page_field, description, specifications_json, specification_field,
                     common_spec_values_json,
+                    spine_width_mode,
                     spine_width_formula_json,
+                    spine_width_page_rules_json,
                     cover_safe_distance_json, spine_safe_distance_json,
                     back_cover_safe_distance_json,
-                    enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    use_safe_distance, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
+                    compact_string(payload.get("sku")),
+                    json_dump(normalize_string_list(payload.get("product_identifiers") or [])),
+                    compact_string(payload.get("template_marker")),
+                    compact_string(payload.get("inner_page_field")),
                     compact_string(payload.get("description")),
                     json_dump(specifications),
                     specification_field,
                     json_dump(common_spec_values),
+                    spine_width_mode,
                     json_dump(spine_width_formula),
+                    json_dump(spine_width_page_rules),
                     json_dump(safe_distances["cover_safe_distance"]),
                     json_dump(safe_distances["spine_safe_distance"]),
                     json_dump(safe_distances["back_cover_safe_distance"]),
+                    int(bool(payload.get("use_safe_distance", True))),
                     int(bool(payload.get("enabled", True))),
                     now,
                     now,
@@ -1607,27 +1744,87 @@ class CatalogRepository:
                 specifications = unique_preserve_order(
                     normalize_string_list(payload.get("specifications"))
                 )
-            specification_field = (
-                compact_string(payload.get("specification_field"))
-                if "specification_field" in payload
-                else existing["specification_field"]
-            )
-            if not specification_field:
-                raise ValueError("specification_field 不能为空")
+            if "specification_field" in payload:
+                # PATCH null/empty explicitly clears the field. Only an
+                # omitted field keeps the existing value.
+                specification_field = compact_string(
+                    payload.get("specification_field")
+                )
+            else:
+                specification_field = compact_string(
+                    existing.get("specification_field")
+                )
             common_spec_values = None
             if "common_spec_values" in payload:
                 common_spec_values = normalize_common_spec_values(
                     payload.get("common_spec_values")
                 )
-            spine_width_formula = None
-            if "spine_width_formula" in payload:
-                spine_width_formula = normalize_product_spine_width_formula(
+            existing_formula = normalize_product_spine_width_formula(
+                json_load(existing.get("spine_width_formula_json"), {})
+            )
+            existing_page_rules = normalize_product_spine_width_page_rules(
+                json_load(existing.get("spine_width_page_rules_json"), {})
+            )
+            existing_mode = normalize_product_spine_width_mode(
+                existing.get("spine_width_mode"),
+                formula=existing_formula,
+                page_rules=existing_page_rules,
+            )
+            formula_provided = "spine_width_formula" in payload
+            page_rules_provided = "spine_width_page_rules" in payload
+            mode_provided = "spine_width_mode" in payload
+            spine_width_formula = (
+                normalize_product_spine_width_formula(
                     payload.get("spine_width_formula")
                 )
+                if formula_provided
+                else existing_formula
+            )
+            spine_width_page_rules = (
+                normalize_product_spine_width_page_rules(
+                    payload.get("spine_width_page_rules")
+                )
+                if page_rules_provided
+                else existing_page_rules
+            )
+            if mode_provided:
+                spine_width_mode = normalize_product_spine_width_mode(
+                    payload.get("spine_width_mode"),
+                    formula=spine_width_formula,
+                    page_rules=spine_width_page_rules,
+                    fallback=existing_mode,
+                )
+            elif formula_provided and not spine_width_formula and not page_rules_provided:
+                # Preserve the historical PATCH {spine_width_formula: null}
+                # behavior: clear the formula and return to range mode.
+                spine_width_mode = "range"
+            elif page_rules_provided and not spine_width_page_rules and not formula_provided:
+                spine_width_mode = "range"
+            elif formula_provided and spine_width_formula:
+                spine_width_mode = "formula"
+            elif page_rules_provided and spine_width_page_rules:
+                spine_width_mode = "page_count_table"
+            else:
+                spine_width_mode = existing_mode
+            if spine_width_mode == "formula" and not spine_width_formula:
+                raise ValueError("spine_width_mode=formula 时必须传 spine_width_formula")
+            if spine_width_mode == "page_count_table" and not spine_width_page_rules:
+                raise ValueError(
+                    "spine_width_mode=page_count_table 时必须传 spine_width_page_rules"
+                )
+            if spine_width_mode != "formula":
+                spine_width_formula = {}
+            if spine_width_mode != "page_count_table":
+                spine_width_page_rules = {}
             safe_distances = self._product_safe_distance_values(payload, existing)
             updates = {
                 "name": name,
                 "description": compact_string(payload.get("description")) if "description" in payload else existing["description"],
+                "sku": compact_string(payload.get("sku")) if "sku" in payload else existing["sku"],
+                "product_identifiers_json": json_dump(normalize_string_list(payload.get("product_identifiers"))) if "product_identifiers" in payload else existing["product_identifiers_json"],
+                "template_marker": compact_string(payload.get("template_marker")) if "template_marker" in payload else existing.get("template_marker", ""),
+                "inner_page_field": compact_string(payload.get("inner_page_field")) if "inner_page_field" in payload else existing["inner_page_field"],
+                "use_safe_distance": int(bool(payload.get("use_safe_distance"))) if "use_safe_distance" in payload else existing["use_safe_distance"],
                 "specifications_json": (
                     json_dump(specifications)
                     if specifications is not None
@@ -1639,10 +1836,12 @@ class CatalogRepository:
                     if common_spec_values is not None
                     else existing.get("common_spec_values_json", "[]")
                 ),
+                "spine_width_mode": spine_width_mode,
                 "spine_width_formula_json": (
                     json_dump(spine_width_formula)
-                    if spine_width_formula is not None
-                    else existing.get("spine_width_formula_json", "{}")
+                ),
+                "spine_width_page_rules_json": (
+                    json_dump(spine_width_page_rules)
                 ),
                 "cover_safe_distance_json": json_dump(
                     safe_distances["cover_safe_distance"]
@@ -1660,19 +1859,34 @@ class CatalogRepository:
                 """
                 UPDATE products SET
                     name = :name,
+                    sku = :sku,
+                    product_identifiers_json = :product_identifiers_json,
+                    template_marker = :template_marker,
+                    inner_page_field = :inner_page_field,
                     description = :description,
                     specifications_json = :specifications_json,
                     specification_field = :specification_field,
                     common_spec_values_json = :common_spec_values_json,
+                    spine_width_mode = :spine_width_mode,
                     spine_width_formula_json = :spine_width_formula_json,
+                    spine_width_page_rules_json = :spine_width_page_rules_json,
                     cover_safe_distance_json = :cover_safe_distance_json,
                     spine_safe_distance_json = :spine_safe_distance_json,
                     back_cover_safe_distance_json = :back_cover_safe_distance_json,
+                    use_safe_distance = :use_safe_distance,
                     enabled = :enabled,
                     updated_at = :updated_at
                 WHERE id = :id
                 """,
                 {**updates, "id": product_id},
+            )
+            connection.execute(
+                """
+                UPDATE size_templates
+                SET spine_width_basis = ?, updated_at = ?
+                WHERE product_id = ?
+                """,
+                (spine_width_mode, updates["updated_at"], product_id),
             )
             if names is not None or shop_ids is not None:
                 old_names = self._product_names(connection, product_id)
@@ -1770,20 +1984,30 @@ class CatalogRepository:
     @staticmethod
     def _product_row_to_dict(connection, row):
         data = dict(row)
+        data["product_identifiers"] = normalize_string_list(json_load(data.pop("product_identifiers_json", "[]"), []))
+        data["template_marker"] = compact_string(data.get("template_marker"))
         data["specifications"] = unique_preserve_order(
             normalize_string_list(
                 json_load(data.pop("specifications_json", "[]"), [])
             )
         )
-        data["specification_field"] = compact_string(
-            data.get("specification_field") or "Book Size | Page Count"
-        )
+        data["specification_field"] = compact_string(data.get("specification_field"))
         data["common_spec_values"] = normalize_common_spec_values(
             json_load(data.pop("common_spec_values_json", "[]"), [])
         )
-        data["spine_width_formula"] = normalize_product_spine_width_formula(
+        spine_width_formula = normalize_product_spine_width_formula(
             json_load(data.pop("spine_width_formula_json", "{}"), {})
-        ) or None
+        )
+        spine_width_page_rules = normalize_product_spine_width_page_rules(
+            json_load(data.pop("spine_width_page_rules_json", "{}"), {})
+        )
+        data["spine_width_mode"] = normalize_product_spine_width_mode(
+            data.get("spine_width_mode"),
+            formula=spine_width_formula,
+            page_rules=spine_width_page_rules,
+        )
+        data["spine_width_formula"] = spine_width_formula or None
+        data["spine_width_page_rules"] = spine_width_page_rules or None
         for key in (
             "cover_safe_distance",
             "spine_safe_distance",
@@ -1822,6 +2046,54 @@ class CatalogRepository:
                 value = json_load(fallback.get(f"{key}_json", "{}"), {})
             result[key] = cls._normalize_safe_distance(value, key)
         return result
+
+    @staticmethod
+    def _migrate_spine_width_basis_modes(connection) -> None:
+        """Replace legacy size-template 0/1 flags with mode strings.
+
+        Product mode is the source of truth when a template is linked to a
+        product. Unlinked legacy rows use 0 -> range and 1 -> formula.
+        """
+        columns = {
+            row["name"]
+            for row in table_columns(connection, "size_templates")
+        }
+        if "spine_width_basis" not in columns:
+            return
+        # Convert the column before writing string values.  On an existing
+        # MySQL table this may still be INTEGER, and writing "formula" before
+        # the type change would be coerced or rejected in strict mode.
+        connection.execute(
+            """
+            ALTER TABLE size_templates
+            MODIFY COLUMN spine_width_basis VARCHAR(32) NOT NULL DEFAULT 'range'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE size_templates st
+            LEFT JOIN products p ON p.id = st.product_id
+            SET st.spine_width_basis = CASE
+                WHEN p.spine_width_mode IN ('range', 'formula', 'page_count_table')
+                    THEN p.spine_width_mode
+                WHEN TRIM(CAST(st.spine_width_basis AS CHAR)) IN ('1', '1.0')
+                    THEN 'formula'
+                ELSE 'range'
+            END
+            WHERE TRIM(CAST(st.spine_width_basis AS CHAR)) IN ('0', '1', '0.0', '1.0')
+               OR st.spine_width_basis IS NULL
+               OR TRIM(CAST(st.spine_width_basis AS CHAR)) = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE size_templates
+            SET spine_width_basis = 'range'
+            WHERE spine_width_basis NOT IN ('range', 'formula', 'page_count_table')
+               OR spine_width_basis IS NULL
+               OR TRIM(spine_width_basis) = ''
+            """
+        )
 
     @staticmethod
     def _migrate_product_safe_distances(connection) -> None:
@@ -1878,6 +2150,14 @@ class CatalogRepository:
             }:
                 candidates.append(normalized)
         return candidates
+
+    def find_product_sku_for_shop(self, sku: str, *shop_names: str):
+        sku = compact_string(sku); candidates = self._mail_shop_candidates(*shop_names)
+        if not sku or not candidates: return None
+        ph = ", ".join("?" for _ in candidates)
+        with self.connect() as connection:
+            row = connection.execute(f"SELECT p.*, s.id AS matched_shop_id, s.shop AS matched_shop, s.shop_name AS matched_shop_name, NULL AS matched_product_name, NULL AS size_template_id FROM products p JOIN product_shops ps ON ps.product_id=p.id JOIN shops s ON s.id=ps.shop_id WHERE p.enabled=1 AND p.sku=? AND (s.shop IN ({ph}) OR s.shop_name IN ({ph})) LIMIT 1", [sku,*candidates,*candidates]).fetchone()
+        return self._mail_product_row(row) if row else None
 
     def find_product_name_for_shop(self, product_name: str, *shop_names: str):
         product_name = compact_string(product_name)
@@ -2039,20 +2319,31 @@ class CatalogRepository:
         data["shop"] = data.pop("matched_shop")
         data["shop_name"] = data.pop("matched_shop_name")
         data["product_name"] = data.pop("matched_product_name", None)
+        data["product_identifiers"] = normalize_string_list(
+            json_load(data.pop("product_identifiers_json", "[]"), [])
+        )
         data["specifications"] = unique_preserve_order(
             normalize_string_list(
                 json_load(data.pop("specifications_json", "[]"), [])
             )
         )
-        data["specification_field"] = compact_string(
-            data.get("specification_field") or "Book Size | Page Count"
-        )
+        data["specification_field"] = compact_string(data.get("specification_field"))
         data["common_spec_values"] = normalize_common_spec_values(
             json_load(data.pop("common_spec_values_json", "[]"), [])
         )
-        data["spine_width_formula"] = normalize_product_spine_width_formula(
+        product_formula = normalize_product_spine_width_formula(
             json_load(data.pop("spine_width_formula_json", "{}"), {})
-        ) or None
+        )
+        product_page_rules = normalize_product_spine_width_page_rules(
+            json_load(data.pop("spine_width_page_rules_json", "{}"), {})
+        )
+        data["spine_width_mode"] = normalize_product_spine_width_mode(
+            data.get("spine_width_mode"),
+            formula=product_formula,
+            page_rules=product_page_rules,
+        )
+        data["spine_width_formula"] = product_formula or None
+        data["spine_width_page_rules"] = product_page_rules or None
         for key in (
             "cover_safe_distance",
             "spine_safe_distance",
@@ -2098,6 +2389,51 @@ class CatalogRepository:
                     }
         return None
 
+    def find_product_template_marker(
+        self, product_id: int, shop_id: int, marker_value: str
+    ):
+        """Find exactly one template whose name contains the order marker value."""
+        source = " ".join(str(marker_value or "").split()).casefold()
+        if not source:
+            return None
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id AS size_template_id, template_name
+                FROM size_templates
+                WHERE product_id = ? AND shop_id = ?
+                ORDER BY id
+                """,
+                (product_id, shop_id),
+            ).fetchall()
+        matches = []
+        for row in rows:
+            names = (row["template_name"],)
+            if any(source in " ".join(str(name or "").split()).casefold() for name in names):
+                matches.append(row)
+        if len(matches) != 1:
+            return None
+        return {
+            "size_template_id": matches[0]["size_template_id"],
+            "matched_marker": marker_value,
+            "use_default_size_option": True,
+        }
+
+    def find_template_specification(self, template_id: int, specification_value: str):
+        source = " ".join(str(specification_value or "").split()).casefold()
+        if not source:
+            return None
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT size_option_id, label FROM size_template_options WHERE size_template_id = ?",
+                (template_id,),
+            ).fetchall()
+        for row in rows:
+            for alias in (row["size_option_id"], row["label"]):
+                if normalize_match_text(alias) and normalize_match_text(alias) in source:
+                    return alias
+        return None
+
     def create_size_template(self, payload: dict[str, Any]):
         product_id = self._optional_int(payload.get("product_id") or payload.get("product"))
         shop_id_value = payload.get("shop_id")
@@ -2119,10 +2455,18 @@ class CatalogRepository:
         )
         now = utc_now()
         with self._lock, self.connect() as connection:
+            product_spine_mode = None
             if product_id is not None:
-                product_row = connection.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone()
+                product_row = connection.execute(
+                    "SELECT id, spine_width_mode FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()
                 if product_row is None:
                     raise ValueError("产品不存在")
+                product_spine_mode = normalize_product_spine_width_mode(
+                    product_row.get("spine_width_mode")
+                )
+                column_values["spine_width_basis"] = product_spine_mode
                 if not product_names:
                     product_names = self._product_names(connection, product_id)
                 if not product_names:
@@ -2281,7 +2625,9 @@ class CatalogRepository:
             rows = connection.execute(
                 f"""
                 SELECT st.*, s.shop, s.shop_name, p.name AS product_category_name,
-                       p.spine_width_formula_json AS product_spine_width_formula_json
+                       p.spine_width_mode AS product_spine_width_mode,
+                       p.spine_width_formula_json AS product_spine_width_formula_json,
+                       p.spine_width_page_rules_json AS product_spine_width_page_rules_json
                 FROM size_templates st
                 JOIN shops s ON s.id = st.shop_id
                 LEFT JOIN products p ON p.id = st.product_id
@@ -2303,7 +2649,9 @@ class CatalogRepository:
             row = connection.execute(
                 """
                 SELECT st.*, s.shop, s.shop_name, p.name AS product_category_name,
-                       p.spine_width_formula_json AS product_spine_width_formula_json
+                       p.spine_width_mode AS product_spine_width_mode,
+                       p.spine_width_formula_json AS product_spine_width_formula_json,
+                       p.spine_width_page_rules_json AS product_spine_width_page_rules_json
                 FROM size_templates st
                 JOIN shops s ON s.id = st.shop_id
                 LEFT JOIN products p ON p.id = st.product_id
@@ -2328,7 +2676,9 @@ class CatalogRepository:
             row = connection.execute(
                 f"""
                 SELECT {select_columns}, s.shop, s.shop_name,
-                       p.spine_width_formula_json AS product_spine_width_formula_json
+                       p.spine_width_mode AS product_spine_width_mode,
+                       p.spine_width_formula_json AS product_spine_width_formula_json,
+                       p.spine_width_page_rules_json AS product_spine_width_page_rules_json
                 FROM size_templates st
                 JOIN shops s ON s.id = st.shop_id
                 LEFT JOIN products p ON p.id = st.product_id
@@ -2528,39 +2878,9 @@ class CatalogRepository:
                 }
                 if candidates and not candidates.intersection(requested):
                     return None
-            if product_name:
-                template_product_id = self._optional_int(template.get("product_id"))
-                normalized_product_name = compact_string(product_name)
-                if template_product_id is not None:
-                    with self.connect() as connection:
-                        if table_exists(connection, "product_names"):
-                            matched = connection.execute(
-                                """
-                                SELECT 1 FROM product_names
-                                WHERE product_id = ?
-                                  AND LOWER(TRIM(name)) = LOWER(TRIM(?))
-                                LIMIT 1
-                                """,
-                                (template_product_id, normalized_product_name),
-                            ).fetchone()
-                            if matched is None:
-                                return None
-                        else:
-                            names = {
-                                compact_string(value).casefold()
-                                for value in template.get("product_names") or []
-                                if compact_string(value)
-                            }
-                            if names and normalized_product_name.casefold() not in names:
-                                return None
-                else:
-                    names = {
-                        compact_string(value).casefold()
-                        for value in template.get("product_names") or []
-                        if compact_string(value)
-                    }
-                    if names and normalized_product_name.casefold() not in names:
-                        return None
+            # Explicit order associations have already been validated by the
+            # automation/manual association flow. Do not require the raw mail
+            # product title to be present in product_names again here.
             return self._flatten_render_template(template)
 
         product_name = compact_string(product_name)
@@ -2643,6 +2963,7 @@ class CatalogRepository:
             product_id = self._optional_int(payload.get("product_id") or payload.get("product")) if ("product_id" in payload or "product" in payload) else existing["product_id"]
             shop_id = self._optional_int(payload.get("shop_id")) or existing["shop_id"]
             self._require_shop(connection, shop_id)
+            product_spine_mode = None
             product_column = self._size_template_product_column(connection)
             product_names = (
                 self._payload_product_names(payload)
@@ -2655,6 +2976,14 @@ class CatalogRepository:
                 if not product_names:
                     raise ValueError("商品名不能为空")
             if product_id is not None:
+                product_row = connection.execute(
+                    "SELECT spine_width_mode FROM products WHERE id = ?",
+                    (product_id,),
+                ).fetchone()
+                if product_row is not None:
+                    product_spine_mode = normalize_product_spine_width_mode(
+                        product_row.get("spine_width_mode")
+                    )
                 product_shops = self._product_shop_ids(connection, product_id)
                 if not product_shops or shop_id not in product_shops:
                     raise ValueError("产品未关联该店铺")
@@ -2678,6 +3007,8 @@ class CatalogRepository:
                 size_spec["display_unit"] = payload.get("display_unit")
             size_spec = self._normalize_size_spec(size_spec)
             column_values = self._size_template_column_values(payload, dict(existing))
+            if product_spine_mode:
+                column_values["spine_width_basis"] = product_spine_mode
             now = utc_now()
             existing_columns = set(existing.keys())
             updates = {
@@ -4820,16 +5151,13 @@ class CatalogRepository:
             result[key] = numeric
         basis = payload.get(
             "spine_width_basis",
-            payload.get("背脊依据", fallback.get("spine_width_basis", 0)),
+            payload.get("背脊依据", fallback.get("spine_width_basis", "range")),
         )
-        if isinstance(basis, bool):
-            basis = int(basis)
-        try:
-            basis = int(basis)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("spine_width_basis 必须是 0 或 1") from exc
-        if basis not in (0, 1):
-            raise ValueError("spine_width_basis 必须是 0 或 1")
+        basis = compact_string(basis).lower()
+        if basis not in PRODUCT_SPINE_WIDTH_MODES:
+            raise ValueError(
+                "spine_width_basis 只能是 range、formula 或 page_count_table"
+            )
         result["spine_width_basis"] = basis
         if (
             result["max_spine_width"] > 0
@@ -4915,7 +5243,9 @@ class CatalogRepository:
             ),
             "min_spine_width": float(row.get("min_spine_width") or 0),
             "max_spine_width": float(row.get("max_spine_width") or 0),
-            "spine_width_basis": int(row.get("spine_width_basis") or 0),
+            "spine_width_basis": normalize_product_spine_width_mode(
+                row.get("spine_width_basis")
+            ),
             "paper_thickness_mm": float(row.get("paper_thickness_mm") or 0),
         }
         product_formula = row.get("product_spine_width_formula")
@@ -4923,8 +5253,21 @@ class CatalogRepository:
             product_formula = normalize_product_spine_width_formula(
                 json_load(row.get("product_spine_width_formula_json"), {})
             )
+        product_page_rules = row.get("product_spine_width_page_rules")
+        if not isinstance(product_page_rules, dict):
+            product_page_rules = normalize_product_spine_width_page_rules(
+                json_load(row.get("product_spine_width_page_rules_json"), {})
+            )
+        product_mode = normalize_product_spine_width_mode(
+            row.get("product_spine_width_mode") or row.get("spine_width_basis"),
+            formula=product_formula,
+            page_rules=product_page_rules,
+        )
+        fields["product_spine_width_mode"] = product_mode
         if product_formula:
             fields["product_spine_width_formula"] = product_formula
+        if product_page_rules:
+            fields["product_spine_width_page_rules"] = product_page_rules
         fields["page_count_arr"] = list(fields["page_count_options"])
         template = {"fields": fields}
         apply_selected_size_variant(template)
@@ -5860,9 +6203,23 @@ class CatalogRepository:
         data["preview_image"] = compact_string(
             data.pop("preview_image_path", data.get("preview_image", ""))
         )
-        data["product_spine_width_formula"] = normalize_product_spine_width_formula(
+        product_formula = normalize_product_spine_width_formula(
             json_load(data.pop("product_spine_width_formula_json", "{}"), {})
-        ) or None
+        )
+        product_page_rules = normalize_product_spine_width_page_rules(
+            json_load(data.pop("product_spine_width_page_rules_json", "{}"), {})
+        )
+        data["product_spine_width_mode"] = normalize_product_spine_width_mode(
+            data.get("product_spine_width_mode") or data.get("spine_width_basis"),
+            formula=product_formula,
+            page_rules=product_page_rules,
+        )
+        # The public size-template contract exposes the product-owned mode as
+        # a readable string. Keep the prefixed key internally for resolver
+        # plumbing, but do not make clients translate the legacy 0/1 basis.
+        data["spine_width_mode"] = data["product_spine_width_mode"]
+        data["product_spine_width_formula"] = product_formula or None
+        data["product_spine_width_page_rules"] = product_page_rules or None
         if include_related:
             data["applicable_products"] = list(product_names)
             data["product_category_name"] = compact_string(
@@ -5889,10 +6246,9 @@ class CatalogRepository:
         except (TypeError, ValueError):
             data["paper_thickness_mm"] = 0.0
         data["display_unit"] = size_spec.get("display_unit") or "in"
-        try:
-            data["spine_width_basis"] = int(data.get("spine_width_basis") or 0)
-        except (TypeError, ValueError):
-            data["spine_width_basis"] = 0
+        data["spine_width_basis"] = normalize_product_spine_width_mode(
+            data.get("spine_width_basis")
+        )
         data["page_count"] = self._normalize_page_count(data.get("page_count"))
         data["page_count_options"] = deepcopy(
             self._normalize_page_count_options(

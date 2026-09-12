@@ -85,6 +85,28 @@ class OrderRepository:
             yield connection
 
     def initialize(self):
+        # Startup must be read-only. Schema/data migrations are an explicit
+        # deployment operation and must never run while importing the app.
+        with self.connect() as connection:
+            required_tables = {"orders", "order_statuses"}
+            existing_tables = set(table_names(connection))
+            missing = sorted(required_tables - existing_tables)
+            if missing:
+                raise RuntimeError(
+                    "数据库缺少必要表（请先执行显式迁移）: " + ", ".join(missing)
+                )
+            required_columns = {"id", "order_number", "status", "product_information"}
+            columns = {row["name"] for row in table_columns(connection, "orders")}
+            missing_columns = sorted(required_columns - columns)
+            if missing_columns:
+                raise RuntimeError(
+                    "orders 表缺少必要字段（请先执行显式迁移）: "
+                    + ", ".join(missing_columns)
+                )
+        return
+
+        # Legacy migration code below is intentionally unreachable. Keep it
+        # for reference until a separate migration command is introduced.
         with self._lock, self.connect() as connection:
             self._ensure_shop_table(connection)
             self._ensure_order_status_table(connection)
@@ -399,6 +421,7 @@ class OrderRepository:
             "uid": uid,
             "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
         }
+        requested_template_id = order.get("size_template_id")
         group_metadata = (metadata or {}).get("order_group") if isinstance(metadata, dict) else None
         with self._lock, self.connect() as connection:
             print(
@@ -439,7 +462,11 @@ class OrderRepository:
                     flush=True,
                 )
             row_data["shop_id"] = product_link["shop_id"]
-            row_data["size_template_id"] = product_link["size_template_id"]
+            row_data["size_template_id"] = (
+                requested_template_id
+                if requested_template_id is not None
+                else product_link["size_template_id"]
+            )
             row_data["shop"] = product_link["shop"]
             row_data["shop_name"] = product_link["shop_name"]
             row_data["order_group_id"] = self._ensure_order_group(
@@ -583,7 +610,7 @@ class OrderRepository:
             "价格": saved["price"],
             "订单总计": saved.get("order_totals", {}),
             "matched_template": saved.get("matched_template"),
-            "resolved_layers": saved.get("resolved_layers"),
+            "template_json": saved.get("template_json"),
         }
 
     def save_template_resolution(
@@ -1497,12 +1524,21 @@ class OrderRepository:
         customer_name = str(group.get("客户姓名") or "").strip() or None
         country = str(group.get("国家") or "").strip() or None
         product_quantity = int(group.get("产品数量") or 0)
+        settlement_currency = None
+        if shop_id is not None:
+            shop_row = connection.execute(
+                "SELECT settlement_currency FROM shops WHERE id = ? LIMIT 1",
+                (shop_id,),
+            ).fetchone()
+            settlement_currency = str((shop_row or {}).get("settlement_currency") or "CAD").upper()
         currency_code, subtotal_amount = OrderRepository._money_value(
-            totals.get("subtotal") if isinstance(totals, dict) else None
+            totals.get("subtotal") if isinstance(totals, dict) else None,
+            target_currency=settlement_currency,
         )
         _, shipping_amount = OrderRepository._money_value(
             totals.get("shipping") if isinstance(totals, dict) else None,
             currency_code=currency_code,
+            target_currency=settlement_currency,
         )
         if not isinstance(totals, dict):
             totals = {}
@@ -1547,7 +1583,7 @@ class OrderRepository:
         return cursor.lastrowid
 
     @staticmethod
-    def _money_value(value, currency_code=None):
+    def _money_value(value, currency_code=None, target_currency=None):
         raw = str(value or "").strip()
         if not raw:
             return currency_code, None
@@ -1564,7 +1600,9 @@ class OrderRepository:
             amount = Decimal(number).quantize(Decimal("0.01"))
         except (InvalidOperation, ValueError):
             return currency_code, None
-        return currency_code, amount if currency_code == "CAD" else None
+        if target_currency and currency_code != target_currency:
+            return currency_code, None
+        return currency_code, amount
 
     @staticmethod
     def _record_monthly_stat(
@@ -1578,7 +1616,7 @@ class OrderRepository:
         order_count,
         product_count,
     ):
-        if not shop_id or currency_code != "CAD":
+        if not shop_id or not currency_code:
             return
         try:
             stat_date = datetime.fromisoformat(str(email_sent_at)).date()
@@ -1662,6 +1700,9 @@ class OrderRepository:
                 [*params, limit, offset],
             ).fetchall()
         return {
+            # Expose the large editable template document only once as
+            # ``template_json``; ``resolved_layers_json`` remains the storage
+            # field used by the rendering pipeline.
             "items": [self.row_to_dict(row) for row in rows],
             "total": total,
             "limit": limit,
@@ -1723,12 +1764,14 @@ class OrderRepository:
             row = connection.execute(
                 """
                 SELECT orders.id, orders.order_group_id, orders.order_number, orders.shop_id,
+                       shops.settlement_currency,
                        order_groups.email_sent_at, order_groups.customer_name,
                        order_groups.country, order_groups.currency_code,
                        order_groups.subtotal_amount, order_groups.shipping_amount,
                        order_groups.product_quantity
                 FROM orders
                 LEFT JOIN order_groups ON order_groups.id = orders.order_group_id
+                LEFT JOIN shops ON shops.id = orders.shop_id
                 WHERE orders.id = ?
                 LIMIT 1
                 """,
@@ -1752,6 +1795,7 @@ class OrderRepository:
             ).fetchone()
         return {
             **dict(row),
+            "currency_mismatch": bool(row.get("currency_code") and row.get("settlement_currency") and row.get("currency_code") != row.get("settlement_currency")),
             "product_quantity": int(float(row.get("product_quantity") or 0)),
             "daily": dict(daily) if daily else {},
             "monthly": dict(monthly) if monthly else {},
@@ -1788,6 +1832,195 @@ class OrderRepository:
             )
             self._refresh_shop_counts(connection, existing["shop_id"])
             connection.commit()
+        return self.get(order_id)
+
+    def associate_template_selection(
+        self,
+        order_id: int,
+        order_number: str,
+        product_id: int,
+        size_template_id: int,
+        size_option_id: str,
+    ):
+        """Atomically associate a manually selected product/size option.
+
+        The shop is always taken from the order row.  The selected option's
+        own layer document is preferred, followed by a synchronized font
+        layout variant and finally the active font layout base document.
+        """
+        normalized_order_number = str(order_number or "").strip()
+        normalized_option_id = str(size_option_id or "").strip()
+        if not normalized_order_number:
+            raise ValueError("订单号不能为空")
+        if not normalized_option_id:
+            raise ValueError("size_option_id 不能为空")
+        try:
+            product_id = int(product_id)
+            size_template_id = int(size_template_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("product_id 和 size_template_id 必须是有效整数") from exc
+        if product_id <= 0 or size_template_id <= 0:
+            raise ValueError("product_id 和 size_template_id 必须大于 0")
+
+        with self._lock, self.connect() as connection:
+            order = connection.execute(
+                """
+                SELECT id, order_number, shop_id, shop, shop_name, status
+                FROM orders
+                WHERE id = ? AND order_number = ?
+                LIMIT 1
+                """,
+                (order_id, normalized_order_number),
+            ).fetchone()
+            if order is None:
+                raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
+            if self._validate_status(order["status"]) != DEFAULT_ORDER_STATUS:
+                raise ValueError("只有新订单状态（0）可以手动关联模板")
+            shop_id = order.get("shop_id")
+            if shop_id is None:
+                raise ValueError("订单未关联店铺，无法手动关联模板")
+
+            product = connection.execute(
+                """
+                SELECT p.id, p.name
+                FROM products p
+                JOIN product_shops ps ON ps.product_id = p.id
+                WHERE p.id = ? AND ps.shop_id = ? AND p.enabled = 1
+                LIMIT 1
+                """,
+                (product_id, shop_id),
+            ).fetchone()
+            if product is None:
+                raise ValueError("所选产品不存在、未启用或不属于订单当前店铺")
+
+            template = connection.execute(
+                """
+                SELECT st.*, s.shop, s.shop_name
+                FROM size_templates st
+                JOIN shops s ON s.id = st.shop_id
+                WHERE st.id = ? AND st.shop_id = ? AND st.product_id = ?
+                LIMIT 1
+                """,
+                (size_template_id, shop_id, product_id),
+            ).fetchone()
+            if template is None:
+                raise ValueError("所选尺寸模板不存在或不属于该产品和店铺")
+
+            option = connection.execute(
+                """
+                SELECT *
+                FROM size_template_options
+                WHERE size_template_id = ? AND size_option_id = ?
+                LIMIT 1
+                """,
+                (size_template_id, normalized_option_id),
+            ).fetchone()
+            if option is None:
+                raise ValueError("所选规格不存在或不属于该尺寸模板")
+
+            def decode_layers(value):
+                try:
+                    decoded = json.loads(value or "{}")
+                except (TypeError, ValueError):
+                    return {}
+                return decoded if isinstance(decoded, dict) and decoded else {}
+
+            layers = decode_layers(option.get("layers_json"))
+            layers_source = "size_template_option"
+            selected_layout_id = template.get("selected_font_layout_id")
+            if (
+                not layers
+                and selected_layout_id
+                and table_exists(connection, "font_layout_size_variants")
+            ):
+                variant = connection.execute(
+                    """
+                    SELECT flsv.layers_json
+                    FROM font_layout_size_variants flsv
+                    JOIN size_template_options sto
+                      ON sto.id = flsv.size_template_option_id
+                    WHERE flsv.font_layout_id = ?
+                      AND flsv.size_template_id = ?
+                      AND sto.id = ?
+                    LIMIT 1
+                    """,
+                    (selected_layout_id, size_template_id, option["id"]),
+                ).fetchone()
+                if variant is not None:
+                    layers = decode_layers(variant.get("layers_json"))
+                    if layers:
+                        layers_source = "font_layout_size_variant"
+            if (
+                not layers
+                and selected_layout_id
+                and table_exists(connection, "font_layout_library")
+            ):
+                base = connection.execute(
+                    "SELECT layers_json FROM font_layout_library WHERE id = ? LIMIT 1",
+                    (selected_layout_id,),
+                ).fetchone()
+                if base is not None:
+                    layers = decode_layers(base.get("layers_json"))
+                    if layers:
+                        layers_source = "font_layout_base"
+            if not layers:
+                raise ValueError("所选规格没有可保存的图层数据")
+
+            def decode_json(value, default):
+                try:
+                    decoded = json.loads(value or "")
+                except (TypeError, ValueError):
+                    return default
+                return decoded
+
+            matched_template = {
+                "template_id": template["id"],
+                "shop_id": shop_id,
+                "shop": template.get("shop") or order.get("shop"),
+                "shop_name": template.get("shop_name") or order.get("shop_name"),
+                "product_id": product_id,
+                "size_unit": option.get("size_unit") or template.get("display_unit"),
+                "selected_size": normalized_option_id,
+                "single_side_width": option.get("single_side_width"),
+                "single_side_height": option.get("single_side_height"),
+                "bleed": option.get("bleed"),
+                "spine_width": option.get("spine_width"),
+                "spine_bleed": option.get("spine_bleed"),
+                "background_color": template.get("background_color") or "#ffffff",
+                "page_count": template.get("page_count"),
+                "page_count_options": decode_json(
+                    template.get("page_count_options_json"), []
+                ),
+                "manual_selection": True,
+            }
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE orders
+                SET shop_id = ?, shop = ?, shop_name = ?, size_template_id = ?,
+                    matched_template_json = ?, resolved_layers_json = ?, updated_at = ?
+                WHERE id = ? AND order_number = ? AND status = ?
+                """,
+                (
+                    shop_id,
+                    template.get("shop") or order.get("shop"),
+                    template.get("shop_name") or order.get("shop_name"),
+                    size_template_id,
+                    json.dumps(matched_template, ensure_ascii=False),
+                    json.dumps(layers, ensure_ascii=False),
+                    now,
+                    order_id,
+                    normalized_order_number,
+                    DEFAULT_ORDER_STATUS,
+                ),
+            )
+            print(
+                "[订单] 手动关联模板成功："
+                f"订单ID={order_id}，订单号={normalized_order_number}，"
+                f"产品ID={product_id}，模板ID={size_template_id}，"
+                f"规格={normalized_option_id}，图层来源={layers_source}",
+                flush=True,
+            )
         return self.get(order_id)
 
     def associate_current_template(self, order_id: int, order_number: str):
@@ -1971,13 +2204,15 @@ class OrderRepository:
         data["matched_template"] = OrderRepository._decode_json_object(
             data.pop("matched_template_json", "{}")
         )
-        data["resolved_layers"] = OrderRepository._decode_json_object(
+        resolved_layers = OrderRepository._decode_json_object(
             data.pop("resolved_layers_json", "{}")
         )
         data["order_totals"] = OrderRepository._decode_json_object(
             data.pop("order_totals_json", "{}")
         )
-        data["template_json"] = data["resolved_layers"]
+        # ``template_json`` is the public editable name for the document. The
+        # database column remains ``resolved_layers_json`` for renderer use.
+        data["template_json"] = resolved_layers
         data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
         return data
 
