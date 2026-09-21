@@ -160,6 +160,18 @@ class _StorageService:
 
 
 class CustomerConfirmationStatusTests(unittest.TestCase):
+    def test_new_order_advances_without_regenerating_confirmation_files(self):
+        repository = _StatusRepository()
+        repository.status = 0
+        artifacts = _ConfirmationArtifactService()
+        service = OrderService(repository, production_artifact_service=artifacts)
+
+        result = service.advance_status(78, "4156669962")
+
+        self.assertEqual(result["status"], 1)
+        self.assertEqual(repository.advance_calls, [(78, "4156669962", 0)])
+        self.assertEqual(artifacts.calls, [])
+
     def test_status_one_regenerates_files_before_advancing_to_two(self):
         repository = _StatusRepository()
         artifacts = _ConfirmationArtifactService()

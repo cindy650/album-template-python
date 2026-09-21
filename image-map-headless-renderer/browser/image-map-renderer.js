@@ -783,10 +783,17 @@
     const logicalHeight = numberOr(workarea.workareaHeight, bounds.height) || bounds.height;
     const scaleX = bounds.width / logicalWidth;
     const scaleY = bounds.height / logicalHeight;
-    return guides.map(guide => ({
-      ...guide,
-      position: (Number(guide.position) || 0) * (guide.orientation === 'vertical' ? scaleX : scaleY),
-    }));
+    // Dimension-derived content boundaries (single-side width/height) and
+    // bleed boundaries are editor/print-layout guides, not artwork. Keep
+    // them in the returned JSON for the editor, but do not emit them into
+    // production SVG files. Other explicitly authored guide kinds remain
+    // available to the SVG exporter.
+    return guides
+      .filter(guide => !['bleed', 'content'].includes(String(guide?.kind || '').toLowerCase()))
+      .map(guide => ({
+        ...guide,
+        position: (Number(guide.position) || 0) * (guide.orientation === 'vertical' ? scaleX : scaleY),
+      }));
   }
 
   function exportOptions(canvas, workarea, bounds, objects, textToSvg = false) {
@@ -801,7 +808,9 @@
       backgroundColor: String(workarea.backgroundColor || '#ffffff'),
       layerNames: layerNames(objects),
       fontSources: collectFontSources(objects, { textToSvg }),
-      printGuides: renderedPrintGuides(workarea, bounds),
+      // Print dimensions and bleed guides are editor-only overlays and must
+      // not be included in exported SVG artwork.
+      printGuides: [],
     };
   }
 

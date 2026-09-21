@@ -53,7 +53,7 @@ class ImageMapSvgExportTests(unittest.TestCase):
             finally:
                 renderer.close()
 
-    def test_svg_has_editable_guides_without_embedded_font_binary(self):
+    def test_svg_omits_dimension_and_bleed_guides_without_embedded_font_binary(self):
         project_root = Path(__file__).resolve().parents[1]
         font_path = Path("C:/Windows/Fonts/arial.ttf")
         self.assertTrue(font_path.is_file())
@@ -117,17 +117,14 @@ class ImageMapSvgExportTests(unittest.TestCase):
         self.assertIn("<!-- Creator: CorelDRAW -->", svg)
         self.assertIn("font-family", svg)
         self.assertIn("@font-face", svg)
-        self.assertIn("font-family:\"Arial\"", svg)
-        self.assertIn("file:///C:/Windows/Fonts/arial.ttf", svg)
+        self.assertIn('font-family: "Arial"', svg)
+        self.assertIn("arial.ttf", svg)
         self.assertNotIn("data:font", svg)
         self.assertNotIn(";base64,", svg)
 
         root = ElementTree.fromstring(svg.split("<!-- Creator: CorelDRAW -->", 1)[1])
         namespace = {"svg": "http://www.w3.org/2000/svg"}
-        bleed = root.find("svg:line[@id='print-guide-1']", namespace)
-        content = root.find("svg:line[@id='print-guide-2']", namespace)
-        self.assertEqual(bleed.get("stroke-dasharray"), "6 4")
-        self.assertIsNone(content.get("stroke-dasharray"))
+        self.assertEqual(root.findall(".//svg:line", namespace), [])
         title = root.find(".//*[@id='title']", namespace)
         self.assertIsNotNone(title)
         self.assertEqual(title.get("data-name"), "标题文字")

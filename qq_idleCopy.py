@@ -2094,6 +2094,11 @@ def process_new_messages(
                         order_data["店铺"], order_data["店铺名"],
                         order_data["产品"], order_data["商品信息"],
                     )
+                    # Classification is authoritative for this mail item.
+                    # Pass its resolved template into persistence so the
+                    # repository cannot re-run the legacy fixed-field matcher.
+                    if product_match and product_match.get("size_template_id") is not None:
+                        order_data["size_template_id"] = product_match["size_template_id"]
                     if not product_match:
                         print(
                             "[邮件分类] 商品未自动关联产品，不影响订单入库，后续等待人工关联："

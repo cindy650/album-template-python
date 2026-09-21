@@ -240,6 +240,8 @@ class OrderTemplateResolver:
             raise RuntimeError(
                 "模板包含自然语言图层规则，必须配置并调用 DeepSeek，不能使用模板示例文字回退"
             )
+        rule_layout_for_logging = self.font_layout_for_size_option(layout, selected_size)
+        failed_rule_element_ids = []
         if resolver is not None and resolver.enabled:
             try:
                 deepseek_result = resolver.resolve(
@@ -272,9 +274,27 @@ class OrderTemplateResolver:
                 ]
                 if missing_ids or invalid_empty_ids:
                     error_ids = missing_ids + invalid_empty_ids
-                    raise RuntimeError(
+                    failed_rule_element_ids = list(error_ids)
+                    rule_error = RuntimeError(
                         "DeepSeek 未返回全部自然语言图层文字：" + ", ".join(error_ids)
                     )
+                    rule_error.rule_details = {
+                        element_id: next(
+                            (
+                                element.get("rule")
+                                or (element.get("content") or {}).get("rule")
+                                or element.get("rules")
+                                or {}
+                                for element in self._layout_objects(rule_layout_for_logging)
+                                if isinstance(element, dict)
+                                and str(element.get("id") or element.get("name") or "").strip()
+                                == element_id
+                            ),
+                            {},
+                        )
+                        for element_id in error_ids
+                    }
+                    raise rule_error
                 values = {
                     element_id: returned_values[element_id]
                     for element_id in rule_ids
@@ -308,6 +328,31 @@ class OrderTemplateResolver:
                         f"[模板解析] DeepSeek 规则失败：{type(exc).__name__}: {exc}",
                         flush=True,
                     )
+                    if failed_rule_element_ids:
+                        rule_details = []
+                        for element in self._layout_objects(rule_layout_for_logging):
+                            if not isinstance(element, dict):
+                                continue
+                            element_id = str(
+                                element.get("id") or element.get("name") or ""
+                            ).strip()
+                            if element_id not in failed_rule_element_ids:
+                                continue
+                            rule = (
+                                element.get("rule")
+                                or (element.get("content") or {}).get("rule")
+                                or element.get("rules")
+                            )
+                            rule_details.append(
+                                f"{element_id}: "
+                                f"{json.dumps(rule or {}, ensure_ascii=False)}"
+                            )
+                        if rule_details:
+                            print(
+                                "[模板解析] 异常图层规则："
+                                + "；".join(rule_details),
+                                flush=True,
+                            )
                     raise
                 print(
                     f"[模板解析] DeepSeek 非必需规则失败，继续本地渲染：{type(exc).__name__}: {exc}",
@@ -378,6 +423,7 @@ class OrderTemplateResolver:
             for key in (
                 "min_spine_width",
                 "max_spine_width",
+                "display_unit",
                 "min_page_count",
                 "max_page_count",
                 "page_count",
@@ -389,6 +435,14 @@ class OrderTemplateResolver:
             )
             if key in template
         }
+        # `find_render_template` exposes the template/display unit as
+        # `size_unit`; preserve it before the selected option replaces the
+        # same compatibility key with its own unit.
+        fields["spine_width_unit"] = (
+            template.get("spine_width_unit")
+            or template.get("display_unit")
+            or template.get("size_unit")
+        )
         template_fields = template.get("fields") or {}
         if isinstance(template_fields, dict):
             fields.update(template_fields)
@@ -467,7 +521,11 @@ class OrderTemplateResolver:
                     flush=True,
                 )
                 return
-        result = resolve_spine_width_for_page_count(fields, page_count)
+        result = resolve_spine_width_for_page_count(
+            fields,
+            page_count,
+            target_unit=option.get("size_unit") or fields.get("size_unit"),
+        )
         if result is None:
             print(
                 "[模板解析] 未找到完整页数/背脊宽范围，保留模板原背脊宽："

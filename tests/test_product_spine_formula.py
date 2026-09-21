@@ -6,6 +6,7 @@ from backend.catalog.repository import (
     normalize_product_spine_width_page_rules,
 )
 from backend.templates.size_variants import (
+    resolve_product_spine_width_formula,
     resolve_product_spine_width_page_table,
 )
 
@@ -14,8 +15,15 @@ class ProductSpineFormulaTests(unittest.TestCase):
     def test_normalizes_valid_formula(self):
         result = normalize_product_spine_width_formula({"unit": "cm"})
         self.assertEqual(result["unit"], "cm")
-        self.assertEqual(result["page_count_coefficient"], 0.2)
-        self.assertEqual(result["additional_width"], 0.9)
+        self.assertEqual(result["paper_thickness"], 0.5)
+        self.assertEqual(result["fixed_width"], 10)
+
+    def test_resolves_current_product_formula(self):
+        width, metadata = resolve_product_spine_width_formula(
+            {"unit": "cm"}, 20, "cm"
+        )
+        self.assertAlmostEqual(width, 20.0)  # 20 * 0.5 + 10
+        self.assertEqual(metadata["fixed_width"], 10)
 
     def test_normalizes_page_count_table(self):
         result = normalize_product_spine_width_page_rules(

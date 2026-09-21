@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from hashlib import md5
 from io import BytesIO
 from pathlib import Path
@@ -79,6 +80,7 @@ class WeComRobotNotifier:
         self,
         title: str,
         product_information: dict[str, Any],
+        rule_details: dict[str, Any] | None = None,
     ):
         """Send an operator-facing automation exception as markdown."""
         if not self.webhook_url:
@@ -90,13 +92,22 @@ class WeComRobotNotifier:
             for key, value in information.items()
             if str(key or "").strip()
         ]
-        content = "\n".join(
-            [
-                f"### {title}",
-                "**商品信息**",
-                *(lines or ["> 无商品信息"]),
-            ]
-        )
+        content_lines = [
+            f"### {title}",
+            "**商品信息**",
+            *(lines or ["> 无商品信息"]),
+        ]
+        if rule_details:
+            content_lines.extend(
+                [
+                    "**异常图层规则**",
+                    *[
+                        f"> {element_id}：{json.dumps(rule, ensure_ascii=False)}"
+                        for element_id, rule in rule_details.items()
+                    ],
+                ]
+            )
+        content = "\n".join(content_lines)
         # WeCom group robot markdown content is limited to 4096 bytes.
         content = self._truncate_utf8(content, 4096)
         response = self._post(

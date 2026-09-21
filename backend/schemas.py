@@ -275,25 +275,15 @@ class ProductSpineWidthFormula(BaseModel):
         default="cm",
         description="公式数值单位；公式计算结果会换算为规格使用单位",
     )
-    page_count_coefficient: float = Field(
-        default=0.2,
+    paper_thickness: float = Field(
+        default=0.5,
         ge=0,
-        description="页数系数；计算项为 page_count * page_count_coefficient",
+        description="每页纸张厚度；公式计算项为 page_count * paper_thickness",
     )
-    page_count_thickness: float = Field(
-        default=0.3,
+    fixed_width: float = Field(
+        default=10,
         ge=0,
-        description="每页厚度；照片留言册为 0.3cm",
-    )
-    base_width: float = Field(
-        default=1,
-        ge=0,
-        description="公式基础背脊宽",
-    )
-    additional_width: float = Field(
-        default=0.9,
-        ge=0,
-        description="公式附加背脊宽",
+        description="公式固定背脊宽",
     )
     spine_bleed: float = Field(
         default=0,
@@ -348,6 +338,16 @@ class ProductCreate(BaseModel):
     specification_field: str | None = Field(
         default=None,
         description="从订单商品信息中读取规格值的字段名；为空时使用 template_marker",
+    )
+    paper_thickness: float = Field(
+        default=0.5,
+        ge=0,
+        description="每页纸张厚度；公式计算项为 page_count * paper_thickness",
+    )
+    fixed_width: float = Field(
+        default=10,
+        ge=0,
+        description="公式固定背脊宽",
     )
     common_spec_values: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -827,6 +827,7 @@ class FontLayoutLibraryCreate(BaseModel):
 
     shop_id: int | None = Field(default=None, gt=0, description="兼容旧链路的所属店铺 ID")
     product_id: int | None = Field(default=None, gt=0, description="所属产品分类 ID")
+    layout_scope: Literal["size", "inner_page"] = Field(default="size", description="布局库用途")
     name: str = Field(min_length=1, description="字体布局模板名称")
     sort_key: str = Field(
         default="",
@@ -843,6 +844,7 @@ class FontLayoutLibraryUpdate(BaseModel):
 
     shop_id: int | None = Field(default=None, gt=0, description="所属店铺 ID")
     product_id: int | None = Field(default=None, gt=0, description="所属产品分类 ID")
+    layout_scope: Literal["size", "inner_page"] | None = Field(default=None, description="布局库用途")
     name: str | None = Field(default=None, min_length=1, description="模板名称")
     sort_key: str | None = Field(
         default=None,
@@ -956,6 +958,16 @@ class FontLayoutSizeSync(BaseModel):
     items: list[FontLayoutSizeVariantItem] = Field(
         min_length=1,
         description="需要同步的一个或多个规格图层",
+    )
+
+
+class FontLayoutInnerPageSync(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inner_page_template_id: int = Field(gt=0, description="目标内页模板 ID")
+    items: list[FontLayoutSizeVariantItem] = Field(
+        min_length=1,
+        description="需要同步的一个或多个内页规格图层",
     )
 
 

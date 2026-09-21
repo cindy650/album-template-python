@@ -45,7 +45,8 @@ async def list_order_statuses():
         "从第 1 页开始分页查询订单，可按订单号、交易编号、店铺、店铺 ID 和状态值筛选。"
         "同一 Etsy 订单号可能返回多条商品项；请使用每条记录的 id 操作模板、状态和导出。"
         "响应包含当前页 pages、每页数量 limit、总记录数 total 和总页数 total_pages。"
-        "每条订单都会返回 status、status_text 和 status_button_text。"
+        "每条订单都会返回 status、status_text、status_button_text 和 "
+        "wecom_preview_sent（示意图是否至少成功发送过一次企业微信）。"
     ),
     operation_id="查询订单列表",
 )
@@ -151,8 +152,10 @@ async def update_order_status(
     summary="推进订单状态",
     description=(
         "根据订单 ID 和订单号校验订单，并按状态表配置推进到下一状态。"
-        "当前状态为 1（客户已确认）时，会先重新生成并覆盖 SVG 和 A4 生产单的"
-        "本地文件及 OSS 文件，全部成功后才推进到状态 2。"
+        "支持从状态 0（新订单）推进到状态 1（示意图已发送/客户确认中）。"
+        "发送示意图不会自动推进状态，前端需单独调用本接口。"
+        "当前状态为 1 时，调用表示客户已确认，会先重新生成并覆盖订单生产文件的"
+        "本地文件及 OSS 文件，全部成功后才推进到状态 2（待生产）。"
         "订单已完成后不能继续推进。"
     ),
     operation_id="推进订单状态",
@@ -249,8 +252,9 @@ async def associate_order_template(
     summary="生成并发送订单示意图",
     description=(
         "根据订单当前关联的商品模板生成订单预览图和企业微信订单辅助图，"
-        "发送到企业微信；两张图发送成功后将订单状态更新为 1。"
-        "商品未关联模板或企业微信发送失败时状态保持不变。"
+        "发送到企业微信；发送成功或失败均不修改订单状态。"
+        "发送成功后将订单字段 wecom_preview_sent 更新为 true。"
+        "状态由前端单独调用 /api/v1/orders/status/advance 推进。"
     ),
 )
 async def send_order_preview_images(payload: OrderPrintImageRequest):

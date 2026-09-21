@@ -123,7 +123,56 @@ class SizeTemplateStyleMatchingTests(unittest.TestCase):
         self.assertIsNone(matched["size_template_id"])
 
 
+class SpineWidthUnitTests(unittest.TestCase):
+    def test_page_range_is_converted_from_template_unit_to_selected_option_unit(self):
+        template = {
+            "size_unit": "cm",
+            "min_spine_width": 1.397,
+            "max_spine_width": 1.778,
+            "page_count_options": [50, 100],
+        }
+        option = {
+            "size_unit": "in",
+            "spine_width": 0.55,
+            "spine_bleed": 0.55,
+        }
+
+        OrderTemplateResolver._apply_order_page_count_spine_width(
+            template, option, 50,
+        )
+
+        self.assertAlmostEqual(option["spine_width"], 0.55, places=6)
+        self.assertEqual(
+            template["spine_width_resolution"]["source_unit"], "cm",
+        )
+        self.assertEqual(
+            template["spine_width_resolution"]["target_unit"], "in",
+        )
+
+    def test_page_range_keeps_values_when_template_and_option_units_match(self):
+        template = {
+            "size_unit": "cm",
+            "min_spine_width": 1.397,
+            "max_spine_width": 1.778,
+            "page_count_options": [50, 100],
+        }
+        option = {"size_unit": "cm", "spine_width": 1.397}
+
+        OrderTemplateResolver._apply_order_page_count_spine_width(
+            template, option, 50,
+        )
+
+        self.assertAlmostEqual(option["spine_width"], 1.397, places=6)
+
+
 class SelectedFontLayoutTests(unittest.TestCase):
+    @staticmethod
+    def _use_selected_size_layers(template):
+        template["size_spec"] = {
+            "selected": 1,
+            "options": [{"id": 1, "layers": template["font_layout_templates"][0]}],
+        }
+
     def test_empty_deepseek_text_removes_rule_layer_and_keeps_other_layers(self):
         class DeepSeekStub:
             enabled = True
@@ -176,6 +225,7 @@ class SelectedFontLayoutTests(unittest.TestCase):
             ],
         }
 
+        self._use_selected_size_layers(template)
         resolved = resolver.resolve(
             template,
             {
@@ -224,6 +274,7 @@ class SelectedFontLayoutTests(unittest.TestCase):
             ],
         }
 
+        self._use_selected_size_layers(template)
         with self.assertRaisesRegex(
             RuntimeError,
             "DeepSeek 未返回全部自然语言图层文字：name-layer",
@@ -266,6 +317,7 @@ class SelectedFontLayoutTests(unittest.TestCase):
             ],
         }
 
+        self._use_selected_size_layers(template)
         with self.assertRaisesRegex(
             RuntimeError,
             "DeepSeek 未返回全部自然语言图层文字：location-layer",
@@ -287,6 +339,7 @@ class SelectedFontLayoutTests(unittest.TestCase):
             ],
         }
 
+        self._use_selected_size_layers(template)
         resolved = resolver.resolve(template, {
             "order_number": "test-order",
             "product_information": product_information("#2 and Black"),

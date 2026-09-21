@@ -12090,6 +12090,22 @@ var ImageMapEditorSvgExportBundle = (() => {
     Array.from(root.querySelectorAll("image")).forEach((image) => {
       const href = image.getAttribute("href") || image.getAttributeNS(XLinkNamespace, "href") || "";
       if (!href.trim()) image.remove();
+      else {
+        if (!image.hasAttribute("preserveAspectRatio")) image.setAttribute("preserveAspectRatio", "none");
+        const ancestors = [];
+        let ancestor = image.parentElement;
+        while (ancestor && ancestor !== root) {
+          if (ancestor.getAttribute("transform")) ancestors.unshift(ancestor);
+          ancestor = ancestor.parentElement;
+        }
+        if (ancestors.length) {
+          const transforms = ancestors.map((element) => element.getAttribute("transform")?.trim()).filter(Boolean).join(" ");
+          const ownTransform = image.getAttribute("transform")?.trim();
+          if (transforms) image.setAttribute("transform", `${transforms}${ownTransform ? ` ${ownTransform}` : ""}`);
+          const outer = ancestors[0];
+          outer.parentElement?.insertBefore(image, outer);
+        }
+      }
     });
     Array.from(root.children).filter((element) => element.localName === "rect").forEach((rect) => {
       const width = rect.getAttribute("width")?.trim();

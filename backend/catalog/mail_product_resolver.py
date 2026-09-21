@@ -223,6 +223,23 @@ class MailProductResolver:
         )
         specification_field = str(candidate.get("specification_field") or "").strip()
         marker_field = str(candidate.get("template_marker") or "").strip()
+        if marker_field:
+            # All classification paths must use the same template-first rule,
+            # including page-count values which do not name a size option.
+            matched = self._match_template_for_product(candidate, product_information)
+            associated = self.repository.associate_mail_product_name(
+                candidate["product_id"], candidate["shop_id"], product_name,
+            )
+            print(
+                "[邮件分类] product_names 写入成功："
+                f"产品ID={candidate['product_id']}，商品={product_name}",
+                flush=True,
+            )
+            return {
+                **associated, **matched,
+                "product_name": product_name,
+                "translated_product_name": semantic_match.get("translated_title", ""),
+            }
         lookup_field = specification_field or marker_field
         specification_value = self._field_value(product_information, lookup_field)
         print(
@@ -360,28 +377,53 @@ class MailProductResolver:
                 pass
         specification_field = str(product.get("specification_field") or "").strip()
         marker_field = str(product.get("template_marker") or "").strip()
-        field = specification_field or marker_field
-        value = self._field_value(product_information, field)
-        if not value:
-            return product
+        # template_marker identifies the template; specification_field only
+        # selects an option inside that template.  They must never be
+        # interchangeable (using the specification value to find a template
+        # was the source of the old fixed-field behaviour).
         if marker_field:
+            marker_value = self._field_value(product_information, marker_field)
+            if not marker_value:
+                return product
             marker_matcher = getattr(self.repository, "find_product_template_marker", None)
-            marker_match = marker_matcher(product["product_id"], product["shop_id"], value) if marker_matcher else None
+            marker_match = marker_matcher(product["product_id"], product["shop_id"], marker_value) if marker_matcher else None
             if not marker_match:
                 return product
-            product = {**product, "size_template_id": marker_match["size_template_id"]}
+            product = {
+                **product,
+                "size_template_id": marker_match["size_template_id"],
+                "use_default_size_option": True,
+            }
             if specification_field:
                 spec_value = self._field_value(product_information, specification_field)
-                spec_matcher = getattr(self.repository, "find_template_specification", None)
-                if spec_matcher and not spec_matcher(product["size_template_id"], spec_value):
+                if not spec_value:
                     return {**product, "size_template_id": None}
+                spec_matcher = getattr(self.repository, "find_template_specification", None)
+                matched_specification = (
+                    spec_matcher(product["size_template_id"], spec_value)
+                    if spec_matcher else None
+                )
+                product["specification_value"] = spec_value
+                product["matched_specification"] = matched_specification
+                product["use_default_size_option"] = matched_specification is None
+                print(
+                    "[邮件分类] 模板规格判断："
+                    f"模板ID={product['size_template_id']}，"
+                    f"字段={specification_field}，字段值={spec_value}，"
+                    + (f"命中规格={matched_specification}" if matched_specification is not None
+                       else "未命中尺寸规格，按页数信息保留，使用模板默认规格"),
+                    flush=True,
+                )
             return product
         if specification_field:
+            value = self._field_value(product_information, specification_field)
+            if not value:
+                return product
             matcher = getattr(self.repository, "find_product_template_specification", None)
             match = matcher(product["product_id"], product["shop_id"], value) if matcher else None
         else:
-            matcher = getattr(self.repository, "find_product_template_marker", None)
-            match = matcher(product["product_id"], product["shop_id"], value) if matcher else None
+            # No rule field means there is no automatic template choice.
+            return product
         if match:
             product = {**product, "size_template_id": match.get("size_template_id")}
         return product

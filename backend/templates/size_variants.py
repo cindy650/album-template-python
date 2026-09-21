@@ -179,16 +179,14 @@ def resolve_product_spine_width_formula(
         source_unit = required_size_unit(formula.get("unit"))
         target_unit = required_size_unit(target_unit)
         pages = float(page_count)
-        coefficient = float(formula.get("page_count_coefficient", 0.2))
-        thickness = float(formula.get("page_count_thickness", 0.3))
-        base = float(formula.get("base_width", 1))
-        additional = float(formula.get("additional_width", 0.9))
+        thickness = float(formula.get("paper_thickness", 0.5))
+        base = float(formula.get("fixed_width", 10))
         spine_bleed = float(formula.get("spine_bleed", 0))
     except (TypeError, ValueError):
         return None
-    if pages < 0 or coefficient < 0 or thickness < 0 or base < 0 or additional < 0 or spine_bleed < 0:
+    if pages < 0 or thickness < 0 or base < 0 or spine_bleed < 0:
         return None
-    width = pages * coefficient * thickness + base + additional
+    width = pages * thickness + base
     source_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}[source_unit]
     target_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}[target_unit]
     converted_width = width / source_factor * target_factor
@@ -198,10 +196,8 @@ def resolve_product_spine_width_formula(
         "formula_unit": source_unit,
         "target_unit": target_unit,
         "page_count": pages,
-        "page_count_coefficient": coefficient,
-        "page_count_thickness": thickness,
-        "base_width": base,
-        "additional_width": additional,
+        "paper_thickness": thickness,
+        "fixed_width": base,
         "spine_width": max(0, converted_width),
         "spine_bleed": max(0, converted_bleed),
     }
@@ -291,16 +287,43 @@ def resolve_product_spine_width_page_table(
 def resolve_spine_width_for_page_count(
     fields: dict[str, Any],
     page_count: Any,
+    target_unit: str | None = None,
 ) -> tuple[float, dict[str, Any]] | None:
     """Resolve spine width from the template page range and width range.
 
     The smallest configured page count maps to ``min_spine_width`` and the
     largest maps to ``max_spine_width``. Values between or outside those
     endpoints use the same linear interval, clamped to the configured range.
+    Range values are interpreted in ``spine_width_unit``/``display_unit`` and
+    converted to ``target_unit`` when provided.
     ``None`` is returned when the template does not contain a complete
     page/width range and the caller should keep its existing width rule.
     """
     source = dict(fields or {})
+    # Template-level page-range values use the template/display unit, while
+    # the selected size option may use another unit.  Keep the old behaviour
+    # when no unit metadata is available, but convert explicitly when it is.
+    source_unit_value = (
+        source.get("spine_width_unit")
+        or source.get("display_unit")
+        or source.get("size_unit")
+    )
+    if source_unit_value in (None, ""):
+        # Older callers did not carry unit metadata; preserve their same-unit
+        # calculation instead of inventing a unit or rejecting the range.
+        source_unit = None
+    else:
+        try:
+            source_unit = required_size_unit(source_unit_value)
+        except ValueError:
+            return None
+    if target_unit in (None, "") and source_unit is None:
+        resolved_target_unit = None
+    else:
+        try:
+            resolved_target_unit = required_size_unit(target_unit or source_unit)
+        except ValueError:
+            return None
     options = source.get("page_count_options")
     if not options:
         options = source.get("page_count_arr")
@@ -386,8 +409,10 @@ def resolve_spine_width_for_page_count(
         return None
     ratio = (requested - page_min) / (page_max - page_min)
     ratio = min(1.0, max(0.0, ratio))
-    width = width_min + (width_max - width_min) * ratio
-    return width, {
+    source_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}.get(source_unit, 1.0)
+    target_factor = {"in": 1.0, "cm": 2.54, "mm": 25.4}.get(resolved_target_unit, 1.0)
+    width = (width_min + (width_max - width_min) * ratio) / source_factor * target_factor
+    resolution = {
         "method": "linear_page_range",
         "requested_page_count": requested,
         "min_page_count": page_min,
@@ -397,6 +422,11 @@ def resolve_spine_width_for_page_count(
         "ratio": ratio,
         "spine_width": width,
     }
+    if source_unit is not None:
+        resolution["source_unit"] = source_unit
+    if resolved_target_unit is not None:
+        resolution["target_unit"] = resolved_target_unit
+    return width, resolution
 
 
 def apply_selected_size_variant(template: dict[str, Any]) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 import json
+import re
 from backend.database import (
     connection_scope,
     foreign_keys,
@@ -121,10 +122,8 @@ def normalize_product_spine_width_formula(value: Any) -> dict[str, Any]:
 
     return {
         "unit": unit,
-        "page_count_coefficient": number("page_count_coefficient", 0.2),
-        "page_count_thickness": number("page_count_thickness", 0.3),
-        "base_width": number("base_width", 1),
-        "additional_width": number("additional_width", 0.9),
+        "paper_thickness": number("paper_thickness", 0.5),
+        "fixed_width": number("fixed_width", 10),
         "spine_bleed": number("spine_bleed", 0),
     }
 
@@ -333,6 +332,19 @@ class CatalogRepository:
                     raise RuntimeError(
                         f"数据库结构不完整，请先执行独立迁移：{table} 缺少字段 {', '.join(missing)}"
                     )
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS inner_page_font_layout_library (
+                    id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                    shop_id INTEGER NOT NULL,
+                    product_id INTEGER NULL,
+                    name VARCHAR(255) NOT NULL,
+                    sort_key VARCHAR(255) NOT NULL DEFAULT '',
+                    preview_image_path TEXT NOT NULL,
+                    layers_json LONGTEXT NOT NULL,
+                    created_at VARCHAR(64) NOT NULL,
+                    updated_at VARCHAR(64) NOT NULL
+                )
+            """)
 
     def _create_schema(self, connection):
         connection.execute(
@@ -491,6 +503,11 @@ class CatalogRepository:
             connection.execute(
                 "ALTER TABLE font_layout_library "
                 "ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''"
+            )
+        if "layout_scope" not in columns:
+            connection.execute(
+                "ALTER TABLE font_layout_library "
+                "ADD COLUMN layout_scope TEXT NOT NULL DEFAULT 'size'"
             )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_font_layout_library_sort_key "
@@ -2396,6 +2413,12 @@ class CatalogRepository:
         source = " ".join(str(marker_value or "").split()).casefold()
         if not source:
             return None
+        # Etsy values commonly contain decorations (``#4 and Gold``).  Match
+        # the numeric marker, rather than requiring the whole value to be a
+        # literal substring of the template name.
+        marker_numbers = {
+            int(value) for value in re.findall(r"\d+", source)
+        }
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -2409,7 +2432,9 @@ class CatalogRepository:
         matches = []
         for row in rows:
             names = (row["template_name"],)
-            if any(source in " ".join(str(name or "").split()).casefold() for name in names):
+            name_text = " ".join(str(row["template_name"] or "").split()).casefold()
+            name_numbers = {int(value) for value in re.findall(r"\d+", name_text)}
+            if source in name_text or (marker_numbers and marker_numbers & name_numbers):
                 matches.append(row)
         if len(matches) != 1:
             return None
@@ -3304,6 +3329,9 @@ class CatalogRepository:
         if not name:
             raise ValueError("字体布局模板名称不能为空")
         sort_key = compact_string(payload.get("sort_key"))
+        layout_scope = compact_string(payload.get("layout_scope")) or "size"
+        if layout_scope not in {"size", "inner_page"}:
+            raise ValueError("layout_scope 必须是 size 或 inner_page")
         layers = self._normalize_layers(payload.get("layers", {}))
         preview_image_path = normalize_preview_url(
             payload.get("preview_image_path") or payload.get("preview_image")
@@ -3334,9 +3362,9 @@ class CatalogRepository:
             cursor = connection.execute(
                 """
                 INSERT INTO font_layout_library (
-                    shop_id, product_id, name, sort_key, preview_image_path, layers_json,
+                    shop_id, product_id, name, sort_key, preview_image_path, layers_json, layout_scope,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     shop_id,
@@ -3345,6 +3373,7 @@ class CatalogRepository:
                     sort_key,
                     preview_image_path,
                     json_dump(layers),
+                    layout_scope,
                     now,
                     now,
                 ),
@@ -3802,9 +3831,10 @@ class CatalogRepository:
         shop_id: int | None = None,
         search: str | None = None,
         product_id: int | None = None,
+        layout_scope: str = "size",
     ):
-        where = []
-        params: list[Any] = []
+        where = ["flt.layout_scope = ?"]
+        params: list[Any] = [compact_string(layout_scope) or "size"]
         if shop_id is not None:
             where.append("flt.shop_id = ?")
             params.append(shop_id)
@@ -3843,6 +3873,46 @@ class CatalogRepository:
             "limit": limit,
             "offset": offset,
         }
+
+    def list_inner_page_font_layout_library_templates(self, limit=50, offset=0, shop_id=None, search=None, product_id=None):
+        where = ["shop_id = %s"] if shop_id is not None else ["1=1"]
+        params = [shop_id] if shop_id is not None else []
+        if product_id is not None: where.append("product_id = %s"); params.append(product_id)
+        if compact_string(search): where.append("(name LIKE %s OR sort_key LIKE %s)"); params.extend([f"%{compact_string(search)}%"] * 2)
+        with self.connect() as c:
+            rows = c.execute(f"SELECT * FROM inner_page_font_layout_library WHERE {' AND '.join(where)} ORDER BY updated_at DESC, id DESC LIMIT %s OFFSET %s", [*params, limit, offset]).fetchall()
+            total = c.execute(f"SELECT COUNT(*) AS count FROM inner_page_font_layout_library WHERE {' AND '.join(where)}", params).fetchone()["count"]
+        return {"items": [{**self._font_layout_library_row_to_dict(row), "layout_scope": "inner_page"} for row in rows], "total": total, "limit": limit, "offset": offset}
+
+    def create_inner_page_font_layout_library_template(self, payload):
+        shop_id = self._optional_int(payload.get("shop_id")); product_id = self._optional_int(payload.get("product_id")); name = compact_string(payload.get("name"))
+        if shop_id is None or not name: raise ValueError("店铺和布局名称不能为空")
+        layers = self._normalize_layers(payload.get("layers", {})); now = utc_now()
+        with self._lock, self.connect() as c:
+            self._require_shop(c, shop_id)
+            cur = c.execute("INSERT INTO inner_page_font_layout_library (shop_id, product_id, name, sort_key, preview_image_path, layers_json, created_at, updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (shop_id, product_id, name, compact_string(payload.get("sort_key")), normalize_preview_url(payload.get("preview_image") or payload.get("preview_image_path")), json_dump(layers), now, now))
+            template_id = cur.lastrowid
+        return self.get_inner_page_font_layout_library_template(template_id)
+
+    def get_inner_page_font_layout_library_template(self, template_id):
+        with self.connect() as c:
+            row = c.execute("SELECT * FROM inner_page_font_layout_library WHERE id = %s", (template_id,)).fetchone()
+        if row is None: raise LookupError("内页字体布局模板不存在")
+        return {**self._font_layout_library_row_to_dict(row), "layout_scope": "inner_page"}
+
+    def update_inner_page_font_layout_library_template(self, template_id, payload):
+        current = self.get_inner_page_font_layout_library_template(template_id); values = {"shop_id": current["shop_id"], "product_id": current.get("product_id"), "name": current["name"], "sort_key": current.get("sort_key", ""), "preview_image_path": current.get("preview_image_path", ""), "layers_json": json_dump(current["layers"])}
+        for key, column in (("shop_id", "shop_id"), ("product_id", "product_id"), ("name", "name"), ("sort_key", "sort_key"), ("preview_image", "preview_image_path"), ("layers", "layers_json")):
+            if key in payload: values[column] = json_dump(self._normalize_layers(payload[key])) if key == "layers" else (normalize_preview_url(payload[key]) if key == "preview_image" else payload[key])
+        values["updated_at"] = utc_now()
+        with self._lock, self.connect() as c:
+            c.execute("UPDATE inner_page_font_layout_library SET shop_id=%s, product_id=%s, name=%s, sort_key=%s, preview_image_path=%s, layers_json=%s, updated_at=%s WHERE id=%s", (values["shop_id"], values["product_id"], values["name"], values["sort_key"], values["preview_image_path"], values["layers_json"], values["updated_at"], template_id))
+        return self.get_inner_page_font_layout_library_template(template_id)
+
+    def delete_inner_page_font_layout_library_template(self, template_id):
+        with self._lock, self.connect() as c:
+            c.execute("DELETE FROM inner_page_font_layout_library WHERE id = %s", (template_id,))
+        return {"deleted": True, "id": template_id}
 
     @staticmethod
     def _font_layout_size_context(connection, layout_row, size_template_id: int):
@@ -4304,6 +4374,65 @@ class CatalogRepository:
             f"已同步 {len(normalized_items)} 个规格（{synced_labels}）"
             + "，当前尺寸模板已切换到该字体布局"
         )
+        return result
+
+    def sync_font_layout_inner_page_options(
+        self,
+        template_id: int,
+        payload: dict[str, Any],
+    ):
+        target_id = self._optional_int(payload.get("inner_page_template_id"))
+        if target_id is None:
+            raise ValueError("inner_page_template_id 不能为空")
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("items 至少需要一个规格图层")
+        normalized = []
+        seen = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValueError(f"items[{index}] 必须是对象")
+            option_id = compact_string(item.get("size_option_id"))
+            if not option_id:
+                raise ValueError(f"items[{index}].size_option_id 不能为空")
+            if option_id in seen:
+                raise ValueError(f"规格不能重复同步: {option_id}")
+            if not isinstance(item.get("layers"), dict):
+                raise ValueError(f"items[{index}].layers 必须是完整图层文档对象")
+            seen.add(option_id)
+            normalized.append({"size_option_id": option_id, "layers": self._normalize_layers(item["layers"])})
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            layout = connection.execute("SELECT * FROM inner_page_font_layout_library WHERE id = %s", (template_id,)).fetchone()
+            if layout is None:
+                raise LookupError("字体布局模板不存在")
+            target = connection.execute("SELECT * FROM inner_page_templates WHERE id = ?", (target_id,)).fetchone()
+            if target is None:
+                raise LookupError("内页模板不存在")
+            if compact_string(layout.get("layout_scope") or "inner_page") != "inner_page":
+                raise ValueError("请选择内页字体布局进行同步")
+            if layout["shop_id"] != target["shop_id"]:
+                raise ValueError("字体布局模板与内页模板必须属于同一店铺")
+            if layout.get("product_id") is None or int(layout["product_id"]) != int(target["product_id"]):
+                raise ValueError("字体布局模板与内页模板必须属于同一产品")
+            option_rows = connection.execute(
+                "SELECT id, size_option_id FROM inner_page_template_options WHERE inner_page_template_id = ?",
+                (target_id,),
+            ).fetchall()
+            option_by_id = {compact_string(row["size_option_id"]): row for row in option_rows}
+            missing = [item["size_option_id"] for item in normalized if item["size_option_id"] not in option_by_id]
+            if missing:
+                raise LookupError(f"内页规格不存在: {', '.join(missing)}")
+            for item in normalized:
+                connection.execute(
+                    "UPDATE inner_page_template_options SET layers_json = ?, updated_at = ? WHERE id = ? AND inner_page_template_id = ?",
+                    (json_dump(item["layers"]), now, option_by_id[item["size_option_id"]]["id"], target_id),
+                )
+            connection.execute("UPDATE inner_page_templates SET updated_at = ? WHERE id = ?", (now, target_id))
+        result = self.get_inner_page_template(target_id)
+        result["just_synced_size_option_ids"] = [item["size_option_id"] for item in normalized]
+        result["synced_count"] = len(normalized)
+        result["message"] = f"已同步 {len(normalized)} 个内页规格"
         return result
 
     def delete_font_layout_size_option(

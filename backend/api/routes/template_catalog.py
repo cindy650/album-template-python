@@ -19,6 +19,7 @@ from backend.schemas import (
     FontLayoutLibrarySaveAs,
     FontLayoutLibraryUpdate,
     FontLayoutSizeSync,
+    FontLayoutInnerPageSync,
     InnerPageTemplateCreate,
     InnerPageTemplateOption,
     InnerPageTemplateOptionUpdate,
@@ -338,6 +339,7 @@ async def list_font_layout_templates(
     shop_id: int | None = Query(default=None, description="所属店铺 ID"),
     search: str | None = Query(default=None, description="按名称或 sort_key 搜索"),
     product_id: int | None = Query(default=None, description="所属产品分类 ID"),
+    layout_scope: str = Query(default="size", pattern="^(size|inner_page)$", description="布局库用途"),
 ):
     result = await repo_call(
         catalog_repository.list_font_layout_library_templates,
@@ -346,11 +348,39 @@ async def list_font_layout_templates(
         shop_id,
         search,
         product_id,
+        layout_scope,
     )
     return api_success(
         public_font_layout_template(result),
         message="字体布局模板查询成功",
     )
+
+
+@router.get("/inner-page-font-layout-templates", summary="查询内页字体布局模板")
+async def list_inner_page_font_layout_templates(limit: int = Query(default=50, ge=1, le=500), offset: int = Query(default=0, ge=0), shop_id: int | None = Query(default=None, gt=0), search: str | None = Query(default=None), product_id: int | None = Query(default=None, gt=0)):
+    result = await repo_call(catalog_repository.list_inner_page_font_layout_library_templates, limit, offset, shop_id, search, product_id)
+    return api_success(public_font_layout_template(result), message="内页字体布局模板查询成功")
+
+
+@router.post("/inner-page-font-layout-templates", status_code=status.HTTP_201_CREATED, summary="新增内页字体布局模板")
+async def create_inner_page_font_layout_template(payload: FontLayoutLibraryCreate):
+    result = await repo_call(catalog_repository.create_inner_page_font_layout_library_template, payload_dict(payload))
+    return api_success(public_font_layout_template(result), message="内页字体布局模板创建成功", status_code=201)
+
+
+@router.get("/inner-page-font-layout-templates/{template_id}")
+async def get_inner_page_font_layout_template(template_id: int = Path(gt=0)):
+    return api_success(public_font_layout_template(await repo_call(catalog_repository.get_inner_page_font_layout_library_template, template_id)), message="内页字体布局模板查询成功")
+
+
+@router.patch("/inner-page-font-layout-templates/{template_id}")
+async def update_inner_page_font_layout_template(payload: FontLayoutLibraryUpdate, template_id: int = Path(gt=0)):
+    return api_success(public_font_layout_template(await repo_call(catalog_repository.update_inner_page_font_layout_library_template, template_id, payload_dict(payload))), message="内页字体布局模板更新成功")
+
+
+@router.delete("/inner-page-font-layout-templates/{template_id}")
+async def delete_inner_page_font_layout_template(template_id: int = Path(gt=0)):
+    return api_success(await repo_call(catalog_repository.delete_inner_page_font_layout_library_template, template_id), message="内页字体布局模板删除成功")
 
 
 @router.post(
@@ -442,6 +472,23 @@ async def sync_font_layout_size_options(
 ):
     result = await repo_call(
         catalog_repository.sync_font_layout_size_options,
+        template_id,
+        payload_dict(payload),
+    )
+    return api_success(result, message=result["message"])
+
+
+@router.post(
+    "/font-layout-templates/{template_id}/sync-inner-page-options",
+    summary="同步字体布局到内页模板规格",
+    description="把当前字体布局图层复制到一个或多个内页模板规格，并切换为该字体布局。",
+)
+async def sync_font_layout_inner_page_options(
+    payload: FontLayoutInnerPageSync,
+    template_id: int = Path(gt=0, description="字体布局模板 ID"),
+):
+    result = await repo_call(
+        catalog_repository.sync_font_layout_inner_page_options,
         template_id,
         payload_dict(payload),
     )

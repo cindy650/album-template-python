@@ -60,7 +60,7 @@ class FakeMatcher:
 
 
 class MailProductResolverTests(unittest.TestCase):
-    def test_existing_product_name_skips_deepseek_and_specification_check(self):
+    def test_existing_product_name_without_template_fields_skips_deepseek(self):
         existing = {"product_id": 8, "shop_id": 3}
         repository = FakeRepository(exact=existing)
         matcher = FakeMatcher(error=AssertionError("DeepSeek should not be called"))
@@ -72,7 +72,8 @@ class MailProductResolverTests(unittest.TestCase):
             {},
         )
 
-        self.assertIs(result, existing)
+        self.assertEqual(result, {**existing, "size_template_id": None})
+        self.assertEqual(existing, {"product_id": 8, "shop_id": 3})
         self.assertEqual(matcher.calls, [])
         self.assertEqual(repository.associations, [])
 

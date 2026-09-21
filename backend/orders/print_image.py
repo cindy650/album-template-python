@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from datetime import datetime
 from io import BytesIO
 import json
 from pathlib import Path
 import re
 from typing import Any
+from urllib.parse import unquote_to_bytes
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import requests
@@ -542,9 +543,10 @@ class OrderPrintImageGenerator:
             font=shop_font,
             fill=red,
         )
+        quantity_label = f"{order.get('quantity') or 1} item"
         draw.text(
             (right_x, content_top + px(125)),
-            f"{order.get('quantity') or 1} item",
+            quantity_label,
             font=heading_font,
             fill=ink,
         )
@@ -553,12 +555,56 @@ class OrderPrintImageGenerator:
             fill=line,
             width=px(2),
         )
+        quantity_bbox = draw.textbbox((0, 0), quantity_label, font=heading_font)
+        draw.text(
+            (
+                right_x + (quantity_bbox[2] - quantity_bbox[0]) + px(38),
+                content_top + px(125),
+            ),
+            "商品信息",
+            font=heading_font,
+            fill=ink,
+        )
         right_y = content_top + px(220)
+        product_information = order.get("product_information") or {}
+        product_image_value = next(
+            (
+                value
+                for label, value in product_information.items()
+                if str(label).strip().casefold() == PRODUCT_IMAGE_FIELD
+            ),
+            None,
+        )
+        product_image = self._load_product_image(product_image_value)
+        info_x = right_x
+        info_width = right_width
+        if product_image is not None:
+            image_top = min(
+                max(content_top + px(220), y + px(20)),
+                first_bottom - px(140),
+            )
+            image_bottom = first_bottom - px(20)
+            if image_bottom <= image_top:
+                image_top = content_top + px(220)
+                image_bottom = max(image_top + px(120), first_bottom - px(20))
+            image_box = (
+                margin,
+                image_top,
+                margin + left_width,
+                image_bottom,
+            )
+            self._paste_product_image(
+                image,
+                product_image,
+                image_box,
+                border_color=line,
+                border_width=px(2),
+            )
         right_y = self._draw_block(
             draw,
             order.get("product") or "",
-            (right_x, right_y),
-            right_width,
+            (info_x, right_y),
+            info_width,
             heading_font,
             ink,
             px(64),
@@ -614,9 +660,9 @@ class OrderPrintImageGenerator:
                         red if is_user_message else ink,
                     ),
                 ],
-                (right_x, row_y),
+                (info_x, row_y),
                 preferred_size=source_size,
-                max_width=right_width,
+                max_width=info_width,
                 fill=None,
                 line_height=max(1, round(source_line_height)),
             )
@@ -626,8 +672,8 @@ class OrderPrintImageGenerator:
                 translation_height = self._draw_wrapped_single_line(
                     draw,
                     translation,
-                    (right_x + px(38), row_y + source_height),
-                    right_width - px(38),
+                    (info_x + px(38), row_y + source_height),
+                    info_width - px(38),
                     font_size=translation_size,
                     fill=red,
                     line_height=translation_line_height,
@@ -941,6 +987,88 @@ class OrderPrintImageGenerator:
                 ),
                 outline=border_color,
                 width=border_width,
+            )
+
+    @classmethod
+    def _load_product_image(cls, value: Any) -> Image.Image | None:
+        """Load the Etsy ``product_image`` value for the production sheet."""
+        if isinstance(value, (list, tuple)):
+            value = next((item for item in value if item), None)
+        if isinstance(value, dict):
+            value = (
+                value.get("url")
+                or value.get("src")
+                or value.get("data_url")
+                or value.get("dataUrl")
+            )
+        source = str(value or "").strip()
+        if not source:
+            return None
+        # Etsy uses this transparent tracking image when no product thumbnail
+        # was included in the order email. Treat it as missing artwork so the
+        # production sheet does not render an empty framed placeholder.
+        source_name = source.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+        if source_name in {"spacer-trans.gif", "spacer.gif", "transparent.gif"}:
+            print("[生产单] 商品图片为透明占位图，已跳过绘制", flush=True)
+            return None
+        try:
+            if source.lower().startswith("data:image/"):
+                header, encoded = source.split(",", 1)
+                payload = (
+                    b64decode(encoded)
+                    if ";base64" in header.lower()
+                    else unquote_to_bytes(encoded)
+                )
+            elif source.lower().startswith(("http://", "https://")):
+                response = requests.get(source, timeout=15)
+                response.raise_for_status()
+                payload = response.content
+            else:
+                local_source = source[7:] if source.lower().startswith("file://") else source
+                path = Path(local_source)
+                if not path.is_file():
+                    raise FileNotFoundError(local_source)
+                payload = path.read_bytes()
+            with Image.open(BytesIO(payload)) as loaded:
+                normalized = ImageOps.exif_transpose(loaded)
+                if "A" in normalized.getbands():
+                    alpha = normalized.getchannel("A")
+                    if alpha.getextrema() == (0, 0):
+                        print("[生产单] 商品图片完全透明，已跳过绘制", flush=True)
+                        return None
+                return normalized.convert("RGB")
+        except Exception as exc:
+            preview = source if len(source) <= 160 else source[:157] + "..."
+            print(
+                f"[生产单] 商品图片加载失败：来源={preview}，错误={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return None
+
+    @staticmethod
+    def _paste_product_image(
+        image: Image.Image,
+        source: Image.Image,
+        box,
+        border_color: str | None = None,
+        border_width: int = 0,
+    ) -> None:
+        x1, y1, x2, y2 = box
+        box_width = max(1, round(x2 - x1))
+        box_height = max(1, round(y2 - y1))
+        product_image = ImageOps.contain(
+            source.convert("RGB"),
+            (box_width, box_height),
+            Image.Resampling.LANCZOS,
+        )
+        x = round(x1 + (box_width - product_image.width) / 2)
+        y = round(y1 + (box_height - product_image.height) / 2)
+        image.paste(product_image, (x, y))
+        if border_color and border_width:
+            ImageDraw.Draw(image).rectangle(
+                (x, y, x + product_image.width - 1, y + product_image.height - 1),
+                outline=border_color,
+                width=max(1, int(border_width)),
             )
 
     @classmethod

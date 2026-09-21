@@ -178,6 +178,7 @@ class OrderService:
                             order,
                             saved_order,
                             uid,
+                            rule_details=getattr(exc, "rule_details", None),
                         )
                     )
                 elif retry_scheduled:
@@ -280,6 +281,7 @@ class OrderService:
                     order,
                     saved_order,
                     uid=None,
+                    rule_details=getattr(exc, "rule_details", None),
                 )
             raise
         order_info_result = self._generate_order_info_image(
@@ -295,9 +297,9 @@ class OrderService:
         if not notification.get("ok") or notification.get("status") != "sent":
             raise RuntimeError("企业微信示意图发送失败，订单状态未变更")
 
-        updated_order = self.repository.update_status(
-            saved_order["id"],
-            PREVIEW_SENT_ORDER_STATUS,
+        updated_order = self.repository.mark_wecom_preview_sent(
+            order_id,
+            order_number,
         )
         event_bus.publish(
             "order.preview_images.sent",
@@ -435,6 +437,13 @@ class OrderService:
                 },
             )
         else:
+            if notification.get("ok") and notification.get("status") == "sent":
+                updated_order = self.repository.mark_wecom_preview_sent(
+                    saved_order["id"],
+                    saved_order["order_number"],
+                )
+                if isinstance(saved_order, dict):
+                    saved_order.update(updated_order)
             event_bus.publish(
                 "order.wecom.sent",
                 {
@@ -445,24 +454,13 @@ class OrderService:
                     "notification": notification,
                 },
             )
-            if (
-                saved_order.get("status") == 0
-                and notification.get("ok")
-                and notification.get("status") == "sent"
-            ):
-                updated_order = self.repository.update_status(
-                    saved_order["id"],
-                    PREVIEW_SENT_ORDER_STATUS,
-                )
-                if isinstance(saved_order, dict):
-                    saved_order.update(updated_order)
         return notification
 
     @staticmethod
     def _requires_manual_intervention(exc: Exception) -> bool:
         return DEEPSEEK_EMPTY_TEXT_ERROR in str(exc or "")
 
-    def _notify_automation_exception(self, order, saved_order, uid):
+    def _notify_automation_exception(self, order, saved_order, uid, rule_details=None):
         notifier = self._notifier_for_order(saved_order)
         if notifier is None:
             print(
@@ -493,6 +491,7 @@ class OrderService:
             notification = notifier.notify_automation_exception(
                 title,
                 product_information,
+                rule_details=rule_details,
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

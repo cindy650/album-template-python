@@ -53,7 +53,8 @@ If BACKEND_API_TOKEN is empty, local API endpoints are open.
 - PUT /api/v1/orders/{order_id}/template-association - 新订单由前端选择产品、尺寸模板和规格，
   后端校验当前店铺归属并读取规格图层，一次性关联 `size_template_id` 和保存订单模板 JSON。
 - POST /api/v1/orders/preview-images/send - 生成订单预览图和企业微信订单辅助图，
-  两张图发送成功后将订单状态从 0 更新为 1；未关联模板时返回提示且状态不变。
+  发送成功或失败均不修改订单状态；状态由前端单独调用状态推进接口修改。订单列表的
+  `wecom_preview_sent` 表示该订单是否至少成功发送过一次企业微信示意图。
 - GET /api/v1/config - 查询已脱敏的运行配置和各项服务配置状态。
 - GET /api/v1/orders/monthly-statistics - 查询按店铺和月份累计的 CAD Subtotal、运费、订单数和商品件数。
 - GET /api/v1/orders/daily-statistics - 查询按店铺和日期累计的 CAD Subtotal、运费、订单数和商品件数。
@@ -146,8 +147,9 @@ data: {"type":"order.saved","msg":"新订单已入库", "data":{"source":"fronte
 ```
 
 后端按 `order_statuses` 表中的状态数值顺序推进。订单 ID 与订单号不匹配时拒绝请求，
-状态 `0` 必须先通过 `/api/v1/orders/preview-images/send` 成功发送两张图片后进入
-状态 `1`，不能直接调用推进接口跳过发送。订单已完成后不能继续推进。
+状态 `0` 可通过本接口推进到 `1`。发送示意图本身不修改状态，前端可在发送成功后
+单独调用推进接口。状态 `1` 推进时会重新生成并上传客户确认文件，全部成功后进入 `2`。
+订单已完成后不能继续推进；每次调用推进一步，前端应避免重复提交。
 `orders` 表只保存状态数值，状态名称和按钮文案从
 `order_statuses` 独立表读取。
 
@@ -259,7 +261,8 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
 或 `page_count_table`（按页数分段）。`range` 模式继续使用尺寸模板的
 `min_spine_width`、`max_spine_width` 和页数选项做线性计算；产品接口不需要保存这两个范围值。
 `formula` 模式使用 `spine_width_formula`，公式计算为：
-`页数 * page_count_coefficient * page_count_thickness + base_width + additional_width`。
+`页数 * paper_thickness + fixed_width`。
+当前默认产品公式为 `页数 * 0.5 + 10`；数值单位由 `unit` 指定，默认示例使用 `cm`。
 `page_count_table` 模式使用 `spine_width_page_rules`，例如：
 
 ```json
@@ -341,10 +344,8 @@ DeepSeek 只生成字段角色和绑定建议，不修改 PSD/OCR 得到的坐�
   "spine_width_mode": "formula",
   "spine_width_formula": {
     "unit": "cm",
-    "page_count_coefficient": 0.2,
-    "page_count_thickness": 0.3,
-    "base_width": 1,
-    "additional_width": 0.9,
+    "paper_thickness": 0.5,
+    "fixed_width": 10,
     "spine_bleed": 0
   }
 }
@@ -671,8 +672,8 @@ POST /api/v1/font-layout-templates/{font_layout_id}/sync-size-options
    自动商品关联失败时，`shop_id` 可以正常保存，`size_template_id` 为空。
 7. 如果订单没有尺寸模板，服务停止后续图片生成，订单保持状态 `0`，前端可先关联产品和模板，
    再调用发送示意图接口。
-8. 如果订单已关联尺寸模板，服务继续生成预览图和企业微信辅助图，并发送企业微信。发送成功后，
-   订单从状态 `0` 自动进入状态 `1`；图片生成或发送失败时，订单不会因失败被推进到下一状态。
+8. 如果订单已关联尺寸模板，服务继续生成预览图和企业微信辅助图，并发送企业微信。
+   图片生成和发送均不修改订单状态，状态仅由前端调用状态接口推进。
 
 商品分类失败的订单项仍会推进邮件 UID，因为订单已经完成邮件处理并进入订单库；数据库写入、解析等
 真正的处理异常会保留 UID，等待监听器重试。IMAP 连接出现 `socket error: EOF` 时，监听器会断开并

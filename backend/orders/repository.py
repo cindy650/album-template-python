@@ -95,7 +95,13 @@ class OrderRepository:
                 raise RuntimeError(
                     "数据库缺少必要表（请先执行显式迁移）: " + ", ".join(missing)
                 )
-            required_columns = {"id", "order_number", "status", "product_information"}
+            required_columns = {
+                "id",
+                "order_number",
+                "status",
+                "product_information",
+                "wecom_preview_sent",
+            }
             columns = {row["name"] for row in table_columns(connection, "orders")}
             missing_columns = sorted(required_columns - columns)
             if missing_columns:
@@ -246,6 +252,7 @@ class OrderRepository:
                     size_template_id_text TEXT NOT NULL
                         DEFAULT '关联商品模板ID',
                     product_information_text TEXT NOT NULL DEFAULT '商品信息',
+                    wecom_preview_sent INTEGER NOT NULL DEFAULT 0,
                     status INTEGER NOT NULL DEFAULT 0
                         REFERENCES order_statuses(status),
                     source TEXT,
@@ -296,6 +303,7 @@ class OrderRepository:
                 "product_information": "TEXT NOT NULL DEFAULT '{}'",
                 "matched_template_json": "TEXT NOT NULL DEFAULT '{}'",
                 "resolved_layers_json": "TEXT NOT NULL DEFAULT '{}'",
+                "wecom_preview_sent": "INTEGER NOT NULL DEFAULT 0",
                 "status": f"INTEGER NOT NULL DEFAULT {DEFAULT_ORDER_STATUS}",
             }
             for column, definition in migrations.items():
@@ -880,6 +888,7 @@ class OrderRepository:
                 price_text TEXT NOT NULL DEFAULT '价格',
                 size_template_id_text TEXT NOT NULL DEFAULT '关联商品模板ID',
                 product_information_text TEXT NOT NULL DEFAULT '商品信息',
+                wecom_preview_sent INTEGER NOT NULL DEFAULT 0,
                 status INTEGER NOT NULL DEFAULT 0
                     REFERENCES order_statuses(status),
                 source TEXT,
@@ -925,6 +934,7 @@ class OrderRepository:
             "price_text": "'价格'",
             "size_template_id_text": "'关联商品模板ID'",
             "product_information_text": "'商品信息'",
+            "wecom_preview_sent": "0",
             "source": "NULL",
             "uid": "NULL",
             "metadata_json": "'{}'",
@@ -1412,12 +1422,14 @@ class OrderRepository:
         for row in rows:
             if row["size_template_id"] is None:
                 continue
-            match = re.search(
-                r"(?:^|[-–—_/])\s*#?\s*(\d+)\s*$",
-                str(row["template_name"] or ""),
-            )
-            template_variant = int(match.group(1)) if match else None
-            if template_variant == variant:
+            # Template markers are intentionally fuzzy.  Etsy/product
+            # templates use both ``#5`` and ``5#`` (and names such as
+            # ``...-06``), while the order value may contain extra text such
+            # as ``#5 and gold``.  Compare any numeric marker in the template
+            # name after normalising leading zeroes instead of requiring a
+            # particular suffix format.
+            template_numbers = re.findall(r"\d+", str(row["template_name"] or ""))
+            if any(int(number) == variant for number in template_numbers):
                 return dict(row)
         return fallback
 
@@ -2117,10 +2129,6 @@ class OrderRepository:
                     "订单状态已变化，请刷新订单后重试："
                     f"预期状态={expected_status}，当前状态={current_status}"
                 )
-            if current_status == DEFAULT_ORDER_STATUS:
-                raise ValueError(
-                    "新订单必须先调用发送示意图接口，不能直接推进状态"
-                )
             next_definition = connection.execute(
                 """
                 SELECT status FROM order_statuses
@@ -2175,6 +2183,32 @@ class OrderRepository:
             raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
         return self.row_to_dict(row)
 
+    def mark_wecom_preview_sent(self, order_id: int, order_number: str):
+        normalized_order_number = str(order_number or "").strip()
+        if not normalized_order_number:
+            raise ValueError("订单号不能为空")
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id FROM orders
+                WHERE id = ? AND order_number = ?
+                LIMIT 1
+                """,
+                (order_id, normalized_order_number),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
+            connection.execute(
+                """
+                UPDATE orders
+                SET wecom_preview_sent = 1, updated_at = ?
+                WHERE id = ? AND order_number = ?
+                """,
+                (utc_now(), order_id, normalized_order_number),
+            )
+            connection.commit()
+        return self.get(order_id)
+
     @staticmethod
     def _order_select(suffix=""):
         return f"""
@@ -2198,6 +2232,7 @@ class OrderRepository:
     @staticmethod
     def row_to_dict(row):
         data = dict(row)
+        data["wecom_preview_sent"] = bool(data.get("wecom_preview_sent", 0))
         data["product_information"] = OrderRepository._decode_product_information(
             data["product_information"]
         )
