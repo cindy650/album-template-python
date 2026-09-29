@@ -11807,18 +11807,18 @@ var ImageMapEditorSvgExportBundle = (() => {
     }
   });
 
-  // image-map-headless-renderer/browser/path-shim.js
-  var path_shim_exports = {};
-  __export(path_shim_exports, {
-    default: () => path_shim_default,
+  // src/image-map-editor/canvas/utils/browserPathShim.ts
+  var browserPathShim_exports = {};
+  __export(browserPathShim_exports, {
+    default: () => browserPathShim_default,
     join: () => join
   });
-  var join, path_shim_default;
-  var init_path_shim = __esm({
-    "image-map-headless-renderer/browser/path-shim.js"() {
+  var join, browserPathShim_default;
+  var init_browserPathShim = __esm({
+    "src/image-map-editor/canvas/utils/browserPathShim.ts"() {
       "use strict";
       join = (...parts) => parts.filter(Boolean).join("/").replace(/\/+/g, "/");
-      path_shim_default = { join };
+      browserPathShim_default = { join };
     }
   });
 
@@ -11871,7 +11871,7 @@ var ImageMapEditorSvgExportBundle = (() => {
         if (staticProps) _defineProperties(Constructor, staticProps);
         return Constructor;
       }
-      var DEFAULT_FONT = (init_path_shim(), __toCommonJS(path_shim_exports)).join(__dirname, "../fonts/ipag.ttf");
+      var DEFAULT_FONT = (init_browserPathShim(), __toCommonJS(browserPathShim_exports)).join(__dirname, "../fonts/ipag.ttf");
       function parseAnchorOption(anchor) {
         var horizontal = anchor.match(/left|center|right/gi) || [];
         horizontal = horizontal.length === 0 ? "left" : horizontal[0];
@@ -12335,12 +12335,28 @@ var ImageMapEditorSvgExportBundle = (() => {
       segment = "";
     };
     for (const character of Array.from(text)) {
-      if (/\s/u.test(character)) {
+      if (character === "\uFE0E" || character === "\uFE0F") {
+        const previous = runs[runs.length - 1];
+        if (previous?.text) previous.text += character;
+        continue;
+      }
+      const normalizedCharacter = metrics.normalizeCharacter?.(character) ?? character;
+      if (/\s/u.test(normalizedCharacter)) {
         flush();
-        const width = Number(metrics.getAdvanceWidth(character));
+        const width = Number(metrics.getAdvanceWidth(normalizedCharacter));
+        if (Number.isFinite(width)) cursorX += width;
+      } else if (metrics.keepCharacterAsText?.(normalizedCharacter)) {
+        flush();
+        runs.push({ text: normalizedCharacter, x: cursorX, y });
+        const width = Number(metrics.getAdvanceWidth(normalizedCharacter));
+        if (Number.isFinite(width)) cursorX += width;
+      } else if (metrics.isolateCharacter?.(normalizedCharacter)) {
+        flush();
+        runs.push({ d: metrics.getPathData(normalizedCharacter, cursorX, y) });
+        const width = Number(metrics.getAdvanceWidth(normalizedCharacter));
         if (Number.isFinite(width)) cursorX += width;
       } else {
-        segment += character;
+        segment += normalizedCharacter;
       }
     }
     flush();
@@ -12360,6 +12376,18 @@ var ImageMapEditorSvgExportBundle = (() => {
   var numberValue = (element, attribute) => {
     const value = Number.parseFloat(element.getAttribute(attribute) || "");
     return Number.isFinite(value) ? value : 0;
+  };
+  var getFontGlyph = (textToSvg, character) => {
+    const font = textToSvg.font;
+    return font?.charToGlyph?.(character);
+  };
+  var hasUsableGlyph = (textToSvg, character) => {
+    const glyph = getFontGlyph(textToSvg, character);
+    if (!glyph) return true;
+    if (/^\s$/u.test(character)) return true;
+    if (glyph.index === 0) return false;
+    const commands = glyph.path?.commands;
+    return !commands || commands.length > 0;
   };
   var loadFont = (url) => {
     const cached = fontCache.get(url);
@@ -12384,10 +12412,41 @@ var ImageMapEditorSvgExportBundle = (() => {
       }
     });
   };
-  var replaceTextWithPaths = async (document2, root, fontSources) => {
+  var copyFallbackTextAttributes = (source, target2, includeIdentity) => {
+    Array.from(source.attributes).forEach((attribute) => {
+      if (["x", "y", "dx", "dy"].includes(attribute.name)) return;
+      if (!includeIdentity && ["id", "data-name", "data-layer-name"].includes(attribute.name)) return;
+      target2.setAttribute(attribute.name, attribute.value);
+    });
+    target2.setAttribute("xml:space", "preserve");
+  };
+  var replaceTextWithPaths = async (document2, root, fontSources, fallbackFontSources) => {
     const sourceByFamily = new Map(
       fontSources.filter((source) => source?.family && String(source.url || "").trim()).map((source) => [normalizeFamily(source.family), source])
     );
+    const fallbackFonts = /* @__PURE__ */ new Map();
+    const fallbackFontPromises = /* @__PURE__ */ new Map();
+    const fallbackSources = fallbackFontSources.filter((source) => source?.family && String(source.url || "").trim());
+    const getFallbackFont = async (character) => {
+      const cached = fallbackFonts.get(character);
+      if (cached) return cached;
+      for (const source of fallbackSources) {
+        const url = source.loadUrl || source.url;
+        let promise = fallbackFontPromises.get(url);
+        if (!promise) {
+          promise = loadFont(url);
+          fallbackFontPromises.set(url, promise);
+        }
+        try {
+          const candidate = await promise;
+          if (!hasUsableGlyph(candidate, character)) continue;
+          fallbackFonts.set(character, candidate);
+          return candidate;
+        } catch {
+        }
+      }
+      return void 0;
+    };
     for (const text of Array.from(root.querySelectorAll("text"))) {
       const source = sourceByFamily.get(normalizeFamily(styleValue(text, "font-family")));
       const fontSize = Number.parseFloat(styleValue(text, "font-size"));
@@ -12401,27 +12460,54 @@ var ImageMapEditorSvgExportBundle = (() => {
       }
       const spans = Array.from(text.children).filter((child) => child.localName === "tspan");
       const textRuns = spans.length ? spans : [text];
-      const paths = textRuns.flatMap((run) => {
+      const paths = [];
+      let fallbackTextCount = 0;
+      for (const run of textRuns) {
         const content = run.textContent || "";
-        if (!content) return [];
+        if (!content) continue;
         const x = numberValue(run, "x");
         const y = numberValue(run, "y");
-        return buildWhitespaceSafePathRuns(content, x, y, {
-          getAdvanceWidth: (value) => textToSvg.getWidth(value, { fontSize, kerning: true }),
-          getPathData: (value, pathX, pathY) => textToSvg.getD(value, {
+        const contentCharacters = Array.from(content).filter((character) => character !== "\uFE0E" && character !== "\uFE0F" && !/\s/u.test(character));
+        for (const character of contentCharacters) {
+          if (!hasUsableGlyph(textToSvg, character)) await getFallbackFont(character);
+        }
+        const textPaths = buildWhitespaceSafePathRuns(content, x, y, {
+          getAdvanceWidth: (value) => {
+            const characterFont = Array.from(value).length === 1 ? fallbackFonts.get(value) : void 0;
+            return (characterFont || textToSvg).getWidth(value, { fontSize, kerning: true });
+          },
+          getPathData: (value, pathX, pathY) => (Array.from(value).length === 1 ? fallbackFonts.get(value) || textToSvg : textToSvg).getD(value, {
             x: pathX,
             y: pathY,
             fontSize,
             kerning: true
-          })
-        }).map(({ d }) => {
+          }),
+          normalizeCharacter: (character) => {
+            return character;
+          },
+          isolateCharacter: (character) => fallbackFonts.has(character),
+          keepCharacterAsText: (character) => !hasUsableGlyph(textToSvg, character) && !fallbackFonts.has(character)
+        });
+        textPaths.forEach((runPath) => {
+          if (runPath.text !== void 0) {
+            const fallbackText = document2.createElementNS(SVG_NAMESPACE2, "text");
+            copyFallbackTextAttributes(text, fallbackText, fallbackTextCount === 0);
+            fallbackText.setAttribute("x", String(runPath.x ?? x));
+            fallbackText.setAttribute("y", String(runPath.y ?? y));
+            fallbackText.setAttribute("data-symbol-fallback", "true");
+            fallbackText.textContent = runPath.text;
+            text.parentElement?.insertBefore(fallbackText, text);
+            fallbackTextCount += 1;
+            return;
+          }
+          if (!runPath.d) return;
           const path = document2.createElementNS(SVG_NAMESPACE2, "path");
           copyPathAttributes(text, path);
-          path.setAttribute("d", d);
-          return path;
+          path.setAttribute("d", runPath.d);
+          paths.push(path);
         });
-      });
-      if (!paths.length) continue;
+      }
+      if (!paths.length && fallbackTextCount === 0) continue;
       paths.forEach((path) => text.parentElement?.insertBefore(path, text));
       text.remove();
     }
@@ -12436,12 +12522,12 @@ var ImageMapEditorSvgExportBundle = (() => {
       return line;
     }).join("\n");
   };
-  var exportTextToSvg = async ({ fontSources, ...options }) => {
+  var exportTextToSvg = async ({ fontSources, fallbackFontSources = [], ...options }) => {
     const editableSvg = exportCorelCompatibleSvg(options);
     const document2 = new DOMParser().parseFromString(editableSvg, "image/svg+xml");
     const root = document2.documentElement;
     if (document2.querySelector("parsererror") || root.localName !== "svg") throw new Error("\u53EF\u7F16\u8F91 SVG XML \u65E0\u6548");
-    await replaceTextWithPaths(document2, root, fontSources);
+    await replaceTextWithPaths(document2, root, fontSources, fallbackFontSources);
     const serialized = new XMLSerializer().serializeToString(root);
     const output = [
       '<?xml version="1.0" encoding="UTF-8"?>',

@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import struct
+import shutil
 from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -625,6 +626,40 @@ class TemplateExportService:
             BytesIO(self._zip_order_files(order_dir, paths)),
             f"{order_resource_stem(order)}.zip",
         )
+
+    def clear_order_artifacts(self, order_id: int, order_number: str):
+        """Remove generated files for a status rollback before DB cleanup."""
+        order = self.order_repository.get_by_id_and_order_number(order_id, order_number)
+        records = self.order_repository.list_artifacts(order_id, order_number)
+        order_dir = order_resource_dir(self.output_dir, order)
+        archive_path = Path(self.output_dir) / f"{order_resource_stem(order)}.zip"
+        oss_result = {"status": "disabled", "count": 0}
+        if self.storage_service is not None and self.storage_service.configured:
+            oss_prefix = self.storage_service.object_key_for_path(order_dir)
+            oss_result = self.storage_service.delete_folder(oss_prefix)
+            # Older production flows also uploaded a same-name ZIP beside the
+            # folder. Remove it so a later download cannot return stale files.
+            self.storage_service.delete_file(path=archive_path)
+
+        removed_files = 0
+        if order_dir.exists():
+            if not order_dir.resolve().is_relative_to(self.output_dir.resolve()):
+                raise RuntimeError(f"订单文件目录不在允许清理范围内：{order_dir}")
+            shutil.rmtree(order_dir)
+            removed_files += len(records)
+            print(f"[FILE] 已清理订单本地文件夹：路径={order_dir}", flush=True)
+        if archive_path.is_file():
+            if not archive_path.resolve().is_relative_to(self.output_dir.resolve()):
+                raise RuntimeError(f"订单 ZIP 不在允许清理范围内：{archive_path}")
+            archive_path.unlink()
+            removed_files += 1
+            print(f"[FILE] 已清理旧订单 ZIP：路径={archive_path}", flush=True)
+        return {
+            "order_id": order_id,
+            "order_number": order_number,
+            "local_files_removed": removed_files,
+            "oss": oss_result,
+        }
 
     def _generate_export(
         self,

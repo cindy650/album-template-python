@@ -74,6 +74,7 @@ Python Playwright、Selenium 或其他无头浏览器都可以直接调用这一
 - JPG/PNG 位图导出不会绘制 `workarea.printGuides` 中的任何打印辅助线。SVG 导出也不会绘制由单面宽、单面高和出血计算出的 `content`/`bleed` 线；这些线仍保留在返回 JSON 中供编辑器使用，其他自定义线条仍可导出。
 - 单排画布且 `spineWidth > 0` 时，产图前会在本次 Fabric JSON 的 `workarea` 后插入背脊顶部、底部两个黑色 `Rect` 图层；宽度等于实际背脊宽度，高度固定为 `5mm`。固定图层 ID 会在每次生成时先删除再重建，避免重复，并随最终图层 JSON 保存回订单。JPG、PNG、SVG 和转曲 SVG 统一使用这份 JSON。
 - `svg` 使用编辑器当前完整的可编辑 SVG 导出逻辑；`text-to-svg` 使用编辑器当前的 `text-to-svg` 路径转换逻辑。两者都包含工作区裁剪、背景、图层名称、CorelDRAW XML 头和格式化缩进，不绘制 `workarea.printGuides` 打印辅助线。
+- 转曲时会检查当前字体是否存在可用字形；缺失字形会优先从内置回退字体子集查找并转为路径，仍无法找到的字符保留为文字，避免生成 `.notdef` 方框或直接丢失。当前内置 `Segoe UI Symbol` 用于 `❤`、`Microsoft YaHei` 用于 `&`，回退字体由 Python 启动器以内嵌 data URL 传入，并在进程内缓存。
 - `workarea.canvasRows === 2` 时使用双排画布：总高度为两倍单排高度加 `canvasRowGap` 分隔缝，未提供该字段时默认无分隔缝（`0px`）；双排是封面/封底两面结构，不包含背脊或背脊出血，宽度为两面单面宽加左右出血；竖向辅助线贯穿整个工作区，每排分别生成横向辅助线。仍只渲染一套内容图层，不会复制图层。
 - 双排 JSON 会按 `unit`、`sideWidth`、`sideHeight` 和出血字段重新核准工作区几何及辅助线，并将 `spineWidth/spineBleed` 归零。旧 JSON 未提供 `canvasRows` 时继续按单排原样渲染。
 - 内容图层带有 `horizontalCentered: true` 或 `verticalCentered: true` 时，渲染器会执行两次对应的居中：第一次在创建 Fabric 对象前应用标识，作为安全区检测和字号缩小的初始位置；第二次在字号调整完成后再次按标识归位，确保最终文字几何居中。两个标识独立生效；没有对应标识的轴两次都不会移动。居中只修改本次渲染使用的克隆 JSON，调用方传入的原始 JSON 不会被修改，四种导出格式使用同一份最终归位结果。

@@ -18,6 +18,7 @@ from backend.schemas import (
     OrderData,
     OrderPrintImageRequest,
     OrderStatusAdvanceRequest,
+    OrderStatusRollbackRequest,
     OrderStatusUpdate,
     OrderTemplateAssociationRequest,
     OrderTemplateJsonUpdate,
@@ -178,6 +179,37 @@ async def advance_order_status(payload: OrderStatusAdvanceRequest):
             detail=str(exc),
         ) from exc
     return api_success(result, message="订单状态推进成功")
+
+
+@router.post(
+    "/status/rollback",
+    summary="回退订单状态并清理产物",
+    description=(
+        "根据订单 ID、订单号和目标状态执行回退。目标状态必须小于当前状态；"
+        "回退前会清理订单本地文件、OSS 文件夹、旧 ZIP 和订单生产文件记录，"
+        "清理成功后才更新订单状态。"
+    ),
+    operation_id="回退订单状态并清理产物",
+)
+async def rollback_order_status(payload: OrderStatusRollbackRequest):
+    try:
+        result = await run_in_threadpool(
+            order_service.rollback_status,
+            payload.order_id,
+            payload.order_number,
+            payload.status,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return api_success(result, message="订单状态回退成功，历史产物已清理")
 
 
 @router.put(

@@ -346,6 +346,56 @@ class FileStorageService:
         )
         return objects
 
+    def delete_file(self, path: Path | None = None, object_key: str | None = None) -> dict[str, Any]:
+        """Delete one OSS object identified by a local path or object key."""
+        key = str(object_key or "").strip(" /")
+        if not key and path is not None:
+            key = self.object_key_for_path(Path(path))
+        if not key:
+            raise ValueError("OSS 对象键不能为空")
+        if not self.configured:
+            print(f"[OSS] 跳过删除：对象键={key}，原因=OSS 未配置", flush=True)
+            return {"ok": True, "status": "disabled", "object_key": key}
+        try:
+            self._bucket().delete_object(key)
+        except ImportError as exc:
+            raise RuntimeError("未安装 oss2，无法删除 OSS 文件") from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"OSS 文件删除失败：对象键={key}，错误={type(exc).__name__}: {exc}"
+            ) from exc
+        print(f"[OSS] 文件删除成功：对象键={key}", flush=True)
+        return {"ok": True, "status": "deleted", "object_key": key}
+
+    def delete_folder(self, object_prefix: str) -> dict[str, Any]:
+        """Delete every object below an OSS folder prefix."""
+        prefix = str(object_prefix or "").strip(" /")
+        if not prefix:
+            raise ValueError("OSS 文件夹前缀不能为空")
+        if not self.configured:
+            print(f"[OSS] 跳过删除文件夹：前缀={prefix}，原因=OSS 未配置", flush=True)
+            return {"ok": True, "status": "disabled", "object_prefix": prefix, "count": 0}
+        try:
+            import oss2
+
+            bucket = self._bucket()
+            keys = [
+                str(getattr(item, "key", "") or "")
+                for item in oss2.ObjectIterator(bucket, prefix=prefix + "/")
+                if str(getattr(item, "key", "") or "")
+                and not str(getattr(item, "key", "") or "").endswith("/")
+            ]
+            for start in range(0, len(keys), 1000):
+                bucket.batch_delete_objects(keys[start : start + 1000])
+        except ImportError as exc:
+            raise RuntimeError("未安装 oss2，无法删除 OSS 文件夹") from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"OSS 文件夹删除失败：前缀={prefix}，错误={type(exc).__name__}: {exc}"
+            ) from exc
+        print(f"[OSS] 文件夹删除成功：前缀={prefix}，文件数={len(keys)}", flush=True)
+        return {"ok": True, "status": "deleted", "object_prefix": prefix, "count": len(keys)}
+
     def object_key_for_path(self, path: Path) -> str:
         path = Path(path)
         try:

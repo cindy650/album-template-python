@@ -48,6 +48,8 @@ If BACKEND_API_TOKEN is empty, local API endpoints are open.
 - GET /api/v1/orders/statuses - 从独立状态表查询全部订单状态和按钮文案。
 - POST /api/v1/orders/status/advance - 使用订单 ID 和订单号校验订单，
   并将订单推进到下一状态。
+- POST /api/v1/orders/status/rollback - 使用订单 ID、订单号和目标状态回退订单；目标状态必须小于当前状态，
+  同时清理本地文件、OSS 文件、旧 ZIP 和订单生产文件记录。
 - PUT /api/v1/orders/{order_id}/template-json - 使用订单号校验订单，
   将前端编辑后的 `template_json` 保存回订单；后续预览和生产导出直接复用。
 - PUT /api/v1/orders/{order_id}/template-association - 新订单由前端选择产品、尺寸模板和规格，
@@ -150,6 +152,20 @@ data: {"type":"order.saved","msg":"新订单已入库", "data":{"source":"fronte
 状态 `0` 可通过本接口推进到 `1`。发送示意图本身不修改状态，前端可在发送成功后
 单独调用推进接口。状态 `1` 推进时会重新生成并上传客户确认文件，全部成功后进入 `2`。
 订单已完成后不能继续推进；每次调用推进一步，前端应避免重复提交。
+
+`POST /api/v1/orders/status/rollback` 请求体：
+
+```json
+{
+  "order_id": 6,
+  "order_number": "4141461118",
+  "status": 0
+}
+```
+
+目标 `status` 必须小于订单当前状态。回退接口会先删除订单目录中的本地文件、OSS
+订单文件夹和旧 ZIP，再删除 `order_artifacts` 记录，最后更新订单状态；清理失败时不会更新状态。
+`wecom_preview_sent` 不会因状态回退而改变，始终保留历史企业微信发送记录。
 `orders` 表只保存状态数值，状态名称和按钮文案从
 `order_statuses` 独立表读取。
 

@@ -92,3 +92,32 @@ class PreviewStatusControlTests(unittest.TestCase):
             ).fetchone())
             result = repository.mark_wecom_preview_sent(1, "test-order")
             self.assertEqual(result["wecom_preview_sent"], 1)
+
+    def test_service_rollback_requires_past_status_and_cleans_before_update(self):
+        repository = Mock()
+        repository.get_by_id_and_order_number.return_value = {
+            "id": 1,
+            "order_number": "test-order",
+            "status": 3,
+        }
+        repository.rollback_status.return_value = {
+            "id": 1,
+            "order_number": "test-order",
+            "status": 1,
+            "wecom_preview_sent": True,
+        }
+        artifact_service = Mock()
+        artifact_service.clear_order_artifacts.return_value = {
+            "local_files_removed": 4,
+            "oss": {"status": "deleted", "count": 4},
+        }
+        service = OrderService(repository, production_artifact_service=artifact_service)
+        with self.assertRaises(ValueError):
+            service.rollback_status(1, "test-order", 3)
+        repository.rollback_status.assert_not_called()
+
+        result = service.rollback_status(1, "test-order", 1)
+        artifact_service.clear_order_artifacts.assert_called_once_with(1, "test-order")
+        repository.rollback_status.assert_called_once_with(1, "test-order", 1)
+        self.assertEqual(result["status"], 1)
+        self.assertTrue(result["wecom_preview_sent"])

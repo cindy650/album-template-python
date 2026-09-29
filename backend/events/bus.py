@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
 from typing import Any
@@ -11,6 +13,17 @@ import json
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def json_default(value: Any):
+    """Encode values commonly present in database-backed order events."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class EventBus:
@@ -73,7 +86,7 @@ class EventBus:
         return (
             f"id: {event['id']}\n"
             f"event: {event['type']}\n"
-            f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            f"data: {json.dumps(event, ensure_ascii=False, default=json_default)}\n\n"
         )
 
 

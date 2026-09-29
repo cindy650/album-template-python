@@ -141,6 +141,14 @@ class OrderStatusAdvanceRequest(OrderPrintImageRequest):
     """将订单推进到下一个生产流程状态。"""
 
 
+class OrderStatusRollbackRequest(OrderPrintImageRequest):
+    """将订单回退到当前状态之前的指定状态。"""
+
+    status: Literal[0, 1, 2, 3, 4, 5] = Field(
+        description="目标历史状态值，只能小于订单当前状态",
+    )
+
+
 class OrderTemplateJsonUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

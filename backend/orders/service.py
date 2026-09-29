@@ -353,6 +353,41 @@ class OrderService:
         )
         return updated_order
 
+    def rollback_status(self, order_id: int, order_number: str, target_status: int):
+        current_order = self.repository.get_by_id_and_order_number(
+            order_id,
+            order_number,
+        )
+        current_status = int(current_order.get("status") or 0)
+        requested_status = int(target_status)
+        if requested_status >= current_status:
+            raise ValueError(
+                f"只能回退到过去状态：当前状态={current_status}，目标状态={requested_status}"
+            )
+        if self.production_artifact_service is None:
+            raise RuntimeError("未配置订单生产文件服务，无法清理订单产物")
+        cleanup = self.production_artifact_service.clear_order_artifacts(
+            order_id,
+            order_number,
+        )
+        updated_order = self.repository.rollback_status(
+            order_id,
+            order_number,
+            requested_status,
+        )
+        updated_order["rollback_cleanup"] = cleanup
+        event_bus.publish(
+            "order.status.rolled_back",
+            {
+                "order": updated_order,
+                "previous_status": current_status,
+                "target_status": requested_status,
+                "cleanup": cleanup,
+                "source": "api",
+            },
+        )
+        return updated_order
+
     def _generate_template_image_once(
         self,
         order,

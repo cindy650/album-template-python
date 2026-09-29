@@ -4,6 +4,7 @@ import argparse
 import base64
 from collections import OrderedDict
 from copy import deepcopy
+from functools import lru_cache
 import json
 import mimetypes
 from pathlib import Path
@@ -159,6 +160,7 @@ class ImageMapRendererSession:
             "useSafeDistance": use_safe_distance,
             "formats": formats,
             "fontSources": font_sources,
+            "fallbackFontSources": fallback_font_sources(),
         }
         if self.render_count >= self.recycle_after:
             self._close_browser()
@@ -526,6 +528,28 @@ def collect_font_sources(document: Any, base_directory: Path) -> list[dict[str, 
 
     visit(document)
     return list(sources.values())
+
+
+@lru_cache(maxsize=1)
+def fallback_font_sources() -> tuple[dict[str, str], ...]:
+    """Embed bundled fallback subsets once per Python process."""
+    fallback_directory = ROOT / "browser" / "fallback-fonts"
+
+    def data_url(path: Path) -> str:
+        content = path.read_bytes()
+        mime = mimetypes.guess_type(path.name)[0] or "font/ttf"
+        return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+
+    return (
+        {
+            "family": "Segoe UI Symbol",
+            "url": data_url(fallback_directory / "seguisym-heart.ttf"),
+        },
+        {
+            "family": "Microsoft YaHei",
+            "url": data_url(fallback_directory / "microsoft-yahei-amp.ttf"),
+        },
+    )
 
 
 def write_data_url(output_path: Path, data_url: str) -> None:

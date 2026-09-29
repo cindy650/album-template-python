@@ -101,7 +101,7 @@
       images.svg = buildSvg(canvas, workarea, bounds, rawObjects);
     }
     if (formats.includes('text-to-svg')) {
-      images.textToSvg = await buildTextToSvg(canvas, workarea, bounds, rawObjects);
+      images.textToSvg = await buildTextToSvg(canvas, workarea, bounds, rawObjects, options);
     }
     const geometry = canvas.getObjects().map(object => ({
       id: object.id ?? null,
@@ -796,7 +796,7 @@
       }));
   }
 
-  function exportOptions(canvas, workarea, bounds, objects, textToSvg = false) {
+  function exportOptions(canvas, workarea, bounds, objects, textToSvg = false, renderOptions = {}) {
     const rawSvg = canvas.toSVG({
       width: bounds.width,
       height: bounds.height,
@@ -808,6 +808,7 @@
       backgroundColor: String(workarea.backgroundColor || '#ffffff'),
       layerNames: layerNames(objects),
       fontSources: collectFontSources(objects, { textToSvg }),
+      fallbackFontSources: textToSvg ? (renderOptions.fallbackFontSources || []) : [],
       // Print dimensions and bleed guides are editor-only overlays and must
       // not be included in exported SVG artwork.
       printGuides: [],
@@ -820,10 +821,10 @@
     return exporter.exportCorelCompatibleSvg(exportOptions(canvas, workarea, bounds, objects));
   }
 
-  async function buildTextToSvg(canvas, workarea, bounds, objects) {
+  async function buildTextToSvg(canvas, workarea, bounds, objects, renderOptions = {}) {
     const exporter = global.ImageMapEditorSvgExport;
     if (!exporter?.exportTextToSvg) throw new Error('编辑器 text-to-svg 导出模块未加载');
-    return exporter.exportTextToSvg(exportOptions(canvas, workarea, bounds, objects, true));
+    return exporter.exportTextToSvg(exportOptions(canvas, workarea, bounds, objects, true, renderOptions));
   }
 
   async function createObject(serialized, warnings) {

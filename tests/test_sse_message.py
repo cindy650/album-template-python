@@ -1,4 +1,5 @@
 import asyncio
+from decimal import Decimal
 import importlib.util
 import json
 import unittest
@@ -134,6 +135,18 @@ class SSEMessageTests(unittest.TestCase):
 
         self.assertIn("event: message\n", formatted)
         self.assertIn('"msg": "测试消息"', formatted)
+
+    def test_sse_format_serializes_decimal_order_amounts(self):
+        bus = EventBus()
+        event = bus.publish(
+            "order.status.rolled_back",
+            {"order": {"subtotal_amount": Decimal("123.45")}},
+        )
+
+        formatted = bus.format_sse(event)
+
+        payload = json.loads(formatted.split("data: ", 1)[1])
+        self.assertEqual(payload["data"]["order"]["subtotal_amount"], 123.45)
 
 
 if __name__ == "__main__":

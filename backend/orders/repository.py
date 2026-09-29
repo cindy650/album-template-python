@@ -749,6 +749,53 @@ class OrderRepository:
             )
         return deleted
 
+    def rollback_status(self, order_id: int, order_number: str, target_status: int):
+        normalized_order_number = str(order_number or "").strip()
+        if not normalized_order_number:
+            raise ValueError("订单号不能为空")
+        target_status = self._validate_status(target_status)
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id, status, shop_id FROM orders
+                WHERE id = ? AND order_number = ?
+                LIMIT 1
+                """,
+                (order_id, normalized_order_number),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("订单 ID 与订单号不匹配，未找到对应订单")
+            current_status = self._validate_status(existing["status"])
+            if target_status >= current_status:
+                raise ValueError(
+                    f"只能回退到过去状态：当前状态={current_status}，目标状态={target_status}"
+                )
+            deleted = connection.execute(
+                "SELECT COUNT(*) AS count FROM order_artifacts WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()["count"]
+            connection.execute(
+                "DELETE FROM order_artifacts WHERE order_id = ?",
+                (order_id,),
+            )
+            connection.execute(
+                """
+                UPDATE orders
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND order_number = ?
+                """,
+                (target_status, now, order_id, normalized_order_number),
+            )
+            self._refresh_shop_counts(connection, existing["shop_id"])
+            connection.commit()
+        print(
+            f"[订单] 状态回退完成：订单ID={order_id}，订单号={normalized_order_number}，"
+            f"状态={current_status}->{target_status}，已删除产物记录={deleted}",
+            flush=True,
+        )
+        return self.get(order_id)
+
     def list_artifacts(self, order_id: int, order_number: str | None = None):
         suffix = "WHERE oa.order_id = ?"
         params: list[Any] = [order_id]

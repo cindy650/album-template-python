@@ -225,6 +225,10 @@ size_template_options.layers_json
 前端随后调用 `/api/v1/orders/preview-images/send`。发送示意图流程会识别手动关联快照，
 保留前端选择的模板和规格，不再被自动模板匹配覆盖；图片发送不修改状态，由前端单独调用状态推进接口。
 
+订单需要回退时调用 `POST /api/v1/orders/status/rollback`，请求体包含订单 ID、订单号和目标状态。
+目标状态必须小于当前状态。接口会清理本地订单文件夹、OSS 订单文件夹、旧 ZIP 以及
+`order_artifacts` 数据库记录，清理完成后才更新订单状态；`wecom_preview_sent` 保留原值，表示历史企业微信发送事实。
+
 ## 8. 相关代码索引
 
 - 邮件监听与多商品拆分：`qq_idleCopy.py`
